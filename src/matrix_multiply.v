@@ -5,28 +5,43 @@ module MatrixMultiplyUnit (
     input wire [31:0] B,
     output reg [31:0] result
 );
+    // ✅ 블록 밖에서 모든 변수 선언
     integer i;
     reg [31:0] acc;
+    reg [7:0] a_slice, b_slice;
+    reg [15:0] A_low16, A_high16, B_low16, B_high16;
 
     always @(posedge clk) begin
-        acc = 0;
-        case(opcode)
+        acc = 32'd0;
+
+        case (opcode)
+            // ✅ 전통 Verilog 규칙 준수: 블록 외부 변수 사용
             8'h03: begin
-                // FP16 행렬 곱 (간단 예)
-                // A, B를 16비트 2개로 나눠서 곱한 후 합산
-                // 실제론 FP16 연산에서 부호/지수/가수 분리 로직 필요
-                // 여기서는 단순 정수 곱으로 시뮬레이션
-                acc = (A[15:0] * B[15:0]) + (A[31:16] * B[31:16]);
+                A_low16  = A[15:0];
+                A_high16 = A[31:16];
+                B_low16  = B[15:0];
+                B_high16 = B[31:16];
+
+                acc = (A_low16 * B_low16) + (A_high16 * B_high16);
             end
+
             8'h04: begin
-                // INT8 행렬 곱 (INT8_DP)
-                // 4개의 8비트 단위 곱
                 for (i = 0; i < 4; i = i + 1) begin
-                    acc = acc + ( {{24{A[i*8 +: 8][7]}}, A[i*8 +: 8]} 
-                                * {{24{B[i*8 +: 8][7]}}, B[i*8 +: 8]} );
+                    case (i)
+                        0: begin a_slice = A[7:0];   b_slice = B[7:0];   end
+                        1: begin a_slice = A[15:8];  b_slice = B[15:8];  end
+                        2: begin a_slice = A[23:16]; b_slice = B[23:16]; end
+                        3: begin a_slice = A[31:24]; b_slice = B[31:24]; end
+                    endcase
+
+                    acc = acc + ({{24{a_slice[7]}}, a_slice} *
+                                 {{24{b_slice[7]}}, b_slice});
                 end
             end
+
+            default: acc = 32'd0;
         endcase
+
         result <= acc;
     end
 endmodule
