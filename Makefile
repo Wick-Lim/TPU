@@ -110,6 +110,14 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(AXI_BIN) test/tpu_axi_tb.v $(AXI_DESIGN)
 	@printf '[%s] ' "tpu_axi"; $(VVP) $(AXI_BIN) | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: tpu_axi"; exit 1; }
+	@# AXI4-Lite MASTER DMA engine vs an AXI slave-memory BFM.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/axi_master_dma_sim test/axi_master_dma_tb.v src/axi_master_dma.v
+	@printf '[%s] ' "axi_master_dma"; $(VVP) $(BUILD_DIR)/axi_master_dma_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: axi_master_dma"; exit 1; }
+	@# Async CDC FIFO across two unrelated clocks (7ns vs 11ns).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/cdc_async_fifo_sim test/cdc_async_fifo_tb.v src/cdc_async_fifo.v
+	@printf '[%s] ' "cdc_async_fifo"; $(VVP) $(BUILD_DIR)/cdc_async_fifo_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: cdc_async_fifo"; exit 1; }
 	@echo "unittests: all per-unit TBs passed"
 
 wave: $(SIM_BIN)
