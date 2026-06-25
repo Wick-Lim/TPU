@@ -47,7 +47,7 @@
 //   CONSTRAINED RANDOM block for why the 512 cap is principled (a larger logit
 //   makes a peaked softmax sensitive to 1/256 Q7.8-logit quantization -- an
 //   inherent low-precision-attention property, exercised separately/unambiguously
-//   by directed D7/D8).  done/busy LATENCY is checked EXACTLY (123 cycles).  The
+//   by directed D7/D8).  done/busy LATENCY is checked EXACTLY (87 cycles).  The
 //   `sat` flag is checked EXACTLY against the golden's boundary flag `gsat`:
 //   because the context is a CONVEX combination of the value vectors, it provably
 //   never clamps for in-range V, so both must read 0 on every vector.
@@ -84,7 +84,12 @@ module attention_unit_tb;
 
     localparam integer S    = `SEQ_LEN;   // 4
     localparam integer D    = `D_MODEL;   // 4
-    localparam integer LAT  = 123;        // committed start->done (see DUT header)
+    // Committed start->done latency, from the LEN=SEQ softmax closed form (see the
+    // DUT header LATENCY note): with SETUP=3*SEQ+1, SM_LAT=5+ceil(SEQ/4)+2*SEQ,
+    // PER_ROW=SM_LAT+1 /*WT*/ +3, LAT=SETUP+SEQ*PER_ROW+2.  At SEQ=4 (NSCR_X=1,
+    // SM_LAT=14): 13 + 4*18 + 2 = 87.  (Was 123 under the old SM_PAD=8 padding;
+    // the softmax now runs over the 4 real logits, so attention is SHORTER.)
+    localparam integer LAT  = 87;         // committed start->done (see DUT header)
     localparam integer ATOL = 2;          // per-element Q7.8 tolerance (LSB)
     localparam integer NRAND = 230;       // constrained-random vectors
 
@@ -604,6 +609,56 @@ module attention_unit_tb;
         if (sat !== 1'b0) begin
             $display("FAIL[D8-nosat] sat=1 for convex max-V (should never clamp)");
             fail = fail + 1; $fatal(1, "attention spurious sat");
+        end else pass = pass + 1;
+
+        // D10 PAD-COLLISION REGRESSION (locks in the LEN=SEQ fix).  Drive EVERY
+        // Q element to +max (Q78_MAX) and EVERY K element to -max (Q78_MIN): every
+        // query is maximally, EQUALLY anti-aligned with every key, so every raw
+        // score S[i][j] = 0.5*SUM_d Qr*Kr is the SAME huge-negative value (~ -32767
+        // in real units) and EVERY scaled Q7.8 logit saturates to the floor
+        // `Q78_MIN.  Under the OLD scheme this row of SEQ floor-logits COLLIDED
+        // with the SEQ..SM_PAD-1 = `Q78_MIN pad lanes: softmax saw SM_PAD=8
+        // identical values and returned uniform 1/8 weights, so the SEQ=4 real
+        // weights summed to 4/8 and the context was scaled to HALF the column-mean
+        // of V (a silent 2x loss, sat=0).  With the LEN=SEQ fix there are NO pad
+        // lanes, so softmax sees 4 identical logits -> uniform 1/4 weights -> the
+        // context is EXACTLY the (uniform-weight) column-mean of V.
+        //
+        // INDEPENDENT GOLDEN: the correct context is the per-column arithmetic
+        // mean of the 4 V rows (round-half-up to Q7.8), computed HERE directly
+        // (NOT via the DUT's softmax/exp path).  V is chosen so every column mean
+        // is exact and clearly nonzero, so the OLD half-of-mean answer would miss
+        // each target by ~|mean|/2 >> ATOL -- this test FAILS on the old padded
+        // code and PASSES now.  V stays well in range so sat must remain 0.
+        //   column means:  col0=100  col1=-50  col2=200  col3=-120
+        //   half (OLD bug):     50      -25      100       -60
+        for (r2 = 0; r2 < S; r2 = r2 + 1)
+            for (c2 = 0; c2 < D; c2 = c2 + 1) begin
+                QM[r2][c2] = `Q78_MAX;   // +127.996 everywhere
+                KM[r2][c2] = `Q78_MIN;   // -128.000 everywhere
+            end
+        // V rows: column d means M[d] = {100,-50,200,-120}; per column the 4 rows
+        // are {M-30,M-10,M+10,M+30} (sum 4M -> exact integer mean).
+        VM[0][0] = 16'sd70;  VM[0][1] = -16'sd80; VM[0][2] = 16'sd170; VM[0][3] = -16'sd150;
+        VM[1][0] = 16'sd90;  VM[1][1] = -16'sd60; VM[1][2] = 16'sd190; VM[1][3] = -16'sd130;
+        VM[2][0] = 16'sd110; VM[2][1] = -16'sd40; VM[2][2] = 16'sd210; VM[2][3] = -16'sd110;
+        VM[3][0] = 16'sd130; VM[3][1] = -16'sd20; VM[3][2] = 16'sd230; VM[3][3] = -16'sd90;
+        run_check("D10-collision");
+        // Every O row must equal the EXACT column-mean of V (NOT half of it).  The
+        // golden column means are independently the integers below.
+        for (i = 0; i < S; i = i + 1) begin
+            if (absdiff(DO[i][0], 16'sd100)  > ATOL ||
+                absdiff(DO[i][1], -16'sd50)  > ATOL ||
+                absdiff(DO[i][2], 16'sd200)  > ATOL ||
+                absdiff(DO[i][3], -16'sd120) > ATOL) begin
+                $display("FAIL[D10-collision] O row %0d = %0d %0d %0d %0d (expected colmean 100 -50 200 -120; OLD pad bug gives 50 -25 100 -60)",
+                         i, DO[i][0], DO[i][1], DO[i][2], DO[i][3]);
+                fail = fail + 1; $fatal(1, "attention pad-collision regression");
+            end else pass = pass + 1;
+        end
+        if (sat !== 1'b0) begin
+            $display("FAIL[D10-collision] sat=1 (column-mean of in-range V never clamps)");
+            fail = fail + 1; $fatal(1, "attention collision spurious sat");
         end else pass = pass + 1;
 
         // ======================= BASE-OFFSET INDEPENDENCE =================

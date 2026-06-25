@@ -119,39 +119,36 @@ the bounds in §9 are **out of scope**, and the units enforce the documented ran
 
 ---
 
-## 5. Known correctness limitation — attention softmax pad collision
+## 5. ~~Known correctness limitation — attention softmax pad collision~~ ✅ RESOLVED
 
-A read-only adversarial audit of this hardening pass found three real issues. Two
-were **fixed immediately** and are NOT limitations: a `conv2d_unit` output-pixel
-counter that was under-sized for even/small `K` with `pad=1` (now sized
-`OH + 2·PAD_MAX`, so every supported `K` is safe), and a `tpu_axi` STEP that could
-be silently dropped if it landed during a core pipeline stall (now the wrapper
-**holds** the instruction until the core's front end is free and exposes a
-`STATUS.BUSY` bit; a host polls `BUSY==0` before the next STEP).
+A read-only adversarial audit of this hardening pass found three real issues. **All
+three are now fixed** and are no longer limitations:
+- a `conv2d_unit` output-pixel counter under-sized for even/small `K` with `pad=1`
+  (now sized `OH + 2·PAD_MAX`, so every supported `K` is safe — proven by the
+  even-`K` testbench `conv2d_evenk`);
+- a `tpu_axi` STEP that could be silently dropped if it landed during a core
+  pipeline stall (the wrapper now **holds** the instruction until the core's front
+  end is free and exposes a `STATUS.BUSY` bit; a host polls `BUSY==0` before STEP);
+- the attention softmax **pad collision** described below.
 
-The third is a **pre-existing** (v2.0) corner-case left as a documented bound:
+**What it was.** `attention_unit` used to run softmax over `SM_PAD = max(SEQ, SM_LEN)`
+= 8 lanes, padding lanes `SEQ..SM_PAD-1` with the Q7.8 floor `Q78_MIN = -128.0` and
+relying on `exp(pad - rowmax) ≈ 0`. In the extreme corner where **all `SEQ` real
+logits in a row themselves saturate to that floor** (every key equally, maximally
+anti-aligned), the real logits collided with the pad sentinel, softmax saw `SM_PAD`
+identical values → uniform `1/SM_PAD` weights → context scaled by `SEQ/SM_PAD` (a 2×
+magnitude loss at the default `SEQ=4`), and `sat` stayed 0 (silent).
 
-**What.** `attention_unit` runs softmax over `SM_PAD = max(SEQ, SM_LEN)` lanes,
-placing the `SEQ` real logits in lanes `0..SEQ-1` and padding the rest with the most
-negative Q7.8 value `Q78_MIN = -128.0`, relying on `exp(pad - rowmax) ≈ 0`. In the
-EXTREME corner where **all `SEQ` real logits in a row themselves saturate to the
-Q7.8 floor** `Q78_MIN` (every key equally, maximally anti-aligned — scaled scores
-`< -128.0`, far outside the `|val| ≤ 512` tested range), the real logits collide
-with the pad sentinel, softmax sees `SM_PAD` identical values and returns uniform
-`1/SM_PAD` weights, so the `SEQ` real weights sum to `SEQ/SM_PAD` instead of `1.0`
-and the context magnitude is scaled by `SEQ/SM_PAD` (a 2× loss at the default
-`SEQ=4`/`SM_PAD=8`). Because the context accumulator does not overflow, `sat` stays
-**0** — a silent magnitude loss in that corner. (Detailed in the `attention_unit.v`
-SATURATION POLICY header.)
-
-**Why deferred.** The correct fix is a per-lane **valid mask** in `softmax_unit` so
-pad lanes contribute exactly 0 regardless of value (or instantiating softmax at
-`LEN=SEQ` with no pad lanes). Both change the softmax cycle-accurate latency and
-therefore the `attention_unit` / softmax **golden testbenches** (which assert exact
-cycles and `sat==gsat` every vector), so it is a coupled RTL-plus-verification change
-rather than a local patch. The normal operating range (the entire `|val| ≤ 512`
-tested envelope, and any realistic attention workload) is unaffected; this is a
-documented bound on an out-of-range input, not a regression.
+**Fix (shipped).** `attention_unit` now instantiates the softmax submodule at
+**`LEN = SEQ`** (no `SM_PAD` padding, no `Q78_MIN` sentinel), so it runs over exactly
+the `SEQ` real logits and the collision is **impossible by construction**. The
+softmax — and hence attention — also becomes strictly shorter: `LAT_TOTAL` drops from
+123 to **87** cycles at `SEQ=4` (37 at `SEQ=2`); the attention testbenches' exact-
+latency assertions were updated to match. A directed regression (`attention_unit_tb`
+D10: every `Q=+max`, `K=−max`, all logits at the floor) confirms the context is now
+the full uniform-weight column-mean of `V`, not half of it — it fails on the old code
+and passes now. `softmax_unit` and `tpu_top` were not touched; all other tests are
+unchanged (attention 4615 → 4639 from the added test).
 
 ---
 

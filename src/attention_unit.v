@@ -40,30 +40,30 @@
 //       (each element in the low 16 bits of one of the 4 lanes), matching the
 //       architecture's FIXED 4-lane TM line.  D need not equal SEQ.
 //     * SEQ <= SM_LEN  = 8    : a length-SEQ score row is run through the softmax
-//       submodule padded to SM_PAD = max(SEQ,SM_LEN) lanes; SM_PAD<=8 keeps the
-//       softmax scratch at the architecture's natural 2 X-lines + 2 P-lines = 4
-//       lines.  (SEQ also bounds how many TM lines Q/K/V/O occupy; with
-//       TM_LINES=32 and four SEQ-line tiles, SEQ<=8 sits comfortably in TM.)
+//       submodule at LEN=SEQ (NO padding -- the softmax operates over exactly the
+//       SEQ real logits).  The score row spans NSCR_X = ceil(SEQ/4) X-lines plus
+//       NSCR_X P-lines = 2*ceil(SEQ/4) scratch lines (<=4 for SEQ<=8).  (SEQ also
+//       bounds how many TM lines Q/K/V/O occupy; with TM_LINES=32 and four
+//       SEQ-line tiles, SEQ<=8 sits comfortably in TM.)
 //     * SEQ >= 1, D >= 1.
 //   The default (4,4) sits inside this envelope and is exercised exhaustively by
 //   attention_unit_tb; a 2nd in-range size (SEQ=2,D=2) is proven by a second
 //   instance in test/attention_param_tb.v against an INDEPENDENT real golden.
 //
-// SOFTMAX REUSE (default-preserving padding to SM_PAD)
-//   softmax_unit is LEN-generic but the attention OUTPUT contract (and the
-//   committed default latency, asserted bit-exactly by the unit TB) is fixed to
-//   the len-8 softmax.  To stay BYTE-IDENTICAL at the default we instantiate the
-//   softmax at SM_PAD = max(SEQ,`SM_LEN) (== 8 at the default) and place the SEQ
-//   real logits in lanes 0..SEQ-1, PADDING lanes SEQ..SM_PAD-1 with the most
-//   negative Q7.8 logit (`Q78_MIN = -128.0).  exp(min - rowmax) underflows to 0
-//   in the unit's Q15.16 exp, so the pad lanes contribute ~0 to the sum and
-//   receive ~0 probability; the first SEQ output probabilities therefore form
-//   the correct length-SEQ softmax (they sum to ~1.0 to within the unit's
-//   documented +/-2 LSB tolerance).  At the default SEQ=4 this is EXACTLY the
-//   committed "4 real logits + 4 Q78_MIN pads into a len-8 softmax" behavior --
-//   the padding length, scratch span, and latency are all unchanged.  This is
-//   the SPEC §5.4 "length-SEQ variant" realised by reuse of the EXACT committed
-//   softmax_unit -- no forked copy.
+// SOFTMAX REUSE (LEN=SEQ -- NO padding; the pad-collision corner is RESOLVED)
+//   softmax_unit is LEN-generic, so we instantiate it at LEN=SEQ and run the
+//   softmax over EXACTLY the SEQ real logits -- there are NO pad lanes at all.
+//   The score row spans NSCR_X = ceil(SEQ/4) scratch X-lines (the SEQ logits in
+//   lanes 0..SEQ-1; any unused lane of the last partial line is a don't-care the
+//   LEN=SEQ softmax never reads), and the SEQ probabilities come back in NSCR_X
+//   P-lines.  This is the mathematically correct length-SEQ softmax (SPEC §5.4),
+//   realised by reuse of the EXACT committed softmax_unit (no forked copy).
+//   Because there is no `Q78_MIN sentinel, the old pad-collision corner (all SEQ
+//   real logits saturating to the Q7.8 floor and colliding with the pad value ->
+//   uniform 1/SM_PAD weights -> SEQ/SM_PAD magnitude loss) is IMPOSSIBLE BY
+//   CONSTRUCTION.  Running over SEQ lanes instead of the old 8-lane padded vector
+//   also makes the softmax -- and hence attention -- STRICTLY SHORTER (see the
+//   LATENCY note): LAT_TOTAL drops from the old 123 to 87 at the default SEQ=4.
 //
 // Q-FORMATS  (single source of truth: tpu_defs.vh, SPEC §1.3)
 //   Q, K, V elements   : Q7.8   signed 16-bit (low 16 bits of a 32-bit TM lane).
@@ -105,29 +105,28 @@
 //       shift/scale-robust; the renormalized context still tracks the golden);
 //     * the softmax probability 0xFFFF clamp (sm_sat) is a ~1.5e-5 rounding of a
 //       PROBABILITY, internal to the softmax submodule.
-//   NORMAL-RANGE PROPERTY: when the SEQ real softmax weights sum to ~1.0 and the
-//   padding weights are ~0, O is a CONVEX COMBINATION of the value vectors, so
-//   |O| <= max_j |V[j][.]| <= Q7.8 max; `ctx_sat` (and thus `sat`) does not fire
-//   for in-range V.  The TB asserts sat==gsat across all directed + random
-//   vectors in that range (logits |val| <= 512), including all-V-max (which
-//   rounds to exactly +max WITHOUT clamping).
+//   NORMAL-RANGE PROPERTY: the softmax runs over the SEQ real logits (LEN=SEQ,
+//   no pad lanes), so its SEQ weights ALWAYS sum to ~1.0 and O is a CONVEX
+//   COMBINATION of the value vectors; |O| <= max_j |V[j][.]| <= Q7.8 max, so
+//   `ctx_sat` (and thus `sat`) does not fire for in-range V.  The TB asserts
+//   sat==gsat across all directed + random vectors in that range (logits |val|
+//   <= 512), including all-V-max (which rounds to exactly +max WITHOUT clamping).
 //
-//   KNOWN LIMITATION -- pad collision (documented in docs/ROADMAP.md).  The
-//   convex-combination property relies on the pad lanes (set to `Q78_MIN) being
-//   strictly MORE negative than every real logit, so exp(pad - rowmax) underflows
-//   to ~0.  That assumption breaks in the EXTREME corner where ALL SEQ real
-//   logits in a row themselves saturate to the Q7.8 floor `Q78_MIN (true scaled
-//   score < -128.0 -- i.e. every key equally, maximally anti-aligned, far outside
-//   the |val| <= 512 tested range): the real logits then collide with the pad
-//   sentinel, softmax sees SM_PAD IDENTICAL values and returns uniform 1/SM_PAD
-//   weights, so the SEQ real weights sum to SEQ/SM_PAD (not 1.0) and |O| is scaled
-//   by SEQ/SM_PAD (a 2x magnitude loss at the default SEQ=4/SM_PAD=8).  Because
-//   the context accumulator itself does NOT overflow, `ctx_sat`/`sat` stay 0 --
-//   so this corner is a SILENT magnitude loss, NOT flagged.  The correct fix
-//   (DEFERRED -- it changes softmax timing and the cycle-accurate golden) is a
-//   per-lane VALID MASK in softmax so pad lanes contribute exactly 0 regardless
-//   of value, or instantiating softmax at LEN=SEQ (no pad lanes).  Until then
-//   this is a documented bound, not a guarantee.
+//   RESOLVED -- pad collision (formerly the KNOWN LIMITATION; see docs/ROADMAP.md
+//   §5).  The previous scheme padded the score row to SM_PAD = max(SEQ,8) lanes
+//   with the `Q78_MIN sentinel and relied on exp(pad - rowmax) ~ 0.  In the
+//   extreme corner where ALL SEQ real logits in a row themselves saturated to the
+//   Q7.8 floor `Q78_MIN (every key equally, maximally anti-aligned), the real
+//   logits COLLIDED with the pad sentinel: softmax saw SM_PAD identical values
+//   and returned uniform 1/SM_PAD weights, so the SEQ real weights summed to
+//   SEQ/SM_PAD (not 1.0) and |O| was silently scaled by SEQ/SM_PAD (a 2x loss at
+//   the default SEQ=4/SM_PAD=8), with `sat` staying 0.  Instantiating the softmax
+//   at LEN=SEQ removes the pad lanes ENTIRELY, so there is no sentinel to collide
+//   with: the convex-combination property now holds for ALL in-range inputs --
+//   even the all-logits-at-floor corner gives the correct uniform 1/SEQ weights
+//   (column-mean of V), NOT half of it.  This corner is locked in by the directed
+//   COLLISION regression in test/attention_unit_tb.v (Q=+max, K=-max).  The
+//   2x-loss corner no longer exists.
 //
 // INTERFACE
 //   clk, rst                          clock / synchronous active-high reset
@@ -146,8 +145,10 @@
 //   committed latency is dominated by SEQ softmax invocations.  The measured,
 //   committed start->done latency of THIS RTL is `LAT_TOTAL` cycles (a
 //   localparam, derived below from SEQ and the softmax submodule's own closed
-//   form); the TB asserts it bit-exactly.  At the default SEQ=4 (SM_PAD=8,
-//   softmax LAT 23) LAT_TOTAL = 123 -- UNCHANGED from the committed figure.
+//   form at LEN=SEQ); the TB asserts it bit-exactly.  At the default SEQ=4
+//   (LEN=SEQ=4, NSCR_X=1, softmax LAT 14) LAT_TOTAL = 87.  Running softmax over
+//   the SEQ real logits (instead of the old 8-lane padded vector) makes this
+//   STRICTLY SHORTER than the previous padded figure of 123.
 //
 // SYNTHESIZABILITY
 //   Synchronous reset on ALL state; every reg assigned on every path of the one
@@ -192,11 +193,10 @@ module attention_unit #(
     // ===================== parameter-derived geometry ========================
     // S       : sequence length (alias kept for the body's historical naming).
     // NLANES  : lanes per TM line (the FIXED 4-lane architectural line).
-    // SM_PAD  : softmax vector length the score row is padded to.  At the default
-    //           SEQ=4 this is `SM_LEN=8 (BYTE-IDENTICAL "4 real + 4 pads"); for
-    //           SEQ>`SM_LEN it widens to SEQ.  SM_PAD<=8 keeps the scratch at 4
-    //           lines for the supported envelope.
-    // NSCR_X  : softmax X (logit) lines = ceil(SM_PAD/NLANES).
+    // SM_LEN_ : softmax vector length = EXACTLY SEQ (NO padding; see the
+    //           SATURATION POLICY header -- the pad-collision corner is RESOLVED
+    //           by running the softmax over the SEQ real logits only).
+    // NSCR_X  : softmax X (logit) lines = ceil(SEQ/NLANES).
     // SCR_N   : total softmax scratch lines = X lines + P lines = 2*NSCR_X.
     // RCNT_W  : width of the row-read counter (holds 0..SEQ).
     // ROW_W   : width of the current-row index (holds 0..SEQ-1).
@@ -204,8 +204,8 @@ module attention_unit #(
     //           0..SEQ*D-1, both <= max(SEQ*SEQ, SEQ*D); sized to the larger).
     localparam integer S      = SEQ;
     localparam integer NLANES = `LINE_LANES;                       // 4
-    localparam integer SM_PAD = (SEQ > `SM_LEN) ? SEQ : `SM_LEN;   // >= SEQ
-    localparam integer NSCR_X = (SM_PAD + NLANES - 1) / NLANES;    // ceil(/4)
+    localparam integer SM_LEN_= SEQ;                               // softmax length
+    localparam integer NSCR_X = (SM_LEN_ + NLANES - 1) / NLANES;   // ceil(SEQ/4)
     localparam integer SCR_N  = 2 * NSCR_X;                        // X + P lines
     localparam integer RCNT_W = $clog2(SEQ + 1);                   // holds 0..SEQ
     localparam integer ROW_W  = (SEQ > 1) ? $clog2(SEQ) : 1;       // holds 0..SEQ-1
@@ -237,23 +237,27 @@ module attention_unit #(
     // ST_IDLE is cycle 1; `done` is a REGISTERED 1-cycle pulse first OBSERVED
     // high `LAT_TOTAL` cycles later.  Breakdown:
     //   SETUP   = ST_RDQ(SEQ) + ST_RDK(SEQ) + ST_RDV(SEQ) + ST_SCORE(1)
-    //   SM_LAT  = the softmax submodule's committed closed form for SM_PAD lanes:
-    //               5 + ceil(SM_PAD/4) + 2*SM_PAD       (== 23 for SM_PAD=8)
+    //   SM_LAT  = the softmax submodule's committed closed form for SM_LEN_=SEQ
+    //             lanes (NO padding):  5 + ceil(SEQ/4) + 2*SEQ
+    //               (== 14 for SEQ=4 / NSCR_X=1;  == 10 for SEQ=2).
     //   SM_WT   = SM_LAT + 1 : sm_start is REGISTERED in ST_SM_GO, so the
     //             submodule samples it one cycle into ST_SM_WT and then runs its
     //             SM_LAT-cycle pipeline; +1 is the cycle sm_done is observed.
     //   PER_ROW = ST_SM_LD(1) + ST_SM_GO(1) + ST_SM_WT(SM_WT) + ST_CTX(1)
     //   TAIL    = ST_DONE entry (1) + the registered done-observed edge (1) = 2
-    // LAT_TOTAL = SETUP + SEQ*PER_ROW + TAIL.  At default SEQ=4 / SM_PAD=8 this
-    // is 13 + 4*27 + 2 = 123 (UNCHANGED).  These are PURE DOCUMENTATION
-    // localparams (the latency is structural in the FSM, not parameter-driven in
-    // logic), so they are not referenced in logic; the lint_off records that.
+    // LAT_TOTAL = SETUP + SEQ*PER_ROW + TAIL.  Running softmax over the SEQ real
+    // logits (instead of the old 8-lane padded vector) makes the softmax -- and
+    // hence attention -- STRICTLY SHORTER.  At default SEQ=4 / NSCR_X=1 this is
+    // 13 + 4*18 + 2 = 87 (was 123 under the old SM_PAD=8 scheme); at SEQ=2 it is
+    // 7 + 2*14 + 2 = 37.  These are PURE DOCUMENTATION localparams (the latency
+    // is structural in the FSM, not parameter-driven in logic), so they are not
+    // referenced in logic; the lint_off records that.
     /* verilator lint_off UNUSEDPARAM */
-    localparam integer SM_LAT    = 5 + NSCR_X + 2*SM_PAD;              // 23 @ pad8
-    localparam integer SM_WT_LAT = SM_LAT + 1;                        // 24
+    localparam integer SM_LAT    = 5 + NSCR_X + 2*SM_LEN_;            // 14 @ SEQ4
+    localparam integer SM_WT_LAT = SM_LAT + 1;                        // 15
     localparam integer SETUP     = 3*SEQ + 1;                         // 13 @ SEQ4
-    localparam integer PER_ROW   = 1 /*LD*/ + 1 /*GO*/ + SM_WT_LAT /*WT*/ + 1; // 27
-    localparam integer LAT_TOTAL = SETUP + (S * PER_ROW) + 2;         // = 123
+    localparam integer PER_ROW   = 1 /*LD*/ + 1 /*GO*/ + SM_WT_LAT /*WT*/ + 1; // 18
+    localparam integer LAT_TOTAL = SETUP + (S * PER_ROW) + 2;         // = 87 @ SEQ4
     /* verilator lint_on UNUSEDPARAM */
 
     // ===================== latched operands / results ========================
@@ -307,7 +311,7 @@ module attention_unit #(
     // softmax addresses scratch lines 0..SCR_N-1; index by the low SCR_IDX_W bits.
     always @(*) sm_rdata = sm_scratch[sm_raddr[SCR_IDX_W-1:0]];
 
-    softmax_unit #(.LEN(SM_PAD)) u_softmax (
+    softmax_unit #(.LEN(SM_LEN_)) u_softmax (
         .clk      (clk),
         .rst      (rst),
         .start    (sm_start),
@@ -470,10 +474,15 @@ module attention_unit #(
     end
 
     // ===================== combinational softmax X-line packing ==============
-    // Pack score row `row` (SEQ Q7.8 logits) into NSCR_X scratch lines: lane
-    // (l*NLANES + k) carries logit (l*NLANES+k) if that index < SEQ, else the
-    // `Q78_MIN pad (whose exp underflows to ~0 in the softmax).  At the default
-    // SEQ=4 this is exactly {4 real logits in line 0} + {4 Q78_MIN in line 1}.
+    // Pack score row `row` (the SEQ Q7.8 logits) into NSCR_X = ceil(SEQ/NLANES)
+    // scratch lines: lane (l*NLANES + k) carries logit (l*NLANES+k) for every
+    // index < SEQ.  The softmax is instantiated at LEN=SEQ (NO pad lanes), so
+    // there is NO Q78_MIN sentinel: any lane index >= SEQ falls in the last,
+    // partial line and is NEVER read by the LEN=SEQ softmax (its read loop guards
+    // (lcnt*NLANES+k) < LEN), so it is left 0 as a don't-care.  Removing the pad
+    // makes the sentinel-collision corner (old KNOWN LIMITATION) IMPOSSIBLE by
+    // construction: softmax runs over exactly the SEQ real logits.  At the
+    // default SEQ=4 this is a single line {4 real logits}.
     reg [`LINE_W-1:0] sm_xline [0:NSCR_X-1];
     integer xl, xk, xe;
     always @(*) begin
@@ -484,8 +493,7 @@ module attention_unit #(
                 if (xe < SEQ)
                     sm_xline[xl][(xk*`LANE_W) +: `LANE_W] =
                         {16'd0, slog[row*SEQ + xe]};
-                else
-                    sm_xline[xl][(xk*`LANE_W) +: `LANE_W] = {16'd0, `Q78_MIN};
+                // xe >= SEQ : last partial line, never read by LEN=SEQ softmax.
             end
         end
     end
@@ -612,9 +620,10 @@ module attention_unit #(
 
                 // ---------------------------------------------------------
                 // Load score row `row` into the softmax input scratch lines
-                // 0..NSCR_X-1.  Lanes 0..SEQ-1 = the SEQ real logits; the
-                // remaining lanes = Q78_MIN padding (exp underflows to ~0).
-                // sm_xline[] packs this combinationally (parameter-derived).
+                // 0..NSCR_X-1.  Lanes 0..SEQ-1 = the SEQ real logits; there is
+                // NO padding (softmax is instantiated at LEN=SEQ), so any unused
+                // lane of the last partial line is a don't-care.  sm_xline[]
+                // packs this combinationally (parameter-derived).
                 ST_SM_LD: begin
                     for (wl = 0; wl < NSCR_X; wl = wl + 1)
                         sm_scratch[wl] <= sm_xline[wl];

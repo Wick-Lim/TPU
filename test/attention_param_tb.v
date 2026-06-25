@@ -9,7 +9,7 @@
 //   stay byte-identical / same assertion count.  This SEPARATE testbench
 //   instantiates the unit at a DIFFERENT, in-range size to prove the
 //   parameterization is structurally correct: the score (QK^T) walk, the
-//   softmax-row packing/padding, the *V context, every counter/index width
+//   softmax-row packing (LEN=SEQ, no padding), the *V context, every counter/index width
 //   ($clog2), the TM row (un)packing and the latency closed form must all track
 //   SEQ and D -- not a hardcoded 4.
 //
@@ -17,12 +17,13 @@
 //     * Q/K/V/O each occupy SEQ=2 TM lines (vs 4 at the default); each row packs
 //       D=2 elements into lanes 0..1 of ONE 128-bit line (vs 4 lanes) -- so a
 //       fixed-4-lane / fixed-4-row implementation would mis-address.  The score
-//       matrix is 2x2 (vs 4x4), and the softmax runs over SEQ=2 real logits
-//       padded to SM_PAD=8 (the SAME default-preserving padding the unit uses at
-//       SEQ=4, here lanes 2..7 = Q78_MIN), so the committed len-8 softmax_unit is
-//       reused unchanged.  The committed start->done latency for SEQ=2 is
-//       LAT = (3*SEQ+1) + SEQ*(1+1+24+1) + 2 = 7 + 2*27 + 2 = 63 cycles, checked
-//       EXACTLY (it differs from the default 123, so a fixed latency would fail).
+//       matrix is 2x2 (vs 4x4), and the softmax runs over EXACTLY SEQ=2 real
+//       logits (LEN=SEQ, NO padding -- the committed softmax_unit is reused
+//       unchanged at LEN=2), so the score row spans NSCR_X=ceil(2/4)=1 X-line.
+//       The committed start->done latency for SEQ=2 is, from the LEN=SEQ closed
+//       form, LAT = (3*SEQ+1) + SEQ*(SM_LAT+1+3) + 2 with SM_LAT=5+ceil(2/4)+2*2
+//       = 10, i.e. 7 + 2*14 + 2 = 37 cycles, checked EXACTLY (it differs from the
+//       default 87, so a fixed latency would fail).
 //   This sits strictly inside the architectural envelope (D=2 <= LINE_LANES=4;
 //   SEQ=2 <= SM_LEN=8).
 //
@@ -60,7 +61,12 @@ module attention_param_tb;
     // ---- 2nd-size geometry (DIFFERENT from the default 4/4) ----
     localparam integer S    = 2;          // SEQ
     localparam integer D    = 2;          // D_MODEL
-    localparam integer LAT  = 63;         // committed start->done for SEQ=2
+    // Committed start->done latency for SEQ=2, from the LEN=SEQ softmax closed
+    // form (see the DUT header LATENCY note): SETUP=3*SEQ+1=7, SM_LAT=5+ceil(2/4)
+    // +2*2=10, PER_ROW=SM_LAT+1+3=14, LAT=SETUP+SEQ*PER_ROW+2 = 7 + 2*14 + 2 = 37.
+    // (Was 63 under the old SM_PAD=8 padding; softmax now runs over the 2 real
+    // logits, so attention is SHORTER -- and still != the default 87.)
+    localparam integer LAT  = 37;         // committed start->done for SEQ=2
     localparam integer ATOL = 2;          // per-element Q7.8 tolerance (LSB)
     localparam integer NRAND = 180;       // constrained-random vectors
 
