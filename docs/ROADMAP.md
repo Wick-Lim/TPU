@@ -44,49 +44,42 @@ result.
 
 ---
 
-## 2. AXI MASTER for autonomous DMA from external DRAM
+## 2. AXI MASTER for autonomous DMA from external memory ✅ DONE
 
-**Status: NOT done. The current wrapper is SLAVE-only.**
+**Status: SHIPPED.** `src/axi_master_dma.v` is an AXI4-Lite **master** DMA engine:
+a command (`start`/`ext_addr`/`len`/`dir`) makes it drive `AW/W/B` (writes) and
+`AR/R` (reads) with registered handshakes, one outstanding transaction, word-aligned
+increments, and a sticky `err` on non-OKAY responses, exposing an internal sink
+(READ) / source (WRITE) stream. It is verified against an AXI4-Lite slave-memory BFM
+(wait states, in/out-of-range) — `make unittests` → `[axi_master_dma] ALL 7 TESTS`.
 
-`src/tpu_axi.v` is an AXI4-Lite **slave** ([`../SPEC.md`](../SPEC.md) §10): a host on
-the bus drives the core one instruction at a time (write `INSTR`, write `CTRL.STEP`,
-read back `RESULT`/`STATUS`). The wrapper **cannot initiate bus transactions** — it
-has no AW/AR *master* channels and so cannot fetch a program or stream tiles from
-external DRAM on its own; every byte of program-visible state is pushed in by the
-host.
-
-A v3 step would add an **AXI master** port so the accelerator can autonomously DMA
-operand/result tiles between external DRAM and the on-chip `TM`/`DMEM`, turning the
-single-step issue model into a descriptor-driven offload engine.
-
-**Why deferred.** A master port is a materially larger block (read/write address
-generation, burst handling, outstanding-transaction tracking, and a DMA descriptor
-interface into the existing `dma_controller`/`TM` paths), and it needs its own BFM +
-goldens. The slave wrapper was the minimal, fully-verifiable step to make the core
-SoC-integratable; the master path is the next, separately-scoped increment.
+`src/tpu_soc.v` integrates it: on a host `DMA_CTRL.START` it autonomously **fetches a
+program from external memory** over the master port and runs it on the core — no
+host single-stepping. See item below for the full two-clock SoC.
 
 ---
 
-## 3. Multi-clock CDC (the wrapper is single-`ACLK`)
+## 3. Multi-clock CDC ✅ DONE
 
-**Status: NOT done. The wrapper is a single clock domain.**
+**Status: SHIPPED.** `src/cdc_async_fifo.v` is a textbook dual-clock async FIFO
+(gray-code pointers crossed via 2-FF synchronizers, dual-port RAM, registered
+full/empty); verified across asynchronous 7ns/11ns clocks streaming 300 words with
+fill-to-full/drain-to-empty and never-violate safety — `[cdc_async_fifo] ALL 309
+TESTS`.
 
-`src/tpu_axi.v` runs the AXI slave logic **and** the core on the **same `ACLK`**, with
-`ARESETn` assumed synchronous to `ACLK` ([`../SPEC.md`](../SPEC.md) §10). There is no
-clock-domain-crossing logic: the bus and the compute core cannot run at independent
-frequencies.
+`src/tpu_soc.v` (`make soc`) is a genuine **two-clock SoC**: an `ACLK` bus domain
+(AXI slave + `axi_master_dma` + FIFO write/read sides) and an independent `CCLK` core
+domain (the unchanged `TPU` + an instruction sequencer), bridged by **two** async CDC
+FIFOs (instruction `ACLK→CCLK`, result `CCLK→ACLK`) plus single-bit 2-FF
+synchronizers for the control pulses — no raw multi-bit crossings. Its TB runs real
+programs end-to-end on asynchronous `ACLK=10ns` / `CCLK=13ns` (measured phase drift
+0.5–9.5 ns): the host writes a DMA descriptor, the accelerator fetches the program
+from external memory, executes it across the clock boundary, and the host reads the
+correct `RESULT` back (`12`, `63`) — `[tpu_soc] ALL 21 TESTS`. No latches, lint and
+`check -assert` clean for `top=tpu_soc`.
 
-A realistic SoC often clocks the AXI fabric and a compute accelerator separately
-(e.g. a fast bus and a slower deep-datapath core, especially given the deep
-combinational paths in item 1). A v3 step would split the wrapper into a bus clock
-domain and a core clock domain with proper CDC (handshake/FIFO synchronizers on the
-register interface and the instruction/result paths).
-
-**Why deferred.** CDC adds synchronizer logic and a multi-clock verification burden
-(metastability/handshake correctness, dual-clock TB) that the single-clock wrapper
-deliberately avoids to keep the issue model simple and the BFM TB deterministic. It
-becomes worthwhile precisely once the core is pipelined (item 1) and wants its own
-clock.
+These resolve the former "slave-only / single-clock" limitation of `src/tpu_axi.v`
+(which remains as the simple single-clock control wrapper).
 
 ---
 

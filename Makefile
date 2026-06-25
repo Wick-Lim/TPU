@@ -20,6 +20,7 @@ BUILD_DIR  := build
 SIM_BIN    := $(BUILD_DIR)/tpu_sim
 HAZARD_BIN := $(BUILD_DIR)/hazard_sim
 AXI_BIN    := $(BUILD_DIR)/axi_sim
+SOC_BIN    := $(BUILD_DIR)/soc_sim
 
 # ---- v2.0 design source set (file name == module name, except top TPU) ----
 DESIGN := \
@@ -39,6 +40,8 @@ DESIGN := \
 
 # ---- AXI4-Lite wrapper source: the slave wrapper + the full unchanged core. ----
 AXI_DESIGN := src/tpu_axi.v $(DESIGN)
+# ---- Two-clock SoC: AXI master DMA + async CDC FIFOs + the unchanged core. ----
+SOC_DESIGN := src/tpu_soc.v src/axi_master_dma.v src/cdc_async_fifo.v $(DESIGN)
 
 # ---- per-unit TBs.  Each builds against its own module (file==module); the
 #      attention TB also needs softmax_unit (it instantiates the real unit). ----
@@ -48,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi unittests sim wave lint synth ppa clean
+.PHONY: all build test hazard axi soc unittests sim wave lint synth ppa clean
 
 all: test hazard unittests lint synth
 
@@ -77,6 +80,16 @@ $(AXI_BIN): test/tpu_axi_tb.v $(AXI_DESIGN) src/tpu_defs.vh
 
 axi: $(AXI_BIN)
 	$(VVP) $(AXI_BIN)
+
+# Two-clock SoC end-to-end TB: external-memory BFM -> AXI master DMA -> instr CDC
+# -> core (autonomous program execution) -> result CDC -> AXI slave readback, on
+# two asynchronous clocks.
+$(SOC_BIN): test/tpu_soc_tb.v $(SOC_DESIGN) src/tpu_defs.vh
+	@mkdir -p $(BUILD_DIR)
+	$(IVERILOG) $(IFLAGS) -o $(SOC_BIN) test/tpu_soc_tb.v $(SOC_DESIGN)
+
+soc: $(SOC_BIN)
+	$(VVP) $(SOC_BIN)
 
 # Build + run every per-unit TB.  attention_unit additionally needs softmax_unit.
 unittests:
@@ -118,6 +131,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/cdc_async_fifo_sim test/cdc_async_fifo_tb.v src/cdc_async_fifo.v
 	@printf '[%s] ' "cdc_async_fifo"; $(VVP) $(BUILD_DIR)/cdc_async_fifo_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: cdc_async_fifo"; exit 1; }
+	@# Two-clock SoC: autonomous program fetch (AXI master DMA) + CDC + core execution.
+	@$(IVERILOG) $(IFLAGS) -o $(SOC_BIN) test/tpu_soc_tb.v $(SOC_DESIGN)
+	@printf '[%s] ' "tpu_soc"; $(VVP) $(SOC_BIN) | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: tpu_soc"; exit 1; }
 	@echo "unittests: all per-unit TBs passed"
 
 wave: $(SIM_BIN)
