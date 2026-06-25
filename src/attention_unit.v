@@ -1,35 +1,75 @@
 `timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
-// attention_unit.v  --  true scaled-dot-product attention, seq=4 d=4 (SPEC §5.4)
+// attention_unit.v  --  true scaled-dot-product attention, SEQ-/D-generic
+//                       (default SEQ=`SEQ_LEN=4, D=`D_MODEL=4) (SPEC §5.4)
 //----------------------------------------------------------------------------
 // PURPOSE
-//   Computes one head of scaled dot-product attention over SEQ_LEN(4) tokens of
-//   dimension D_MODEL(4), all in Q7.8 fixed point:
+//   Computes one head of scaled dot-product attention over SEQ tokens of
+//   dimension D, all in Q7.8 fixed point:
 //
 //       Attn(Q,K,V) = softmax( (Q . K^T) / sqrt(d) ) . V
 //
 //   This REPLACES the v1.5 single-element "attention" (which had NO softmax and
 //   truncated the (query*key) product into 32 bits -- the documented v1.5 bug).
 //   v2.0 computes the scores in a full 48-bit Q15.16 accumulator, applies an
-//   EXACT 1/sqrt(4) = >>1 scale with round-half-up, runs a genuine exponential
-//   softmax over each length-4 row (by INSTANTIATING the already-built len-8
+//   EXACT 1/sqrt(d) scale with round-half-up, runs a genuine exponential
+//   softmax over each length-SEQ row (by INSTANTIATING the LEN-generic
 //   softmax_unit), and forms the context in a second 48-bit accumulator with an
 //   explicit round-half-up + saturate narrowing and a sticky `sat` flag.  No
 //   silent truncation survives anywhere -- the bug class is structurally gone.
 //
-//   It is TM->TM: it reads Q/K/V (4 lines each) from tile memory and writes the
-//   4 context lines O.  It exposes raw TM ACCESS PORTS only (the surrounding
-//   datapath / unit TB owns and models the tile memory).  The single submodule
-//   it instantiates is src/softmax_unit.v; that submodule runs entirely on an
-//   INTERNAL 4-line scratch memory inside this unit, so the softmax never
-//   contends for the external TM port (clean, self-contained arbitration).
+//   It is TM->TM: it reads Q/K/V (SEQ lines each) from tile memory and writes
+//   the SEQ context lines O.  It exposes raw TM ACCESS PORTS only (the
+//   surrounding datapath / unit TB owns and models the tile memory).  The single
+//   submodule it instantiates is src/softmax_unit.v; that submodule runs
+//   entirely on an INTERNAL scratch memory inside this unit, so the softmax
+//   never contends for the external TM port (clean, self-contained arbitration).
+//
+// PARAMETERIZATION (NEW in v2.0; default == tpu_defs.vh, byte-identical)
+//   parameter integer SEQ = `SEQ_LEN, D = `D_MODEL  (defaults 4, 4).
+//   Every loop bound, the QK^T / softmax / *V dimension, the counter/index
+//   widths ($clog2), the softmax-scratch line span and the TM packing indices
+//   are derived from SEQ and D -- NO size-literal tricks remain.  In particular
+//   the v1.x "{row[1:0],col[1:0]} == row*4+col" mod-4 bit-truncation is replaced
+//   by a real (row*SEQ + col) index, and the fixed 3-bit S_LAST/rcnt/row
+//   counters are replaced by $clog2-sized counters.
+//
+//   SUPPORTED RANGE (architectural envelope):
+//     * D   <= LINE_LANES = 4 : one Q/K/V/O ROW packs into ONE 128-bit TM line
+//       (each element in the low 16 bits of one of the 4 lanes), matching the
+//       architecture's FIXED 4-lane TM line.  D need not equal SEQ.
+//     * SEQ <= SM_LEN  = 8    : a length-SEQ score row is run through the softmax
+//       submodule padded to SM_PAD = max(SEQ,SM_LEN) lanes; SM_PAD<=8 keeps the
+//       softmax scratch at the architecture's natural 2 X-lines + 2 P-lines = 4
+//       lines.  (SEQ also bounds how many TM lines Q/K/V/O occupy; with
+//       TM_LINES=32 and four SEQ-line tiles, SEQ<=8 sits comfortably in TM.)
+//     * SEQ >= 1, D >= 1.
+//   The default (4,4) sits inside this envelope and is exercised exhaustively by
+//   attention_unit_tb; a 2nd in-range size (SEQ=2,D=2) is proven by a second
+//   instance in test/attention_param_tb.v against an INDEPENDENT real golden.
+//
+// SOFTMAX REUSE (default-preserving padding to SM_PAD)
+//   softmax_unit is LEN-generic but the attention OUTPUT contract (and the
+//   committed default latency, asserted bit-exactly by the unit TB) is fixed to
+//   the len-8 softmax.  To stay BYTE-IDENTICAL at the default we instantiate the
+//   softmax at SM_PAD = max(SEQ,`SM_LEN) (== 8 at the default) and place the SEQ
+//   real logits in lanes 0..SEQ-1, PADDING lanes SEQ..SM_PAD-1 with the most
+//   negative Q7.8 logit (`Q78_MIN = -128.0).  exp(min - rowmax) underflows to 0
+//   in the unit's Q15.16 exp, so the pad lanes contribute ~0 to the sum and
+//   receive ~0 probability; the first SEQ output probabilities therefore form
+//   the correct length-SEQ softmax (they sum to ~1.0 to within the unit's
+//   documented +/-2 LSB tolerance).  At the default SEQ=4 this is EXACTLY the
+//   committed "4 real logits + 4 Q78_MIN pads into a len-8 softmax" behavior --
+//   the padding length, scratch span, and latency are all unchanged.  This is
+//   the SPEC §5.4 "length-SEQ variant" realised by reuse of the EXACT committed
+//   softmax_unit -- no forked copy.
 //
 // Q-FORMATS  (single source of truth: tpu_defs.vh, SPEC §1.3)
 //   Q, K, V elements   : Q7.8   signed 16-bit (low 16 bits of a 32-bit TM lane).
 //   score MAC product  : Q7.8 * Q7.8 = Q14.16 (30-bit signed, fits 32 bits).
-//   score accumulator  : Q15.16, 48-bit signed (4 Q14.16 products, no overflow).
-//   scaled score S[i][j]: (acc + round) >> 1, then >> FRAC into Q7.8 logit space
+//   score accumulator  : Q15.16, 48-bit signed (D Q14.16 products, no overflow).
+//   scaled score S[i][j]: (acc + round) >> 1, then narrowed into Q7.8 logit space
 //                         for softmax (the >>1 is the EXACT 1/sqrt(4) scale).
 //   softmax weights W  : Q0.16 unsigned probabilities (0xFFFF ~= 1.0).
 //   context MAC product: W(Q0.16) * V(Q7.8) = Q7.24 (held left-aligned, see below)
@@ -37,59 +77,62 @@
 //
 // SCORE -> SOFTMAX-LOGIT SCALING (the EXACT >>1, documented)
 //   Raw score acc_S[i][j] = SUM_{d} Q[i][d]*K[j][d]  is Q15.16 in 48 bits.
-//   The 1/sqrt(d) = 1/sqrt(4) = 1/2 scale is an EXACT right shift by 1.  We apply
-//   it with round-half-up:  scaled = (acc_S + (1<<0)) >>> 1   (Q15.16 still).
-//   The softmax_unit consumes Q7.8 LOGITS (16-bit), so the scaled Q15.16 score is
-//   narrowed to a Q7.8 logit by a LOCAL round-half-up+saturate helper that is
-//   bit-exact to the (now signed-correct) shared tpu_defs.vh narrowing macro --
-//   see the round-half-up note below.  softmax is shift-invariant, so any saturation of
-//   an individual logit only matters relative to the row max; the row max itself
-//   is subtracted inside softmax_unit for numerical stability.  Score-logit
-//   saturation is a softmax-INPUT clamp and is intentionally NOT folded into the
-//   output `sat` flag (see the SATURATION POLICY note below).
-//
-// LENGTH-4 SOFTMAX VIA THE LEN-8 softmax_unit (consistent reuse)
-//   softmax_unit is hardwired to SM_LEN=8.  A length-4 row is run through it by
-//   placing the 4 real logits in lanes 0..3 and PADDING lanes 4..7 with the most
-//   negative Q7.8 logit (`Q78_MIN = -128.0).  exp(min - rowmax) underflows to 0
-//   in the unit's Q15.16 exp, so the 4 padding lanes contribute ~0 to the sum and
-//   receive ~0 probability; the first 4 output probabilities therefore form the
-//   correct length-4 softmax (they sum to ~1.0 to within the unit's documented
-//   +/-2 LSB tolerance).  This is the SPEC §5.4 "length-4 variant consistent with
-//   it" realised by reuse of the EXACT committed softmax_unit -- no forked copy.
+//   The 1/sqrt(d) scale is applied as the committed EXACT right shift by 1
+//   (the v1.5/default 1/sqrt(4)=1/2): scaled = (acc_S + 1) >>> 1   (Q15.16
+//   still).  The softmax_unit consumes Q7.8 LOGITS (16-bit), so the scaled
+//   Q15.16 score is narrowed to a Q7.8 logit by a LOCAL round-half-up+saturate
+//   helper that is bit-exact to the shared tpu_defs.vh narrowing macro.  softmax
+//   is shift-invariant, so any saturation of an individual logit only matters
+//   relative to the row max; the row max itself is subtracted inside
+//   softmax_unit for numerical stability.  Score-logit saturation is a
+//   softmax-INPUT clamp and is intentionally NOT folded into the output `sat`
+//   flag (see the SATURATION POLICY note below).
 //
 // CONTEXT  O[i][d] = SUM_{j} W[i][j] * V[j][d]
 //   W[i][j] is Q0.16 (unsigned [0,1]); V[j][d] is Q7.8 signed.  The product
 //   W*V is Q0.16 * Q7.8 = Q7.24.  To accumulate in the shared Q15.16 48-bit
 //   format, each product is sign-extended then right-shifted by
 //   (Q016_FRAC - Q78_FRAC) = 8 with round-half-up so the running sum is Q15.16;
-//   four such terms cannot overflow 48 bits.  The 48-bit sum is then narrowed to
+//   SEQ such terms cannot overflow 48 bits.  The 48-bit sum is then narrowed to
 //   Q7.8 by a LOCAL round-half-up + saturate (signed-bias) helper.
 //
 // SATURATION POLICY (the `sat` flag)
 //   The attention OUTPUT is the context O.  Its only output narrowing is the
 //   W.V -> Q7.8 step, so `sat` is the sticky OR of CONTEXT narrowing saturation
-//   (`ctx_sat`) ONLY.  Two clamps are DELIBERATELY excluded because neither is
-//   an output-magnitude loss of this unit:
+//   (`ctx_sat`) ONLY.  Two clamps are DELIBERATELY excluded because in the normal
+//   operating range neither is an output-magnitude loss of this unit:
 //     * the score -> Q7.8-logit clamp is a softmax-INPUT clamp (softmax is
 //       shift/scale-robust; the renormalized context still tracks the golden);
 //     * the softmax probability 0xFFFF clamp (sm_sat) is a ~1.5e-5 rounding of a
 //       PROBABILITY, internal to the softmax submodule.
-//   PROVABLE PROPERTY: because the four real softmax weights sum to ~1.0 and the
+//   NORMAL-RANGE PROPERTY: when the SEQ real softmax weights sum to ~1.0 and the
 //   padding weights are ~0, O is a CONVEX COMBINATION of the value vectors, so
-//   |O| <= max_j |V[j][.]| <= Q7.8 max.  Hence `ctx_sat` (and thus `sat`)
-//   CANNOT fire for in-range V -- saturation is unreachable BY CONSTRUCTION, a
-//   correctness guarantee rather than a gap.  The flag is still implemented per
-//   SPEC §1.3 (round+saturate with a visible flag) and is asserted to stay 0 by
-//   the TB across all directed + random vectors (including all-V-max, which
-//   rounds to exactly +max WITHOUT clamping).  This is the structural cure for
-//   the v1.5 silent-truncation bug: scores live in full 48-bit, and the output
-//   magnitude is bounded and observable.
+//   |O| <= max_j |V[j][.]| <= Q7.8 max; `ctx_sat` (and thus `sat`) does not fire
+//   for in-range V.  The TB asserts sat==gsat across all directed + random
+//   vectors in that range (logits |val| <= 512), including all-V-max (which
+//   rounds to exactly +max WITHOUT clamping).
+//
+//   KNOWN LIMITATION -- pad collision (documented in docs/ROADMAP.md).  The
+//   convex-combination property relies on the pad lanes (set to `Q78_MIN) being
+//   strictly MORE negative than every real logit, so exp(pad - rowmax) underflows
+//   to ~0.  That assumption breaks in the EXTREME corner where ALL SEQ real
+//   logits in a row themselves saturate to the Q7.8 floor `Q78_MIN (true scaled
+//   score < -128.0 -- i.e. every key equally, maximally anti-aligned, far outside
+//   the |val| <= 512 tested range): the real logits then collide with the pad
+//   sentinel, softmax sees SM_PAD IDENTICAL values and returns uniform 1/SM_PAD
+//   weights, so the SEQ real weights sum to SEQ/SM_PAD (not 1.0) and |O| is scaled
+//   by SEQ/SM_PAD (a 2x magnitude loss at the default SEQ=4/SM_PAD=8).  Because
+//   the context accumulator itself does NOT overflow, `ctx_sat`/`sat` stay 0 --
+//   so this corner is a SILENT magnitude loss, NOT flagged.  The correct fix
+//   (DEFERRED -- it changes softmax timing and the cycle-accurate golden) is a
+//   per-lane VALID MASK in softmax so pad lanes contribute exactly 0 regardless
+//   of value, or instantiating softmax at LEN=SEQ (no pad lanes).  Until then
+//   this is a documented bound, not a guarantee.
 //
 // INTERFACE
 //   clk, rst                          clock / synchronous active-high reset
 //   start                             1-cycle pulse: latch bases, begin attention
-//   q_base,k_base,v_base,o_base [4:0] TM line indices of Q,K,V,O tiles (4 lines ea)
+//   q_base,k_base,v_base,o_base [4:0] TM line indices of Q,K,V,O tiles (SEQ ea)
 //   busy                              high while an op is in flight (registered)
 //   done                              1-cycle pulse when the last O line is driven
 //   sat                               valid with done; 1 iff any narrowing clamped
@@ -99,13 +142,12 @@
 //   tm_we (out) / tm_waddr [4:0] (out) / tm_wdata [127:0] (out)
 //
 // LATENCY (deterministic, committed; asserted EXACTLY by the unit TB)
-//   The unit serially REUSES the len-8 softmax_unit once per output row, so the
-//   true committed latency is dominated by 4 softmax invocations rather than the
-//   SPEC §3.3 rough estimate (~44, which assumed a fused length-4 softmax).  The
-//   measured, committed start->done latency of THIS RTL is `LAT_TOTAL` cycles
-//   (a localparam, derived below); the TB asserts it bit-exactly.  The deviation
-//   from the ~44 estimate is an honest consequence of reusing the proven len-8
-//   softmax_unit four times instead of forking a bespoke len-4 softmax.
+//   The unit serially REUSES the softmax_unit once per output row, so the true
+//   committed latency is dominated by SEQ softmax invocations.  The measured,
+//   committed start->done latency of THIS RTL is `LAT_TOTAL` cycles (a
+//   localparam, derived below from SEQ and the softmax submodule's own closed
+//   form); the TB asserts it bit-exactly.  At the default SEQ=4 (SM_PAD=8,
+//   softmax LAT 23) LAT_TOTAL = 123 -- UNCHANGED from the committed figure.
 //
 // SYNTHESIZABILITY
 //   Synchronous reset on ALL state; every reg assigned on every path of the one
@@ -113,7 +155,13 @@
 //   registered state (no comb loop); no real/$display/$random/initial in the
 //   module.  Passes verilator --lint-only -Wall and iverilog -g2012 -Wall.
 //============================================================================
-module attention_unit (
+module attention_unit #(
+    // Sequence length and model/head dimension.  DEFAULT to the tpu_defs.vh
+    // values so behavior is BYTE-IDENTICAL to the committed seq4/d4 unit at its
+    // default (and so the system TB, which instantiates defaults, is unaffected).
+    parameter integer SEQ = `SEQ_LEN,
+    parameter integer D   = `D_MODEL
+) (
     input  wire                 clk,
     input  wire                 rst,
 
@@ -141,53 +189,71 @@ module attention_unit (
     output reg  [`LINE_W-1:0]   tm_wdata
 );
 
-    // ===================== local constants (NOT in tpu_defs.vh) ==============
-    localparam integer S = `SEQ_LEN;   // 4
-    localparam integer D = `D_MODEL;   // 4
-    localparam [2:0] S_LAST = 3'd3;  // SEQ_LEN-1, sized for clean 3-bit compares
+    // ===================== parameter-derived geometry ========================
+    // S       : sequence length (alias kept for the body's historical naming).
+    // NLANES  : lanes per TM line (the FIXED 4-lane architectural line).
+    // SM_PAD  : softmax vector length the score row is padded to.  At the default
+    //           SEQ=4 this is `SM_LEN=8 (BYTE-IDENTICAL "4 real + 4 pads"); for
+    //           SEQ>`SM_LEN it widens to SEQ.  SM_PAD<=8 keeps the scratch at 4
+    //           lines for the supported envelope.
+    // NSCR_X  : softmax X (logit) lines = ceil(SM_PAD/NLANES).
+    // SCR_N   : total softmax scratch lines = X lines + P lines = 2*NSCR_X.
+    // RCNT_W  : width of the row-read counter (holds 0..SEQ).
+    // ROW_W   : width of the current-row index (holds 0..SEQ-1).
+    // SIDX_W  : width of a flat score/QKV element index (holds 0..SEQ*SEQ-1 and
+    //           0..SEQ*D-1, both <= max(SEQ*SEQ, SEQ*D); sized to the larger).
+    localparam integer S      = SEQ;
+    localparam integer NLANES = `LINE_LANES;                       // 4
+    localparam integer SM_PAD = (SEQ > `SM_LEN) ? SEQ : `SM_LEN;   // >= SEQ
+    localparam integer NSCR_X = (SM_PAD + NLANES - 1) / NLANES;    // ceil(/4)
+    localparam integer SCR_N  = 2 * NSCR_X;                        // X + P lines
+    localparam integer RCNT_W = $clog2(SEQ + 1);                   // holds 0..SEQ
+    localparam integer ROW_W  = (SEQ > 1) ? $clog2(SEQ) : 1;       // holds 0..SEQ-1
+
+    // last row index, sized to the row counter.
+    localparam [RCNT_W-1:0] S_LAST = RCNT_W'(SEQ - 1);
 
     // ---- FSM states ----
     localparam [3:0] ST_IDLE   = 4'd0;
-    localparam [3:0] ST_RDQ    = 4'd1;  // read 4 Q rows  (4 cycles)
-    localparam [3:0] ST_RDK    = 4'd2;  // read 4 K rows  (4 cycles)
-    localparam [3:0] ST_RDV    = 4'd3;  // read 4 V rows  (4 cycles)
-    localparam [3:0] ST_SCORE  = 4'd4;  // compute all 16 scaled scores (1 cycle)
+    localparam [3:0] ST_RDQ    = 4'd1;  // read SEQ Q rows  (SEQ cycles)
+    localparam [3:0] ST_RDK    = 4'd2;  // read SEQ K rows  (SEQ cycles)
+    localparam [3:0] ST_RDV    = 4'd3;  // read SEQ V rows  (SEQ cycles)
+    localparam [3:0] ST_SCORE  = 4'd4;  // compute all SEQ*SEQ scaled scores (1 cyc)
     localparam [3:0] ST_SM_LD  = 4'd5;  // load score row i into softmax scratch
     localparam [3:0] ST_SM_GO  = 4'd6;  // pulse softmax start
     localparam [3:0] ST_SM_WT  = 4'd7;  // wait for softmax done, capture weights
     localparam [3:0] ST_CTX    = 4'd8;  // compute O row i, drive its TM write
     localparam [3:0] ST_DONE   = 4'd9;  // 1-cycle done pulse
 
-    // Softmax scratch line indices (internal 4-line scratch memory).  Two views:
-    //   *_5 : 5-bit TM_IDX_W constants wired to the softmax submodule's x/p base.
-    //   *_2 : 2-bit constants for indexing the 4-line scratch array directly.
-    localparam [`TM_IDX_W-1:0] SM_XBASE = 5'd0;  // logits  -> scratch lines 0,1
-    localparam [`TM_IDX_W-1:0] SM_PBASE = 5'd2;  // probs   <- scratch lines 2,3
-    localparam [1:0] SCR_X0 = 2'd0;  // scratch idx of logits line 0
-    localparam [1:0] SCR_X1 = 2'd1;  // scratch idx of logits line 1
-    localparam [1:0] SCR_P0 = 2'd2;  // scratch idx of probs  line 0
+    // Softmax scratch line indices (internal scratch memory).  The softmax X
+    // (logit) tile is scratch lines 0..NSCR_X-1; the P (prob) tile is lines
+    // NSCR_X..2*NSCR_X-1.  At the default these are X={0,1}, P={2,3}.
+    localparam [`TM_IDX_W-1:0] SM_XBASE = `TM_IDX_W'(0);
+    localparam [`TM_IDX_W-1:0] SM_PBASE = `TM_IDX_W'(NSCR_X);
+    localparam integer         SCR_IDX_W = (SCR_N > 1) ? $clog2(SCR_N) : 1;
 
     // Committed deterministic latency (asserted EXACTLY by the unit TB).
     // Counting convention (matches the TB): the cycle `start` is sampled high in
     // ST_IDLE is cycle 1; `done` is a REGISTERED 1-cycle pulse first OBSERVED
-    // high `LAT_TOTAL` cycles later (the FSM enters ST_DONE one cycle before
-    // `done` is observed).  Breakdown:
-    //   SETUP   = ST_RDQ(4) + ST_RDK(4) + ST_RDV(4) + ST_SCORE(1)          = 13
-    //   PER_ROW = ST_SM_LD(1) + ST_SM_GO(1) + ST_SM_WT(24) + ST_CTX(1)     = 27
-    //     ST_SM_WT spans 24 cycles: sm_start is REGISTERED in ST_SM_GO, so the
-    //     softmax submodule samples it one cycle into ST_SM_WT and then runs its
-    //     committed 22-cycle pipeline; 1 (start-sample latency) + 22 + 1 (the
-    //     cycle sm_done is observed) = 24 cycles resident in ST_SM_WT.
-    //   TAIL    = ST_DONE entry (1) + the registered done-observed edge (1)   = 2
-    // LAT_TOTAL = 13 + SEQ_LEN*27 + 2 = 13 + 4*27 + 2 = 123 cycles.
-    // These are PURE DOCUMENTATION localparams (the latency is structural in the
-    // FSM, not parameter-driven), so they are intentionally not referenced in
-    // logic; the narrow UNUSEDPARAM lint_off records that.
+    // high `LAT_TOTAL` cycles later.  Breakdown:
+    //   SETUP   = ST_RDQ(SEQ) + ST_RDK(SEQ) + ST_RDV(SEQ) + ST_SCORE(1)
+    //   SM_LAT  = the softmax submodule's committed closed form for SM_PAD lanes:
+    //               5 + ceil(SM_PAD/4) + 2*SM_PAD       (== 23 for SM_PAD=8)
+    //   SM_WT   = SM_LAT + 1 : sm_start is REGISTERED in ST_SM_GO, so the
+    //             submodule samples it one cycle into ST_SM_WT and then runs its
+    //             SM_LAT-cycle pipeline; +1 is the cycle sm_done is observed.
+    //   PER_ROW = ST_SM_LD(1) + ST_SM_GO(1) + ST_SM_WT(SM_WT) + ST_CTX(1)
+    //   TAIL    = ST_DONE entry (1) + the registered done-observed edge (1) = 2
+    // LAT_TOTAL = SETUP + SEQ*PER_ROW + TAIL.  At default SEQ=4 / SM_PAD=8 this
+    // is 13 + 4*27 + 2 = 123 (UNCHANGED).  These are PURE DOCUMENTATION
+    // localparams (the latency is structural in the FSM, not parameter-driven in
+    // logic), so they are not referenced in logic; the lint_off records that.
     /* verilator lint_off UNUSEDPARAM */
-    localparam integer SM_WT_LAT = 24;
-    localparam integer SETUP     = 4 + 4 + 4 + 1;                       // 13
+    localparam integer SM_LAT    = 5 + NSCR_X + 2*SM_PAD;              // 23 @ pad8
+    localparam integer SM_WT_LAT = SM_LAT + 1;                        // 24
+    localparam integer SETUP     = 3*SEQ + 1;                         // 13 @ SEQ4
     localparam integer PER_ROW   = 1 /*LD*/ + 1 /*GO*/ + SM_WT_LAT /*WT*/ + 1; // 27
-    localparam integer LAT_TOTAL = SETUP + (S * PER_ROW) + 2;          // = 123
+    localparam integer LAT_TOTAL = SETUP + (S * PER_ROW) + 2;         // = 123
     /* verilator lint_on UNUSEDPARAM */
 
     // ===================== latched operands / results ========================
@@ -205,25 +271,25 @@ module attention_unit (
     // ---- bookkeeping ----
     reg [3:0]              state;
     reg [`TM_IDX_W-1:0]    q_base_q, k_base_q, v_base_q, o_base_q;
-    reg [2:0]              rcnt;     // generic small counter (0..S)
-    reg [2:0]              row;      // current output/softmax row (0..S-1)
+    reg [RCNT_W-1:0]       rcnt;     // generic small counter (0..S)
+    reg [ROW_W-1:0]        row;      // current output/softmax row (0..S-1)
 
-    // ===================== internal 4-line softmax scratch ===================
+    // ===================== internal softmax scratch ==========================
     // The instantiated softmax_unit reads/writes THIS scratch only, never the
-    // external TM, so there is no external-port arbitration.
-    reg [`LINE_W-1:0] sm_scratch [0:3];
+    // external TM, so there is no external-port arbitration.  SCR_N lines
+    // (2*NSCR_X) cover both the X (logit) and P (prob) tiles.
+    reg [`LINE_W-1:0] sm_scratch [0:SCR_N-1];
 
     // softmax handshake wiring.
     //   * sm_busy / sm_argmax are produced by the submodule but NOT consumed
-    //     here (the FSM sequences purely off sm_done; argmax/busy carry no role
-    //     in the attention pipeline).  Their declarations are wrapped in a narrow
+    //     here (the FSM sequences purely off sm_done).  Wrapped in a narrow
     //     UNUSEDSIGNAL lint_off documenting the deliberate non-use.
     //   * sm_sat (softmax's own 0xFFFF probability clamp) is an internal
     //     renormalization artifact, NOT an attention-output magnitude loss, so it
     //     is intentionally NOT consumed (see the `sat` policy in the header).
     //   * sm_raddr / sm_waddr are 5-bit (TM_IDX_W) but the internal scratch is
-    //     only 4 lines, so only the low 2 bits are used; the lint_off covers the
-    //     intentionally-unused high index bits [4:2] too.
+    //     only SCR_N lines, so only the low SCR_IDX_W bits are used; the lint_off
+    //     covers the intentionally-unused high index bits too.
     reg                  sm_start;
     wire                 sm_done;
     wire                 sm_we;
@@ -238,11 +304,10 @@ module attention_unit (
     /* verilator lint_on UNUSEDSIGNAL */
 
     // Combinational read of the internal scratch for the softmax submodule.
-    // softmax addresses lines 0..3 (SM_XBASE,+1 and SM_PBASE,+1); scratch is 4
-    // lines, so index by the low 2 bits.
-    always @(*) sm_rdata = sm_scratch[sm_raddr[1:0]];
+    // softmax addresses scratch lines 0..SCR_N-1; index by the low SCR_IDX_W bits.
+    always @(*) sm_rdata = sm_scratch[sm_raddr[SCR_IDX_W-1:0]];
 
-    softmax_unit u_softmax (
+    softmax_unit #(.LEN(SM_PAD)) u_softmax (
         .clk      (clk),
         .rst      (rst),
         .start    (sm_start),
@@ -261,16 +326,11 @@ module attention_unit (
 
     // ===================== local round-half-up + saturate ====================
     // This local helper is a bit-exact wrapper of the canonical tpu_defs.vh
-    // `TPU_RND_SAT_Q78 / `TPU_ROUND_SHIFT / `TPU_SAT_HIT.  HISTORICAL NOTE: the
-    // shared macros used to build their round bias as an UNSIGNED concatenation,
-    // so (signed acc + unsigned bias) evaluated UNSIGNED and the `>>> became a
-    // LOGICAL shift, BREAKING narrowing for NEGATIVE accumulators (e.g.
-    // acc=-10752 -> +32767 instead of -42).  Attention scores and signed-V
-    // contexts are routinely NEGATIVE.  The header bias is now a SIGNED ACC_W
-    // constant (fixed), so the macro is signed-correct and this helper computes
-    // the IDENTICAL result; it is retained as named functions because the score
-    // and context blocks index 2-D reg arrays and reuse the round-shift twice.
-    // RND_BIAS is a localparam declared inside this module.
+    // `TPU_RND_SAT_Q78 / `TPU_ROUND_SHIFT / `TPU_SAT_HIT.  The shared macro's
+    // round bias is now a SIGNED ACC_W constant, so the macro is signed-correct
+    // and this helper computes the IDENTICAL result; it is retained as named
+    // functions because the score and context blocks index 2-D reg arrays and
+    // reuse the round-shift twice.  RND_BIAS is a localparam declared here.
     //   rounded = (acc + (1<<(FRAC-1))) >>> FRAC          [arithmetic shift]
     //   sat:  rounded > 32767 -> 32767 ; < -32768 -> -32768 ; else value
     localparam signed [`ACC_W-1:0] RND_BIAS =
@@ -304,32 +364,22 @@ module attention_unit (
     endfunction
 
     // ===================== combinational score computation ===================
-    // For the SCORE state we compute all 16 raw dot products combinationally
+    // For the SCORE state we compute all SEQ*SEQ raw dot products combinationally
     // from the latched qm/km, scale by >>1 (round-half-up) into Q15.16, and
-    // narrow each to a Q7.8 logit.  A genvar-free explicit unroll keeps it
-    // synthesizable and lint-clean.  acc_S[i][j] = SUM_d qm[i*D+d]*km[j*D+d].
+    // narrow each to a Q7.8 logit.  acc_S[i][j] = SUM_d qm[i*D+d]*km[j*D+d].
     //
-    // Each product is Q14.16 in 32 bits (PROD_W); 4 summed in a 48-bit signed
-    // accumulator.  scaled = round_half_up(acc, 1) >>> 1  (the EXACT 1/sqrt 4).
+    // Each product is Q14.16 in 32 bits; D summed in a 48-bit signed accumulator.
+    // scaled = round_half_up(acc, 1) >>> 1  (the EXACT 1/sqrt(4) committed scale).
     // The Q15.16 scaled score is then narrowed to a Q7.8 logit (round+sat).
     //
-    // NOTE ON SCORE-LOGIT SATURATION (intentionally NOT folded into `sat`):
-    //   For very large |Q|,|K| the scaled score can exceed the Q7.8 logit range
-    //   and clamp.  This clamp is a SOFTMAX-INPUT clamp, not an OUTPUT-magnitude
-    //   loss: softmax is shift/scale-robust, and the renormalized weights (hence
-    //   the context O) still track the real golden within the documented
-    //   tolerance even when several logits clamp to +max (a near-degenerate
-    //   softmax that the floating golden also produces).  The sticky `sat` flag
-    //   is the OUTPUT-narrowing flag (SPEC §1.3 -- "no truncation that can
-    //   silently LOSE MAGNITUDE"); it is driven ONLY by the CONTEXT narrowing
-    //   (ctx_sat, see the SATURATION POLICY note in the header).  Score-logit
-    //   clamping is therefore deliberately NOT OR'd into `sat`.  The v1.5 bug
-    //   guard is preserved: scores are full 48-bit (never silently wrapped) and
-    //   the OUTPUT magnitude is the flagged, bounded quantity.
-    //
-    // One dot-product accumulator helper as a function of (i,j) is not allowed
-    // (functions cannot index the 2-D reg arrays cleanly here under -Wall), so
-    // we build the 16 scaled logits in a small always-comb that the FSM samples.
+    // NOTE ON SCORE-LOGIT SATURATION (intentionally NOT folded into `sat`): for
+    //   very large |Q|,|K| the scaled score can exceed the Q7.8 logit range and
+    //   clamp.  This is a SOFTMAX-INPUT clamp, not an OUTPUT-magnitude loss:
+    //   softmax is shift/scale-robust, and the renormalized weights (hence the
+    //   context O) still track the real golden within tolerance.  The sticky
+    //   `sat` flag is the OUTPUT-narrowing flag (SPEC §1.3); it is driven ONLY by
+    //   the CONTEXT narrowing (ctx_sat).  Score-logit clamping is deliberately
+    //   NOT OR'd into `sat`.
     reg signed [`ELEM_W-1:0] score_log  [0:S*S-1];   // Q7.8 logit
     integer si, sj, sd;
     reg signed [`ACC_W-1:0]  acc_tmp;
@@ -342,17 +392,14 @@ module attention_unit (
                 acc_tmp = {`ACC_W{1'b0}};
                 for (sd = 0; sd < D; sd = sd + 1) begin
                     // Q7.8 * Q7.8 = Q14.16 (32-bit SIGNED).  Keep it in a signed
-                    // 32b temp, then EXPLICITLY sign-extend (replicate the sign
-                    // bit) into the 48-bit accumulator -- an explicit extension so
-                    // the negative-product sign is preserved AND verilator sees no
-                    // implicit width growth.
+                    // 32b temp, then EXPLICITLY sign-extend into the 48-bit
+                    // accumulator so the negative-product sign is preserved AND
+                    // the lint sees no implicit width growth.
                     qk_prod = $signed(qm[si*D+sd]) * $signed(km[sj*D+sd]);
                     qk_ext  = {{(`ACC_W-32){qk_prod[31]}}, qk_prod};
                     acc_tmp = acc_tmp + qk_ext;
                 end
                 // EXACT 1/sqrt(4)=1/2 scale: round-half-up then arithmetic >>1.
-                // acc_tmp is signed; +1 is a signed sized literal so the >>> is
-                // arithmetic (ties -> +inf), matching the round-half-up policy.
                 scl_tmp = (acc_tmp + `ACC_W'sd1) >>> 1;
                 // narrow Q15.16 -> Q7.8 logit (local round-half-up + saturate).
                 score_log[si*S+sj] = rnd_sat_q78( scl_tmp );
@@ -361,10 +408,10 @@ module attention_unit (
     end
 
     // ===================== combinational context computation =================
-    // For ST_CTX (current `row`) compute O[row][d] for d=0..3 from the captured
+    // For ST_CTX (current `row`) compute O[row][d] for d=0..D-1 from the captured
     // wrow[] (Q0.16) and vm[] (Q7.8).  product W*V = Q7.24; shift right by
     // (Q016_FRAC - Q78_FRAC)=8 with round-half-up to land in Q15.16, accumulate
-    // 4 terms in a 48-bit signed accumulator, then round+saturate to Q7.8.
+    // SEQ terms in a 48-bit signed accumulator, then round+saturate to Q7.8.
     localparam integer WV_SH = `Q016_FRAC - `Q78_FRAC;  // = 8
 
     reg signed [`ELEM_W-1:0] ctx_out  [0:D-1];
@@ -375,8 +422,7 @@ module attention_unit (
     // W[row][cj] is Q0.16 unsigned [0..0xFFFF]; widen it to 17-bit SIGNED (a
     // leading 0) so the signed multiply with the Q7.8 V keeps V's sign.  The
     // 17b*16b product is a 33-bit SIGNED value; keep it in a wide signed temp so
-    // its sign survives BEFORE sign-extending into the 48-bit accumulator (a
-    // bare width-cast would zero-extend and corrupt a negative product).
+    // its sign survives BEFORE sign-extending into the 48-bit accumulator.
     reg signed [16:0]        w_se;       // {1'b0, wrow} as 17-bit signed
     reg signed [32:0]        wv_prod;    // Q7.24 signed product (17b*16b -> 33b)
     reg signed [`ACC_W-1:0]  wv_ext;     // sign-extended product, Q7.24 in 48b
@@ -400,8 +446,53 @@ module attention_unit (
         end
     end
 
+    // ===================== combinational TM line (un)packing =================
+    // A Q/K/V/O ROW packs D Q7.8 elements into the low 16 bits of lanes 0..D-1 of
+    // one 128-bit TM line; lanes D..NLANES-1 are unused (read: ignored; write:
+    // sign-extension carries no data there).  These two combinational helpers
+    // replace the hardwired [15:0]/[47:32]/[79:64]/[111:96] slices so the packing
+    // is parameter-derived in D.
+    //   rd_row[d] : the d-th Q7.8 element of the currently-read TM line.
+    //   o_wline   : the current context row packed into a TM line (sign-extended).
+    reg signed [`ELEM_W-1:0] rd_row [0:D-1];
+    integer pk;
+    always @(*) begin
+        for (pk = 0; pk < D; pk = pk + 1)
+            rd_row[pk] = tm_rdata[(pk*`LANE_W) +: `ELEM_W];
+    end
+    reg [`LINE_W-1:0] o_wline;
+    integer ok;
+    always @(*) begin
+        o_wline = {`LINE_W{1'b0}};
+        for (ok = 0; ok < D; ok = ok + 1)
+            o_wline[(ok*`LANE_W) +: `LANE_W] =
+                {{(`LANE_W-`ELEM_W){ctx_out[ok][`ELEM_W-1]}}, ctx_out[ok]};
+    end
+
+    // ===================== combinational softmax X-line packing ==============
+    // Pack score row `row` (SEQ Q7.8 logits) into NSCR_X scratch lines: lane
+    // (l*NLANES + k) carries logit (l*NLANES+k) if that index < SEQ, else the
+    // `Q78_MIN pad (whose exp underflows to ~0 in the softmax).  At the default
+    // SEQ=4 this is exactly {4 real logits in line 0} + {4 Q78_MIN in line 1}.
+    reg [`LINE_W-1:0] sm_xline [0:NSCR_X-1];
+    integer xl, xk, xe;
+    always @(*) begin
+        for (xl = 0; xl < NSCR_X; xl = xl + 1) begin
+            sm_xline[xl] = {`LINE_W{1'b0}};
+            for (xk = 0; xk < NLANES; xk = xk + 1) begin
+                xe = xl*NLANES + xk;                    // flat softmax-lane index
+                if (xe < SEQ)
+                    sm_xline[xl][(xk*`LANE_W) +: `LANE_W] =
+                        {16'd0, slog[row*SEQ + xe]};
+                else
+                    sm_xline[xl][(xk*`LANE_W) +: `LANE_W] = {16'd0, `Q78_MIN};
+            end
+        end
+    end
+
     // ===================== single clocked FSM ================================
     integer w;
+    integer rl, wl;
     always @(posedge clk) begin
         if (rst) begin
             state    <= ST_IDLE;
@@ -412,8 +503,8 @@ module attention_unit (
             k_base_q <= {`TM_IDX_W{1'b0}};
             v_base_q <= {`TM_IDX_W{1'b0}};
             o_base_q <= {`TM_IDX_W{1'b0}};
-            rcnt     <= 3'd0;
-            row      <= 3'd0;
+            rcnt     <= {RCNT_W{1'b0}};
+            row      <= {ROW_W{1'b0}};
             tm_raddr <= {`TM_IDX_W{1'b0}};
             tm_we    <= 1'b0;
             tm_waddr <= {`TM_IDX_W{1'b0}};
@@ -428,7 +519,7 @@ module attention_unit (
                 slog[w] <= {`ELEM_W{1'b0}};
             for (w = 0; w < S; w = w + 1)
                 wrow[w] <= {`Q016_W{1'b0}};
-            for (w = 0; w < 4; w = w + 1)
+            for (w = 0; w < SCR_N; w = w + 1)
                 sm_scratch[w] <= {`LINE_W{1'b0}};
         end else begin
             // defaults (overridden below where needed).
@@ -438,7 +529,7 @@ module attention_unit (
 
             // Capture softmax writes into the internal scratch every cycle.
             if (sm_we)
-                sm_scratch[sm_waddr[1:0]] <= sm_wdata;
+                sm_scratch[sm_waddr[SCR_IDX_W-1:0]] <= sm_wdata;
 
             case (state)
                 // ---------------------------------------------------------
@@ -450,93 +541,83 @@ module attention_unit (
                         k_base_q <= k_base;
                         v_base_q <= v_base;
                         o_base_q <= o_base;
-                        rcnt     <= 3'd0;
-                        row      <= 3'd0;
+                        rcnt     <= {RCNT_W{1'b0}};
+                        row      <= {ROW_W{1'b0}};
                         tm_raddr <= q_base;       // present Q row 0 this cycle
                         state    <= ST_RDQ;
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Read 4 Q rows; row r presented on tm_raddr at cycle r, its
-                // data latched the next cycle.  We latch the line read THIS
-                // cycle (presented last cycle) and present the next address.
+                // Read SEQ Q rows; row r presented on tm_raddr at cycle r, its
+                // data latched the next cycle.  We latch the line read THIS cycle
+                // (presented last cycle) and present the next address.  rd_row[]
+                // un-packs the D lanes of the live TM line (parameter-derived).
                 ST_RDQ: begin
-                    qm[rcnt*D+0] <= tm_rdata[ 15:  0];
-                    qm[rcnt*D+1] <= tm_rdata[ 47: 32];
-                    qm[rcnt*D+2] <= tm_rdata[ 79: 64];
-                    qm[rcnt*D+3] <= tm_rdata[111: 96];
+                    for (rl = 0; rl < D; rl = rl + 1)
+                        qm[rcnt*D + rl] <= rd_row[rl];
                     if (rcnt == S_LAST) begin
-                        rcnt     <= 3'd0;
+                        rcnt     <= {RCNT_W{1'b0}};
                         tm_raddr <= k_base_q;      // begin K reads next cycle
                         state    <= ST_RDK;
                     end else begin
-                        rcnt     <= rcnt + 3'd1;
+                        rcnt     <= rcnt + {{(RCNT_W-1){1'b0}}, 1'b1};
                         tm_raddr <= q_base_q +
-                                    {{(`TM_IDX_W-3){1'b0}}, (rcnt + 3'd1)};
+                            {{(`TM_IDX_W-RCNT_W){1'b0}},
+                             (rcnt + {{(RCNT_W-1){1'b0}}, 1'b1})};
                     end
                 end
 
                 // ---------------------------------------------------------
                 ST_RDK: begin
-                    km[rcnt*D+0] <= tm_rdata[ 15:  0];
-                    km[rcnt*D+1] <= tm_rdata[ 47: 32];
-                    km[rcnt*D+2] <= tm_rdata[ 79: 64];
-                    km[rcnt*D+3] <= tm_rdata[111: 96];
+                    for (rl = 0; rl < D; rl = rl + 1)
+                        km[rcnt*D + rl] <= rd_row[rl];
                     if (rcnt == S_LAST) begin
-                        rcnt     <= 3'd0;
+                        rcnt     <= {RCNT_W{1'b0}};
                         tm_raddr <= v_base_q;      // begin V reads next cycle
                         state    <= ST_RDV;
                     end else begin
-                        rcnt     <= rcnt + 3'd1;
+                        rcnt     <= rcnt + {{(RCNT_W-1){1'b0}}, 1'b1};
                         tm_raddr <= k_base_q +
-                                    {{(`TM_IDX_W-3){1'b0}}, (rcnt + 3'd1)};
+                            {{(`TM_IDX_W-RCNT_W){1'b0}},
+                             (rcnt + {{(RCNT_W-1){1'b0}}, 1'b1})};
                     end
                 end
 
                 // ---------------------------------------------------------
                 ST_RDV: begin
-                    vm[rcnt*D+0] <= tm_rdata[ 15:  0];
-                    vm[rcnt*D+1] <= tm_rdata[ 47: 32];
-                    vm[rcnt*D+2] <= tm_rdata[ 79: 64];
-                    vm[rcnt*D+3] <= tm_rdata[111: 96];
+                    for (rl = 0; rl < D; rl = rl + 1)
+                        vm[rcnt*D + rl] <= rd_row[rl];
                     if (rcnt == S_LAST) begin
-                        rcnt  <= 3'd0;
+                        rcnt  <= {RCNT_W{1'b0}};
                         state <= ST_SCORE;
                     end else begin
-                        rcnt     <= rcnt + 3'd1;
+                        rcnt     <= rcnt + {{(RCNT_W-1){1'b0}}, 1'b1};
                         tm_raddr <= v_base_q +
-                                    {{(`TM_IDX_W-3){1'b0}}, (rcnt + 3'd1)};
+                            {{(`TM_IDX_W-RCNT_W){1'b0}},
+                             (rcnt + {{(RCNT_W-1){1'b0}}, 1'b1})};
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Latch all 16 scaled Q7.8 logits.  (Score-logit clamping is a
-                // softmax-input clamp and is intentionally NOT folded into the
-                // sticky output `sat` flag -- see the score-block note above.)
-                // Move to the first softmax row.
+                // Latch all SEQ*SEQ scaled Q7.8 logits.  (Score-logit clamping is
+                // a softmax-input clamp and is intentionally NOT folded into the
+                // sticky output `sat` flag.)  Move to the first softmax row.
                 ST_SCORE: begin
                     for (w = 0; w < S*S; w = w + 1)
                         slog[w] <= score_log[w];
-                    row   <= 3'd0;
+                    row   <= {ROW_W{1'b0}};
                     state <= ST_SM_LD;
                 end
 
                 // ---------------------------------------------------------
-                // Load score row `row` into the softmax input scratch (lines
-                // SM_XBASE, SM_XBASE+1).  Lanes 0..3 = the 4 real logits;
-                // lanes 4..7 = Q78_MIN padding (their exp underflows to ~0).
+                // Load score row `row` into the softmax input scratch lines
+                // 0..NSCR_X-1.  Lanes 0..SEQ-1 = the SEQ real logits; the
+                // remaining lanes = Q78_MIN padding (exp underflows to ~0).
+                // sm_xline[] packs this combinationally (parameter-derived).
                 ST_SM_LD: begin
-                    // slog index = row*S + col with S=4, so {row[1:0],col[1:0]}
-                    // is exactly row*4+col (4-bit index into the 16-entry array).
-                    sm_scratch[SCR_X0] <= {
-                        {16'd0, slog[{row[1:0], 2'b11}]},
-                        {16'd0, slog[{row[1:0], 2'b10}]},
-                        {16'd0, slog[{row[1:0], 2'b01}]},
-                        {16'd0, slog[{row[1:0], 2'b00}]} };
-                    sm_scratch[SCR_X1] <= {
-                        {16'd0, `Q78_MIN}, {16'd0, `Q78_MIN},
-                        {16'd0, `Q78_MIN}, {16'd0, `Q78_MIN} };
+                    for (wl = 0; wl < NSCR_X; wl = wl + 1)
+                        sm_scratch[wl] <= sm_xline[wl];
                     state <= ST_SM_GO;
                 end
 
@@ -548,43 +629,41 @@ module attention_unit (
                 end
 
                 // ---------------------------------------------------------
-                // Wait for softmax done.  When done, the probs are already in
-                // scratch lines SM_PBASE, SM_PBASE+1 (written synchronously by
-                // softmax + captured into sm_scratch above).  Capture the 4
-                // real weights (lanes 0..3 of line SM_PBASE), fold softmax sat.
+                // Wait for softmax done.  When done, the probs are already in the
+                // P scratch lines (SM_PBASE..) (written synchronously by softmax +
+                // captured into sm_scratch above).  Capture the SEQ real weights
+                // (lanes 0..SEQ-1, spanning NSCR_X P-lines), fold softmax sat NO.
                 ST_SM_WT: begin
                     if (sm_done) begin
-                        wrow[0] <= sm_scratch[SCR_P0][ 15:  0];
-                        wrow[1] <= sm_scratch[SCR_P0][ 47: 32];
-                        wrow[2] <= sm_scratch[SCR_P0][ 79: 64];
-                        wrow[3] <= sm_scratch[SCR_P0][111: 96];
+                        // P-tile line index = NSCR_X + (w/NLANES) (plain-int
+                        // localparam + int loop var -> integer index, no width
+                        // mismatch); lane within the line = (w % NLANES).
+                        for (w = 0; w < S; w = w + 1)
+                            wrow[w] <=
+                                sm_scratch[NSCR_X + (w / NLANES)]
+                                          [((w % NLANES)*`LANE_W) +: `Q016_W];
                         // NOTE: sm_sat (a softmax probability hitting the 0xFFFF
-                        // clamp) is an internal renormalization artifact worth
-                        // ~1.5e-5 in a probability -- NOT an attention-OUTPUT
-                        // magnitude loss -- so it is intentionally NOT folded
-                        // into the attention `sat` flag (see header / sat policy).
+                        // clamp) is an internal renormalization artifact -- NOT an
+                        // attention-OUTPUT magnitude loss -- so it is intentionally
+                        // NOT folded into the attention `sat` flag.
                         state <= ST_CTX;
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Compute O[row][0..3] from wrow + vm, drive the O-row write.
-                // (combinational ctx_out / ctx_sat are valid this cycle).
+                // Compute O[row][0..D-1] from wrow + vm, drive the O-row write.
+                // (combinational ctx_out / ctx_sat / o_wline are valid this cyc.)
                 ST_CTX: begin
                     tm_we    <= 1'b1;
                     tm_waddr <= o_base_q +
-                                {{(`TM_IDX_W-3){1'b0}}, row};
-                    tm_wdata <= {
-                        {{16{ctx_out[3][15]}}, ctx_out[3]},
-                        {{16{ctx_out[2][15]}}, ctx_out[2]},
-                        {{16{ctx_out[1][15]}}, ctx_out[1]},
-                        {{16{ctx_out[0][15]}}, ctx_out[0]} };
+                                {{(`TM_IDX_W-ROW_W){1'b0}}, row};
+                    tm_wdata <= o_wline;
                     if (ctx_sat)
                         sat <= 1'b1;
-                    if (row == S_LAST) begin
+                    if (row == S_LAST[ROW_W-1:0]) begin
                         state <= ST_DONE;
                     end else begin
-                        row   <= row + 3'd1;
+                        row   <= row + {{(ROW_W-1){1'b0}}, 1'b1};
                         state <= ST_SM_LD;
                     end
                 end

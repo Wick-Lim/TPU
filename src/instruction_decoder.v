@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
 // instruction_decoder.v  --  TPU v2.0 combinational instruction field extractor

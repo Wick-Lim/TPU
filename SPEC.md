@@ -252,3 +252,97 @@ Each tensor unit is independently verifiable before integration, so phase-2 para
 - Real algorithms at small fixed sizes: 4×4 systolic GEMM, 8×8∗3×3 line-buffered conv, len-8 LUT exp-softmax, seq4/d4 full attention.
 - Real ISA: 8-bit opcode, immediate path, `LOADI`, hardwired-zero `r0`, illegal-opcode flag (see `docs/ISA.md`).
 - Verification independence enforced: all tensor goldens are `real`-typed behavioral models, never sharing the DUT's fixed-point path.
+
+---
+
+## 9. Module parameterization (tensor units)
+
+The four tensor units are **module-parameterized** over their tile sizes. The
+`tpu_defs.vh` `localparam` sizes of §1.2 remain the committed defaults; each unit
+takes a module `parameter` that **defaults to that size**, so an unparameterized
+instance is **byte-identical in behavior** to the original fixed design and the
+per-unit TBs still pass with the same assertion counts. Inside each unit every
+index, counter width (`$clog2`-derived), loop bound, operand-bank depth, and
+packing index is derived from the parameter — the size-specific mod-4 bit
+truncations of the original (`tcnt[1:0]`, `{row[1:0],col[1:0]}`, fixed 3-bit
+counters) are replaced by parameter-correct equivalents (true subtraction/`row*N+col`
+indices, `$clog2`-sized counters), correct for any in-range size, not just powers
+of two.
+
+| Unit | Module parameter(s) | Default | Supported range | Reason for the bound |
+|---|---|---|---|---|
+| `gemm_systolic.v` | `N` | `GEMM_N` = 4 | `2 ≤ N ≤ LINE_LANES` (= 4) | upper: one row = one TM line of 4 lanes; lower: keep `$clog2(N) ≥ 1` |
+| `conv2d_unit.v` | `IMG_H`, `IMG_W`, `K` | 8, 8, 3 | `IMG_W ≤ 8`, `K ≤ 8`, `K ≤ IMG_H` and `K ≤ IMG_W` | one image/kernel row packs dense-16 into one 128-bit line (8 cols); valid output dims ≥ 1 |
+| `softmax_unit.v` | `LEN` | `SM_LEN` = 8 | `2 ≤ LEN ≤ 8·LINE_LANES` (= 32) | 1-D reduction over `ceil(LEN/4)` lines; lower: len-1 is degenerate |
+| `attention_unit.v` | `SEQ`, `D` | 4, 4 | `D ≤ LINE_LANES` (= 4), `SEQ ≤ SM_LEN` (= 8), `SEQ,D ≥ 1` | one Q/K/V/O row = one TM line (4 lanes); a score row runs through the softmax submodule padded to `SM_PAD = max(SEQ, SM_LEN)` |
+
+**The architectural bound.** All upper bounds trace to **`LINE_LANES = 4`** (§1.2):
+the architecture packs one matrix/feature/Q-K-V row into **one 128-bit TM line of 4
+lanes**, baked into `tpu_defs.vh` / `tile_memory.v` / `tpu_top.v`. So GEMM `N` and
+attention `D` cannot exceed 4, and a conv image/kernel row cannot exceed 8 columns
+(4 lanes × 16-bit dense pack). **softmax** is the exception: as a 1-D reduction it
+spans `ceil(LEN/4)` TM lines and so scales to `LEN ≤ 32`, but its `argmax` status
+port stays a 3-bit architectural field (§4) — exact for `LEN ≤ 8`, low-3-bits
+truncated above. Going beyond these bounds (e.g. GEMM `N > 4`) requires a
+**multi-line-per-row TM re-architecture** (a TM port / packing change) and is out of
+scope for these units (see `docs/ROADMAP.md`).
+
+**2nd-size proofs.** Each unit is verified at a second in-range size against an
+independent `real`-typed golden, in addition to its exhaustive default-size TB:
+`gemm_systolic_tb` (N=2, N=3), `test/conv2d_param_tb.v` (6×6∗3 → 4×4),
+`test/softmax_param_tb.v` (LEN=4 and LEN=16), `test/attention_param_tb.v` (SEQ=2,
+D=2). `make unittests` builds and runs all of them.
+
+---
+
+## 10. AXI4-Lite slave wrapper (`src/tpu_axi.v`)
+
+`src/tpu_axi.v` (module `tpu_axi`) wraps the verified `TPU` core (module `TPU`,
+unchanged) as a drop-in, SoC-integratable **AXI4-Lite SLAVE** IP. The core is
+instantiated and wrapped — **never edited**.
+
+**Clock / reset.** Single clock domain: `ACLK` drives both the AXI slave logic and
+the core. `ARESETn` is AXI active-LOW; the core's `rst` is synchronous active-HIGH,
+so `core.rst = ~ARESETn`. `ARESETn` is assumed synchronous to `ACLK` (standard AXI
+assumption); all wrapper state resets synchronously. This is a **single-clock**
+wrapper — there is no CDC (see `docs/ROADMAP.md` for the deferred multi-clock case).
+
+**Issue model (single-step).** The wrapper owns the core's `instruction_in`,
+mirroring the testbench's one-instruction-per-cycle `step()`. A host:
+1. writes the **`INSTR`** register (the 32-bit instruction word, WSTRB-honoured RMW), then
+2. writes **`CTRL.STEP`** (bit0), which drives the `INSTR` word onto
+   `instruction_in` for **exactly one `ACLK` cycle** — the cycle the W-channel write
+   commits (`BVALID` asserted). On every other cycle `instruction_in` is forced to
+   `OP_NOP` (`0x00`).
+
+The host runs any program by issuing INSTR-then-STEP per instruction in sequence and
+reading `RESULT`/`STATUS` back after the pipeline latency (5 stages + any tensor
+stall). The core's `result_out` and `illegal_opcode` are continuously mirrored into
+the read-only `RESULT`/`STATUS` registers; `STATUS.illegal` is sticky and cleared via
+`CTRL.CLR_ILL` (bit1).
+
+**Register map** (32-bit registers; byte address = word offset × 4):
+
+| Byte | Word | Name | Access | Meaning |
+|---|---|---|---|---|
+| `0x00` | 0 | `CTRL`/`STEP` | W / R | W: bit0 `STEP` → issue `INSTR` for one `ACLK`; bit1 `CLR_ILL` → clear sticky illegal. R: bit0 `STEP_DONE`, bit1 `LAST_ILL` (illegal seen on last step) |
+| `0x04` | 1 | `INSTR` | RW | the 32-bit instruction word to issue |
+| `0x08` | 2 | `RESULT` | RO | mirror of core `result_out` (committed WB word) |
+| `0x0C` | 3 | `STATUS` | RO | bit0 sticky `illegal_opcode`, bit1 live `illegal_opcode` (this cycle), bit2 `STEP_DONE`, [31:3] reserved (read 0) |
+
+**Protocol.** 32-bit data; 4-bit `WSTRB` byte strobes honoured on register writes.
+Five channels AW/W/B/AR/R with **registered** VALID/READY handshakes (no
+combinational `AWREADY↔AWVALID`/`ARREADY↔ARVALID` loops); a single outstanding
+transaction (legal for AXI4-Lite). A write commits only when **both** AW and W have
+handshaked (in either order). Mapped accesses return `OKAY` (`2'b00`); unmapped word
+offsets read 0 / drop writes and return `SLVERR` (`2'b10`).
+
+**Synthesis & test.** Synchronous reset on every state element, no inferred latch, no
+combinational loops; passes `verilator --lint-only -Wall` (top `tpu_axi`) and yosys
+`check -assert` (top `tpu_axi`). `make axi` builds and runs the BFM testbench
+(`test/tpu_axi_tb.v`), which drives a real program through the bus channels and
+checks it against independent goldens.
+
+**Scope.** This is a **slave-only** wrapper: it cannot autonomously fetch from
+external memory. An AXI **master** path (DMA from external DRAM) is a deferred v3 item
+(`docs/ROADMAP.md`).

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
 // tile_memory  --  TPU v2.0 tensor tile memory  (SPEC.md §1.1, §2, §5.5)

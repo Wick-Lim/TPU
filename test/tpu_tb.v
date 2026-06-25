@@ -492,6 +492,47 @@ module tpu_tb;
                (dut.regfile.registers[7] >> `ST_ARGMAX_LO) &
                ((1 << (`ST_ARGMAX_HI - `ST_ARGMAX_LO + 1)) - 1), sm_argmax);
 
+        //----------------------------------------------------------------
+        // PART 3b -- EX-stage forward of a TENSOR op's STATUS writeback at
+        //   distance 1 (the EX->EX forward regression guard).
+        //
+        //   A retiring tensor op writes its STATUS word (sat/unit/argmax) to rC,
+        //   NOT the EX-stage `ex_value` -- which for a tensor opcode is the unused
+        //   eff_addr default (opA_ex + imm_ex).  When a directly-dependent (gap=0)
+        //   scalar consumer reads that rC, the EX-stage forward arm MUST hand it
+        //   `tensor_status_word`, not the eff_addr garbage.  The historical bug
+        //   forwarded `ex_value` (== eff_addr) instead, silently corrupting the
+        //   first dependent scalar op behind any tensor op.
+        //
+        //   We re-issue the SOFTMAX (its operand tile TM[16..17] is still loaded)
+        //   writing status to r7, and IMMEDIATELY (no NOP/drain in between, so the
+        //   consumer sits in ID while SOFTMAX is in EX) issue `ADDI r9 = r7 + 0`.
+        //   r9 therefore captures EXACTLY what the EX-stage forward delivered.
+        //   The op uses rA=r5(=16), imm12=18, so the OLD bug would have forwarded
+        //   eff_addr = 16 + 18 = 34 instead of the real status word.
+        //
+        //   INDEPENDENT goldens: the forwarded word's UNIT field == the ISA
+        //   constant UNIT_SOFTMAX and its ARGMAX field == sm_argmax (the real
+        //   exp-softmax argmax computed in compute_goldens) -- never mirrored from
+        //   the DUT.  A separate guard asserts the forwarded word is NOT the
+        //   eff_addr garbage (34), which is what regressing this fix would yield.
+        //----------------------------------------------------------------
+        $display("[PART 3b] EX-stage forward of tensor STATUS at distance 1");
+        step(Iimm(`OP_LOADI, 5, 20'd16));        // x base line = 16 (operand tile)
+        step(R(`OP_SOFTMAX, 5, 0, 7, 12'd18));   // status -> r7  (eff_addr=16+18=34)
+        step(R(`OP_ADDI, 7, 0, 9, 12'h000));     // r9 = (fwd r7) + 0  -- EX->EX fwd
+        drain(6);
+        // The forwarded-then-written word must carry the SOFTMAX status fields...
+        chk_eq("EXfwd tensor-status unit",
+               (dut.regfile.registers[9] >> `ST_UNIT_LO) &
+               ((1 << (`ST_UNIT_HI - `ST_UNIT_LO + 1)) - 1), `UNIT_SOFTMAX);
+        chk_eq("EXfwd tensor-status argmax",
+               (dut.regfile.registers[9] >> `ST_ARGMAX_LO) &
+               ((1 << (`ST_ARGMAX_HI - `ST_ARGMAX_LO + 1)) - 1), sm_argmax);
+        // ...and must NOT be the EX-stage eff_addr garbage (opA_ex+imm = 16+18).
+        chk_eq("EXfwd not eff_addr garbage",
+               (dut.regfile.registers[9] == 34) ? 1 : 0, 0);
+
         //====================================================================
         // PART 4 -- ATTENTION (seq4 d4, tolerance vs real attention golden).
         //====================================================================

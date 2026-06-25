@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
 // scatter_gather  --  indexed DMEM access engine (TPU v2.0)      (SPEC §2, §5.5)

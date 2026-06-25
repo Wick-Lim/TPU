@@ -1,17 +1,44 @@
 `timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
-// softmax_unit.v  --  TPU v2.0 fixed-point exp-based softmax, len 8 (SPEC §5.3)
+// softmax_unit.v  --  TPU v2.0 fixed-point exp-based softmax, LEN-generic
+//                     (default LEN=`SM_LEN=8) (SPEC §5.3)
 //----------------------------------------------------------------------------
 // PURPOSE
-//   Computes a true numerically-stable softmax over SM_LEN(8) logits:
+//   Computes a true numerically-stable softmax over LEN logits:
 //       p_i = exp(x_i - max) / SUM_j exp(x_j - max)
 //   This REPLACES the v1.5 "fake SOFTMAX" linear lane-normalization with a
 //   genuine exponential softmax (LUT-based exp + reciprocal normalize).  It is
-//   TM->TM: it reads two tile-memory lines of logits and writes two tile-memory
-//   lines of probabilities, naming both tiles by a base TM line index.  It
-//   instantiates NOTHING and exposes raw TM ACCESS PORTS (read + write); the
-//   surrounding datapath (or the unit TB) owns/​models the tile memory.
+//   TM->TM: it reads NLINES tile-memory lines of logits and writes NLINES
+//   tile-memory lines of probabilities, naming both tiles by a base TM line
+//   index.  It instantiates NOTHING and exposes raw TM ACCESS PORTS (read +
+//   write); the surrounding datapath (or the unit TB) owns/models the tile
+//   memory.
+//
+// PARAMETERIZATION (this file is LEN-generic)
+//   parameter integer LEN  : the softmax vector length.  Defaults to `SM_LEN
+//                            (8) so the module is BYTE-IDENTICAL in behavior to
+//                            the committed len-8 unit at its default, and the
+//                            attention_unit reuse (which instantiates the
+//                            DEFAULT) is unaffected.
+//   Softmax is a 1-D reduction, so it is naturally length-generic.  The vector
+//   spans NLINES = ceil(LEN/LINE_LANES) TM lines (each line packs LINE_LANES=4
+//   lanes of one element each).  Everything below -- the read loop, max+argmax
+//   reduce, exp-LUT pass, reciprocal, normalize loop, and write loop -- runs
+//   over LEN with parameter-derived index/counter widths ($clog2) and
+//   line-span counts (NLINES); there are no size-specific bit tricks.
+//
+//   SUPPORTED RANGE:  2 <= LEN <= 8 * LINE_LANES = 32.
+//     * Lower bound 2: a length-1 softmax is degenerate (p=1.0).
+//     * Upper bound 32: the read/write loops address NLINES = ceil(LEN/4) TM
+//       lines from the base; with TM_LINES=32 a comfortable in-range envelope
+//       is LEN<=32 (NLINES<=8 lines).  LEN need NOT be a multiple of
+//       LINE_LANES (the last line is partially populated; unused lanes are
+//       never read/written meaningfully).
+//     * The `argmax` STATUS PORT is fixed 3-bit (architectural status field,
+//       SPEC §4 carries a 0..7 value).  argmax is exact for LEN<=8; for LEN>8
+//       the reported index is the true argmax truncated to its low 3 bits
+//       (the port width is an architectural invariant and is NOT widened).
 //
 // Q-FORMATS (single source of truth: tpu_defs.vh, SPEC §1.3)
 //   logits  x_i     : Q7.8   signed 16-bit          (ELEM_W, Q78_FRAC=8)
@@ -68,12 +95,12 @@
 // INTERFACE
 //   clk, rst                              clock / synchronous active-high reset
 //   start                                 1-cycle pulse: latch bases, begin
-//   x_base [TM_IDX_W-1:0]                 base TM line of the 8 logits (2 lines)
-//   p_base [TM_IDX_W-1:0]                 base TM line for the 8 probs  (2 lines)
+//   x_base [TM_IDX_W-1:0]                 base TM line of the LEN logits (NLINES)
+//   p_base [TM_IDX_W-1:0]                 base TM line for the LEN probs (NLINES)
 //   busy                                  high while an op is in flight
 //   done                                  1-cycle pulse when result lines written
 //   sat                                   saturation flag (valid with `done`)
-//   argmax [2:0]                          index of the max logit (0..7)
+//   argmax [2:0]                          index of the max logit (low 3 bits)
 //   -- TM read access port (combinational; TB/datapath drives the memory) --
 //   tm_raddr [TM_IDX_W-1:0]  (out)        line index to read
 //   tm_rdata [LINE_W-1:0]    (in)         line data read back (combinational)
@@ -84,23 +111,33 @@
 //
 // LATENCY (deterministic; asserted by the TB)
 //   FSM stages, in order:
-//     S_RD0(1) S_RD1(1) S_MAX(1) S_EXP(8) S_RECIP(1) S_NORM(8) S_WR1(1) S_DONE(1)
+//     S_RD(NLINES) S_MAX(1) S_EXP(LEN) S_RECIP(1) S_NORM(LEN) S_WR(1) S_DONE(1)
+//   The NORM pass writes each FULLY-PROBED output line in the same cycle its
+//   last lane is produced (the historic "write line 0 during S_NORM cnt==3"
+//   trick, generalized to every line); the FINAL line is drained in the
+//   dedicated S_WR cycle.  Generic start->done latency (posedges from the start
+//   edge to the done edge, inclusive of both, == the TB's `LAT`):
+//       LAT = 1 + NLINES + 1 + LEN + 1 + LEN + 1 + 1
+//           = 5 + NLINES + 2*LEN
 //   COUNTING CONVENTION (the two numbers describe the SAME waveform):
-//     * 22 = stage-edges traversed AFTER the start edge, EXCLUSIVE of it (the
-//       count used in this header's stage list above).
-//     * 23 = posedges from the edge that samples `start` to the edge that raises
-//       `done`, INCLUSIVE of the start edge -- this is the `LAT` the unit TB
-//       (softmax_unit_tb.v) measures and asserts, and the figure SPEC §3.3 lists.
-//   SPEC §3.2 originally budgeted ~20 (2*SM_LEN+4); the committed RTL adds a
-//   clean separate max-reduce and write-drain cycle.  `busy` is high from the
-//   start cycle through the cycle before `done`.
+//     * (LAT-1) = stage-edges traversed AFTER the start edge, EXCLUSIVE of it.
+//     * LAT     = posedges from the edge that samples `start` to the edge that
+//       raises `done`, INCLUSIVE of the start edge -- this is what the unit TB
+//       measures and asserts.
+//   For the DEFAULT LEN=8 (NLINES=2):  LAT = 5 + 2 + 16 = 23  (UNCHANGED, the
+//   committed figure SPEC §3.3 lists).  `busy` is high from the start cycle
+//   through the cycle before `done`.
 //
 // SYNTHESIZABILITY
 //   Synchronous reset on ALL state; every reg assigned on every path of the one
 //   clocked block (FSM) -- no inferred latches, no comb loops, no real/$display/
 //   $random/initial in the module.  Passes verilator --lint-only -Wall.
 //============================================================================
-module softmax_unit (
+module softmax_unit #(
+    // Vector length.  DEFAULTS to `SM_LEN so behavior is byte-identical to the
+    // committed len-8 unit (and the attention_unit reuse) at its default.
+    parameter integer LEN = `SM_LEN
+) (
     input  wire                 clk,
     input  wire                 rst,
 
@@ -114,10 +151,10 @@ module softmax_unit (
     output reg  [2:0]           argmax,
 
     // TM read access port (combinational read).
-    // Each 128-bit line packs four 32-bit lanes; a Q7.8 logit occupies only the
-    // LOW 16 bits of its lane (sign-extension/padding in the high 16).  This
-    // unit reads the low 16 bits of each lane, so the high 16 of every lane are
-    // intentionally unused -- the narrow lint_off documents that.
+    // Each 128-bit line packs LINE_LANES (4) 32-bit lanes; a Q7.8 logit occupies
+    // only the LOW 16 bits of its lane (sign-extension/padding in the high 16).
+    // This unit reads the low 16 bits of each lane, so the high 16 of every lane
+    // are intentionally unused -- the narrow lint_off documents that.
     output reg  [`TM_IDX_W-1:0] tm_raddr,
     /* verilator lint_off UNUSEDSIGNAL */
     input  wire [`LINE_W-1:0]   tm_rdata,
@@ -129,16 +166,26 @@ module softmax_unit (
     output reg  [`LINE_W-1:0]   tm_wdata
 );
 
+    // ---- parameter-derived geometry (replaces the size-specific tricks) ----
+    // NLINES   : TM lines the LEN-vector spans = ceil(LEN/LINE_LANES).
+    // IDX_W    : bits to hold an element index 0..LEN-1.
+    // LINE_W_  : bits to hold a line index 0..NLINES-1 (for the line counters).
+    // CNT_W    : bits for the element pass counter (must hold LEN, i.e. 0..LEN).
+    localparam integer NLANES = `LINE_LANES;                 // 4 lanes / line
+    localparam integer NLINES = (LEN + NLANES - 1) / NLANES; // ceil(LEN/4)
+    localparam integer IDX_W  = (LEN  > 1) ? $clog2(LEN)    : 1;
+    localparam integer LINE_W_= (NLINES > 1) ? $clog2(NLINES) : 1;
+    localparam integer CNT_W  = $clog2(LEN + 1);             // holds 0..LEN
+
     // ---- local constants (NOT in tpu_defs.vh; declared here per the rules) ----
     localparam [3:0] S_IDLE  = 4'd0;
-    localparam [3:0] S_RD0   = 4'd1;  // read logits line 0 (lanes 0..3)
-    localparam [3:0] S_RD1   = 4'd2;  // read logits line 1 (lanes 4..7)
-    localparam [3:0] S_MAX   = 4'd3;  // max + argmax over all 8 logits
-    localparam [3:0] S_EXP   = 4'd4;  // 8 cycles: e_i = exp(x_i-max), accumulate S
-    localparam [3:0] S_RECIP = 4'd5;  // reciprocal 1/S in Q1.30
-    localparam [3:0] S_NORM  = 4'd6;  // 8 cycles: p_i = e_i*recip -> Q0.16
-    localparam [3:0] S_WR1   = 4'd7;  // write probs line 1, pulse done next
-    localparam [3:0] S_DONE  = 4'd8;  // 1-cycle done pulse
+    localparam [3:0] S_RD    = 4'd1;  // read logits lines 0..NLINES-1 (NLINES cyc)
+    localparam [3:0] S_MAX   = 4'd2;  // max + argmax over all LEN logits
+    localparam [3:0] S_EXP   = 4'd3;  // LEN cycles: e_i = exp(x_i-max), accum S
+    localparam [3:0] S_RECIP = 4'd4;  // reciprocal 1/S in Q1.30
+    localparam [3:0] S_NORM  = 4'd5;  // LEN cycles: p_i = e_i*recip -> Q0.16
+    localparam [3:0] S_WR    = 4'd6;  // write the FINAL probs line, done next
+    localparam [3:0] S_DONE  = 4'd7;  // 1-cycle done pulse
 
     // Maclaurin reciprocal-of-factorial constants in Q0.16 (divide-free):
     //   1/6  ~= round(2^16/6)  = 10923
@@ -151,38 +198,39 @@ module softmax_unit (
     reg [`TM_IDX_W-1:0]    x_base_q;
     reg [`TM_IDX_W-1:0]    p_base_q;
 
-    // Latched logits (8 x Q7.8 signed, stored sign-extended to 16-bit).
-    reg signed [`ELEM_W-1:0] xv [0:`SM_LEN-1];
+    // Latched logits (LEN x Q7.8 signed, stored sign-extended to 16-bit).
+    reg signed [`ELEM_W-1:0] xv [0:LEN-1];
     // Running max (Q7.8 signed) and its index.
     reg signed [`ELEM_W-1:0] maxv;
-    reg [2:0]                maxidx;
+    reg [IDX_W-1:0]          maxidx;
     // exp results e_i (Q15.16, up to 65536 -> fits 32-bit), and SUM accumulator.
-    reg [`PROD_W-1:0]        ev [0:`SM_LEN-1];
+    reg [`PROD_W-1:0]        ev [0:LEN-1];
     reg [`ACC_W-1:0]         sumacc;
     // reciprocal 1/S in Q1.30.
     reg [`Q130_W-1:0]        recip;
     // probabilities p_i (Q0.16).
-    reg [`Q016_W-1:0]        pv [0:`SM_LEN-1];
-    // pass element counter (0..7).
-    reg [3:0]                cnt;
+    reg [`Q016_W-1:0]        pv [0:LEN-1];
+    // element pass counter (0..LEN-1) and line counter for the RD/WR loops.
+    reg [CNT_W-1:0]          cnt;
+    reg [LINE_W_-1:0]        lcnt;     // line index during the read loop
 
     integer w;
 
     // ----------------------------------------------------------------------
-    // Combinational max + argmax over the eight latched logits xv[0..7].
+    // Combinational max + argmax over the LEN latched logits xv[0..LEN-1].
     // Sequential reduce: keeps the LOWEST index on ties (strict > update).
-    // Computed when all 8 logits are latched (state S_MAX), then registered.
+    // Computed when all logits are latched (state S_MAX), then registered.
     // ----------------------------------------------------------------------
     reg signed [`ELEM_W-1:0] cmax;
-    reg [2:0]                cmaxidx;
+    reg [IDX_W-1:0]          cmaxidx;
     integer mi;
     always @(*) begin
         cmax    = xv[0];
-        cmaxidx = 3'd0;
-        for (mi = 1; mi < `SM_LEN; mi = mi + 1) begin
+        cmaxidx = {IDX_W{1'b0}};
+        for (mi = 1; mi < LEN; mi = mi + 1) begin
             if (xv[mi] > cmax) begin
                 cmax    = xv[mi];
-                cmaxidx = mi[2:0];
+                cmaxidx = mi[IDX_W-1:0];
             end
         end
     end
@@ -193,8 +241,10 @@ module softmax_unit (
     // All intermediates are sized explicitly (no implicit width growth).
     // ----------------------------------------------------------------------
     // d = x[cnt] - max  (<= 0).  m = -d  (>= 0).  Use 17-bit signed for the
-    // subtraction so the full [-65535,0] range of d is representable.
-    wire signed [16:0] diff17 = $signed({xv[cnt[2:0]][`ELEM_W-1], xv[cnt[2:0]]})
+    // subtraction so the full [-65535,0] range of d is representable.  `cnt`
+    // indexes the element array; the low IDX_W bits select the lane.
+    wire [IDX_W-1:0] xidx = cnt[IDX_W-1:0];
+    wire signed [16:0] diff17 = $signed({xv[xidx][`ELEM_W-1], xv[xidx]})
                               - $signed({maxv[`ELEM_W-1], maxv});
     wire        [16:0] mag17  = (~diff17) + 17'd1;   // m = -d (two's complement)
 
@@ -342,7 +392,7 @@ module softmax_unit (
     //   (the round-down after adding the 2^29 half-LSB bias).
     // ----------------------------------------------------------------------
     /* verilator lint_off UNUSEDSIGNAL */
-    wire [63:0] p_prod  = {{(64-`PROD_W){1'b0}}, ev[cnt[2:0]]} * {32'd0, recip};
+    wire [63:0] p_prod  = {{(64-`PROD_W){1'b0}}, ev[xidx]} * {32'd0, recip};
     wire [63:0] p_round = p_prod + (64'd1 <<< 29);
     /* verilator lint_on UNUSEDSIGNAL */
     wire [33:0] p_shift = p_round[63:30];                    // Q0.16-ish, >=0
@@ -351,8 +401,71 @@ module softmax_unit (
     wire [`Q016_W-1:0] p_q016 = p_sat_hit ? `Q016_ONE : p_shift[`Q016_W-1:0];
 
     // ----------------------------------------------------------------------
+    // Explicit-width constants derived from LEN/NLINES/NLANES.  Building these
+    // as sized localparams (rather than bare 32-bit integer literals) keeps the
+    // comparisons/adds below width-clean under verilator -Wall.
+    // ----------------------------------------------------------------------
+    localparam [CNT_W-1:0]     LEN_M1    = CNT_W'(LEN - 1);      // last element idx
+    localparam [IDX_W-1:0]     LANE_M1   = IDX_W'(NLANES - 1);   // last lane idx/line
+    localparam [`TM_IDX_W-1:0] NLINES_M1 = `TM_IDX_W'(NLINES-1); // last line idx
+    localparam integer         LASTBASE  = (NLINES - 1) * NLANES;// base elem last line
+
+    // Which element index is currently the last lane of a line (so its line is
+    // complete and can be flushed in the same NORM cycle): (cnt % NLANES)==last.
+    wire [IDX_W-1:0]  lane_in_line  = xidx % NLANES[IDX_W-1:0];
+    wire              line_complete = (lane_in_line == LANE_M1);
+    // Is `cnt` the very last element (LEN-1)?  Its line is drained in S_WR.
+    wire              is_last_elem  = (cnt == LEN_M1);
+
+    // argmax index forced to EXACTLY 3 bits for the fixed-width status port,
+    // independent of IDX_W (zero-extend if IDX_W<3, truncate if IDX_W>3).
+    // Zero-extend maxidx to a fixed 3+IDX_W vector, then take the low 3 bits --
+    // legal for any IDX_W (avoids an out-of-range part-select when IDX_W<3).
+    // The high bits [IDX_W+2:3] are deliberately unused (the status port is the
+    // architectural 3-bit field, SPEC §4); the narrow lint_off documents that.
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [IDX_W+2:0]  maxidx_ext = {{3{1'b0}}, maxidx};
+    /* verilator lint_on UNUSEDSIGNAL */
+    wire [2:0]        maxidx3    = maxidx_ext[2:0];
+
+    // ----------------------------------------------------------------------
+    // Combinationally assemble the two output lines (LEN-generic NLANES packing).
+    //   norm_wline : the line that ENDS at the current NORM element `cnt` (its
+    //                last lane is the live p_q016; the earlier lanes are pv[]).
+    //                Used for every line EXCEPT the final one (flushed in NORM).
+    //   final_wline: the line containing element LEN-1 (all lanes from pv[]); a
+    //                partial line writes 0 into unused high lanes.  Used in S_WR.
+    // Each Q7.8 probability sits in the low ELEM_W (16) bits of its 32-bit lane;
+    // the high 16 bits of each lane are intentionally 0 (the packing matches the
+    // committed len-8 layout exactly).
+    // ----------------------------------------------------------------------
+    reg  [`LINE_W-1:0] norm_wline;
+    reg  [`LINE_W-1:0] final_wline;
+    integer kk;
+    // base element index of the line that ends at `cnt` (== cnt - (NLANES-1)).
+    wire [IDX_W-1:0] norm_base = xidx - LANE_M1;
+    always @(*) begin
+        norm_wline  = {`LINE_W{1'b0}};
+        final_wline = {`LINE_W{1'b0}};
+        for (kk = 0; kk < NLANES; kk = kk + 1) begin
+            // current (just-completed) line: last lane is live p_q016, rest pv[].
+            if (kk == (NLANES-1))
+                norm_wline[(kk*`LANE_W) +: `LANE_W] = {16'd0, p_q016};
+            else
+                norm_wline[(kk*`LANE_W) +: `LANE_W] =
+                    {16'd0, pv[norm_base + kk[IDX_W-1:0]]};
+            // final line: every populated lane from pv[]; unused high lanes = 0.
+            if ((LASTBASE + kk) < LEN)
+                final_wline[(kk*`LANE_W) +: `LANE_W] =
+                    {16'd0, pv[LASTBASE + kk]};
+        end
+    end
+
+    // ----------------------------------------------------------------------
     // Single clocked FSM.  Every reg assigned on every path (reset/branch).
     // ----------------------------------------------------------------------
+    integer k;            // generic lane loop variable in the clocked block
+
     always @(posedge clk) begin
         if (rst) begin
             state    <= S_IDLE;
@@ -363,15 +476,16 @@ module softmax_unit (
             x_base_q <= {`TM_IDX_W{1'b0}};
             p_base_q <= {`TM_IDX_W{1'b0}};
             maxv     <= {`ELEM_W{1'b0}};
-            maxidx   <= 3'd0;
+            maxidx   <= {IDX_W{1'b0}};
             sumacc   <= {`ACC_W{1'b0}};
             recip    <= {`Q130_W{1'b0}};
-            cnt      <= 4'd0;
+            cnt      <= {CNT_W{1'b0}};
+            lcnt     <= {LINE_W_{1'b0}};
             tm_raddr <= {`TM_IDX_W{1'b0}};
             tm_we    <= 1'b0;
             tm_waddr <= {`TM_IDX_W{1'b0}};
             tm_wdata <= {`LINE_W{1'b0}};
-            for (w = 0; w < `SM_LEN; w = w + 1) begin
+            for (w = 0; w < LEN; w = w + 1) begin
                 xv[w] <= {`ELEM_W{1'b0}};
                 ev[w] <= {`PROD_W{1'b0}};
                 pv[w] <= {`Q016_W{1'b0}};
@@ -388,104 +502,127 @@ module softmax_unit (
                         busy     <= 1'b1;
                         sat      <= 1'b0;
                         sumacc   <= {`ACC_W{1'b0}};
-                        cnt      <= 4'd0;
+                        cnt      <= {CNT_W{1'b0}};
+                        lcnt     <= {LINE_W_{1'b0}};
                         x_base_q <= x_base;
                         p_base_q <= p_base;
                         tm_raddr <= x_base;          // present line 0 this cycle
-                        state    <= S_RD0;
+                        state    <= S_RD;
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Latch lanes 0..3 (from logits line 0); request line 1.
-                S_RD0: begin
-                    xv[0] <= tm_rdata[ 15:  0];
-                    xv[1] <= tm_rdata[ 47: 32];
-                    xv[2] <= tm_rdata[ 79: 64];
-                    xv[3] <= tm_rdata[111: 96];
-                    tm_raddr <= x_base_q + {{(`TM_IDX_W-1){1'b0}}, 1'b1};
-                    state <= S_RD1;
+                // Read loop: NLINES cycles.  On cycle `lcnt` the live tm_rdata is
+                // logits line `lcnt` (lanes lcnt*4 .. lcnt*4+3); latch up to 4
+                // lanes into xv[], guarding the partial final line by LEN.  Then
+                // request the NEXT line (lcnt+1) so it is live next cycle.
+                S_RD: begin
+                    for (k = 0; k < NLANES; k = k + 1) begin
+                        // global element index of lane k on this line
+                        if ((lcnt * NLANES + k) < LEN)
+                            xv[lcnt * NLANES + k] <=
+                                tm_rdata[(k*`LANE_W) +: `ELEM_W];
+                    end
+                    if (lcnt == NLINES_M1[LINE_W_-1:0]) begin
+                        // all lines latched -> reduce
+                        state <= S_MAX;
+                    end else begin
+                        // next logits line (widen lcnt to the TM index width).
+                        tm_raddr <= x_base_q +
+                            {{(`TM_IDX_W-LINE_W_){1'b0}}, lcnt} +
+                            {{(`TM_IDX_W-1){1'b0}}, 1'b1};
+                        lcnt  <= lcnt + 1'b1;
+                    end
                 end
 
                 // ---------------------------------------------------------
-                // Latch lanes 4..7 (from logits line 1).
-                S_RD1: begin
-                    xv[4] <= tm_rdata[ 15:  0];
-                    xv[5] <= tm_rdata[ 47: 32];
-                    xv[6] <= tm_rdata[ 79: 64];
-                    xv[7] <= tm_rdata[111: 96];
-                    state <= S_MAX;
-                end
-
-                // ---------------------------------------------------------
-                // All 8 logits are now latched: register the combinational
+                // All logits are now latched: register the combinational
                 // max + argmax (lowest index on ties) for the exp pass.
                 S_MAX: begin
                     maxv   <= cmax;
                     maxidx <= cmaxidx;
-                    cnt    <= 4'd0;
+                    cnt    <= {CNT_W{1'b0}};
                     state  <= S_EXP;
                 end
 
                 // ---------------------------------------------------------
-                // 8 cycles: e[cnt] = exp(x[cnt]-max); accumulate sum.
+                // LEN cycles: e[cnt] = exp(x[cnt]-max); accumulate sum.
                 S_EXP: begin
-                    ev[cnt[2:0]] <= e_q1516;
+                    ev[xidx] <= e_q1516;
                     sumacc <= sumacc + {{(`ACC_W-`PROD_W){1'b0}}, e_q1516};
-                    if (cnt == 4'd7) begin
-                        cnt   <= 4'd0;
+                    if (cnt == LEN_M1) begin
+                        cnt   <= {CNT_W{1'b0}};
                         state <= S_RECIP;
                     end else begin
-                        cnt <= cnt + 4'd1;
+                        cnt <= cnt + 1'b1;
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Reciprocal 1/S in Q1.30.
+                // Reciprocal 1/S in Q1.30.  Also rewind `lcnt` to 0 so the
+                // NORM pass numbers OUTPUT lines from the p_base (the read loop
+                // left lcnt at NLINES-1).
                 S_RECIP: begin
                     recip <= recip_calc;
-                    cnt   <= 4'd0;
+                    cnt   <= {CNT_W{1'b0}};
+                    lcnt  <= {LINE_W_{1'b0}};
                     state <= S_NORM;
                 end
 
                 // ---------------------------------------------------------
-                // 8 cycles: p[cnt] = e[cnt]*recip -> Q0.16.  On the 4th and
-                // 8th element, emit the packed output line.
+                // LEN cycles: p[cnt] = e[cnt]*recip -> Q0.16.  Whenever `cnt`
+                // completes a line (last lane) AND it is NOT the final element,
+                // flush that line in the SAME cycle (lanes are pv[] + live
+                // p_q016).  The FINAL line is drained in S_WR.
                 S_NORM: begin
-                    pv[cnt[2:0]] <= p_q016;
+                    pv[xidx] <= p_q016;
                     if (p_sat_hit)
                         sat <= 1'b1;
-                    if (cnt == 4'd3) begin
-                        // First output line: probs 0..3 (lane0 already in pv[0..2],
-                        // lane3 is the live p_q016).
+
+                    // When the current element completes a line (and it is NOT
+                    // the final element), flush that just-completed line in the
+                    // SAME cycle: its packed form is `norm_wline` (pv[] lanes +
+                    // the live p_q016 as the last lane).  `lcnt` numbers output
+                    // lines from p_base.
+                    if (line_complete && !is_last_elem) begin
                         tm_we    <= 1'b1;
-                        tm_waddr <= p_base_q;
-                        tm_wdata <= { {16'd0, p_q016}, {16'd0, pv[2]},
-                                      {16'd0, pv[1]},  {16'd0, pv[0]} };
-                        cnt <= cnt + 4'd1;
-                    end else if (cnt == 4'd7) begin
-                        cnt   <= 4'd0;
-                        state <= S_WR1;
+                        tm_waddr <= p_base_q +
+                            {{(`TM_IDX_W-LINE_W_){1'b0}}, lcnt};   // line idx lcnt
+                        tm_wdata <= norm_wline;
+                        lcnt     <= lcnt + 1'b1;
+                    end
+
+                    if (cnt == LEN_M1) begin
+                        cnt   <= {CNT_W{1'b0}};
+                        state <= S_WR;
                     end else begin
-                        cnt <= cnt + 4'd1;
+                        cnt <= cnt + 1'b1;
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Second output line: probs 4..7 (pv[4..6] + live p_q016 for 7).
-                S_WR1: begin
+                // Drain the FINAL output line (the line containing element
+                // LEN-1).  Its lanes are entirely in pv[] now (the last lane,
+                // pv[LEN-1], was written on the previous NORM cycle).  This line
+                // may be PARTIAL (LEN not a multiple of NLANES): unused high
+                // lanes are written as 0.  Base lane = (NLINES-1)*NLANES.
+                S_WR: begin
                     tm_we    <= 1'b1;
-                    tm_waddr <= p_base_q + {{(`TM_IDX_W-1){1'b0}}, 1'b1};
-                    tm_wdata <= { {16'd0, pv[7]}, {16'd0, pv[6]},
-                                  {16'd0, pv[5]}, {16'd0, pv[4]} };
-                    state <= S_DONE;
+                    tm_waddr <= p_base_q + NLINES_M1;   // last output line index
+                    tm_wdata <= final_wline;
+                    state    <= S_DONE;
                 end
 
                 // ---------------------------------------------------------
                 S_DONE: begin
                     busy   <= 1'b0;
                     done   <= 1'b1;
-                    argmax <= maxidx;
+                    // Emit the low 3 bits of the argmax index on the fixed
+                    // 3-bit status port (exact for LEN<=8).  `maxidx3` zero-
+                    // extends/truncates the IDX_W-wide index to exactly 3 bits
+                    // so the part-select is legal for any IDX_W (e.g. IDX_W=2
+                    // at LEN=4, IDX_W=4 at LEN=16).
+                    argmax <= maxidx3;
                     state  <= S_IDLE;
                 end
 

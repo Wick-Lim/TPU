@@ -1,10 +1,36 @@
+`timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
-// gemm_systolic  --  output-stationary 4x4 systolic GEMM   (SPEC.md §5.1)
+// gemm_systolic  --  output-stationary NxN systolic GEMM   (SPEC.md §5.1)
+//----------------------------------------------------------------------------
+// PARAMETERIZATION (size N)
+//   This unit is parameterized over the GEMM tile dimension N (module
+//   parameter N, DEFAULT `GEMM_N == 4).  With the default the module is
+//   byte-identical in behavior to the original fixed-4x4 implementation (the
+//   per-unit TB still passes with the same assertion count).  Every internal
+//   index, counter width, loop bound, operand bank and accumulator array is
+//   derived from N (via $clog2) -- no hardcoded 4's or fixed 2-bit slices
+//   remain.
+//
+//   SUPPORTED RANGE:  2 <= N <= `LINE_LANES  (== 4).
+//   * UPPER BOUND N<=4 is ARCHITECTURAL: a matrix ROW is packed as ONE TM line
+//     of `LINE_LANES==4 lanes (baked into tpu_defs.vh / tile_memory.v /
+//     tpu_top.v), so one line holds at most 4 elements.  A single-line-per-row
+//     GEMM therefore cannot exceed N=4.  N>4 would require multi-line rows = a
+//     TM port / packing re-architecture and is OUT OF SCOPE for this unit.
+//   * LOWER BOUND N>=2 keeps every $clog2(N)-derived index width >= 1 bit
+//     ($clog2(1)==0 is degenerate); N=1 is not a meaningful GEMM tile.
+//
+//   The size-specific mod-4 BIT-TRUNCATION tricks of the original
+//   (arr_k = tcnt[1:0]-i-j, wr_row = tcnt[1:0]-FIRST_WR[1:0], tcnt[3:0]) have
+//   been replaced by PARAMETER-CORRECT equivalents: a true subtraction guarded
+//   to [0,N-1] for the arrival index, a true (tcnt-FIRST_WR) for the write row,
+//   and a $clog2-sized counter -- correct for ANY N in range, not just powers
+//   of two.
 //----------------------------------------------------------------------------
 // ALGORITHM (output-stationary skewed wavefront mesh)
-//   Computes C = A . B for 4x4 matrices held in tile memory (TM).  The array
-//   is an OUTPUT-STATIONARY 4x4 grid of 16 processing elements (PEs); PE[i][j]
+//   Computes C = A . B for NxN matrices held in tile memory (TM).  The array
+//   is an OUTPUT-STATIONARY NxN grid of N*N processing elements (PEs); PE[i][j]
 //   owns the 48-bit Q15.16 accumulator for output element C[i][j].
 //
 //   Operands are SKEWED at the array edges exactly as in a wavefront array:
@@ -13,8 +39,8 @@
 //     * B streams from the NORTH, col j delayed by j, then shifts SOUTH one PE
 //       per cycle:  B[k][j] reaches PE[i][j] at cycle  t = i + j + k.
 //   Because A[i][k] and B[k][j] reach PE[i][j] on the SAME cycle t = i+j+k,
-//   each PE multiply-accumulates exactly the four products of its dot product:
-//        C[i][j] = sum_{k=0..3} A[i][k] * B[k][j].
+//   each PE multiply-accumulates exactly the N products of its dot product:
+//        C[i][j] = sum_{k=0..N-1} A[i][k] * B[k][j].
 //   The unique partial product consumed by PE[i][j] on cycle t is index
 //   k = t - i - j, valid only while 0 <= k <= N-1.  We MAC precisely that
 //   product each cycle, which is algebraically identical to a physical mesh
@@ -27,7 +53,7 @@
 //   t = 6,7,8,9 for N=4).  Results are written back ONE ROW PER CYCLE,
 //   OVERLAPPED with the wavefront tail: row r is driven onto the TM write port
 //   the cycle after it becomes final, i.e. at t = r + 2N-1 (t = 7,8,9,10).
-//   This overlap is what yields the SPEC §3.3 latency 2N-1 + N = 11.
+//   This overlap is what yields the SPEC §3.3 latency 2N-1 + N (11 for N=4).
 //
 //   OPERAND DELIVERY.  TM has two combinational read ports.  During the run
 //   the unit walks A row r on port 1 and B row r on port 2 (r = 0..N-1),
@@ -39,31 +65,32 @@
 //
 // Q-FORMATS  (single source of truth: tpu_defs.vh)
 //   A, B, C elements : Q7.8   (16-bit signed value sign-extended in a 32-bit
-//                              TM lane; 4 lanes per TM line = one matrix row).
+//                              TM lane; N lanes of a 4-lane TM line = one row).
 //   MAC product      : Q7.8 * Q7.8 = Q14.16 (30-bit signed, fits 32 bits).
-//   Accumulator      : Q15.16, 48-bit signed (4 Q14.16 products w/o overflow).
+//   Accumulator      : Q15.16, 48-bit signed (N Q14.16 products w/o overflow).
 //   Output narrowing : round-half-up + saturate to Q7.8 via the shared
 //                      `TPU_RND_SAT_Q78 macro; saturation flagged via
 //                      `TPU_SAT_HIT.
 //
 // MEMORY LAYOUT (TM, base line indices on the interface)
-//   A : lines a_base..a_base+3 ; line a_base+i = row i = lanes
-//       {A[i][3],A[i][2],A[i][1],A[i][0]} (lane 0 = column 0).
-//   B : lines b_base..b_base+3 ; line b_base+k = row k of B.
-//   C : lines c_base..c_base+3 ; line c_base+i = row i of C.
+//   A : lines a_base..a_base+N-1 ; line a_base+i = row i = lanes
+//       {A[i][N-1]..A[i][0]} (lane 0 = column 0).
+//   B : lines b_base..b_base+N-1 ; line b_base+k = row k of B.
+//   C : lines c_base..c_base+N-1 ; line c_base+i = row i of C.
 //   Only the low ELEM_W (16) bits of each lane carry Q7.8 data; the unit
 //   sign-extends on read and re-packs sign-extended results on write.
 //
-// LATENCY / HANDSHAKE (measured, deterministic)  -- SPEC §3.3 = 2N-1 + N = 11
-//   Cycle 0      : `start` sampled high in S_IDLE (bases latched).
-//   Cycles 1..11 : S_RUN.  MAC wavefront on t = 0..3N-3 (cycles 1..10) with
-//                  overlapped row writes on t = 2N-1..3N-2 (cycles 8..11);
-//                  the LAST C row (row N-1) is driven on cycle 11.
-//   `done` is a COMBINATIONAL 1-cycle pulse asserted on cycle 11 (the cycle the
-//   last C row write is driven).  Measured start->done = 11 cycles.
-//   `sat` is a COMBINATIONAL reduction over all 16 (final, stable) accumulators,
-//   valid together with `done`; it is high iff ANY C element saturated.
-//   `busy` is registered, high from cycle 1 through cycle 11 (drops at 12).
+// LATENCY / HANDSHAKE (measured, deterministic)  -- SPEC §3.3 = 2N-1 + N
+//   Cycle 0       : `start` sampled high in S_IDLE (bases latched).
+//   Cycles 1..L   : S_RUN (L = 3N-2 + 1 = latency).  MAC wavefront on
+//                   t = 0..3N-3 with overlapped row writes on t = 2N-1..3N-2;
+//                   the LAST C row (row N-1) is driven on the final cycle.
+//   `done` is a COMBINATIONAL 1-cycle pulse asserted on the final run cycle (the
+//   cycle the last C row write is driven).  Measured start->done = 2N-1 + N
+//   (11 for N=4).
+//   `sat` is a COMBINATIONAL reduction over all N*N (final, stable)
+//   accumulators, valid together with `done`; high iff ANY C element saturated.
+//   `busy` is registered, high from cycle 1 through the final cycle.
 //   Because the TM write is SYNCHRONOUS, the last C row LANDS in TM the cycle
 //   AFTER `done`; a consumer reads C from the cycle after `done` onward.
 //
@@ -85,7 +112,11 @@
 //   registered state with no feedback (no comb loop); no non-synthesizable
 //   constructs.  Passes verilator --lint-only -Wall and iverilog -g2012 -Wall.
 //============================================================================
-module gemm_systolic (
+module gemm_systolic #(
+    // GEMM tile dimension.  DEFAULT keeps the historical 4x4 behavior exactly.
+    // Architectural envelope: 2 <= N <= `LINE_LANES (one TM line per row).
+    parameter integer N = `GEMM_N
+) (
     input  wire                  clk,
     input  wire                  rst,
 
@@ -110,11 +141,22 @@ module gemm_systolic (
 
     // ----------------------------------------------------------------------
     // Geometry (local loop bounds only -- never redefines tpu_defs sizes).
+    // All bounds and index/counter widths are DERIVED from the parameter N so
+    // the unit is correct for any N in [2,`LINE_LANES]; defaults reproduce the
+    // historical 4x4 sizing (LAST_MAC=9, FIRST_WR=7, LAST_T=10, 4-bit tcnt,
+    // 2-bit indices).
     // ----------------------------------------------------------------------
-    localparam integer N        = `GEMM_N;            // 4
-    localparam integer LAST_MAC = 3*`GEMM_N - 3;      // last MAC cycle t = 9
-    localparam integer FIRST_WR = 2*`GEMM_N - 1;      // first row write at t = 7
-    localparam integer LAST_T   = 3*`GEMM_N - 2;      // final run cycle t = 10
+    localparam integer LAST_MAC = 3*N - 3;   // last MAC cycle t = 3N-3  (9 @N=4)
+    localparam integer FIRST_WR = 2*N - 1;   // first row write at t=2N-1 (7 @N=4)
+    localparam integer LAST_T   = 3*N - 2;   // final run cycle t = 3N-2  (10 @N=4)
+
+    // Derived widths (replace the original hardcoded 4/2-bit slices):
+    //   TCNT_W : holds run-cycle counter 0..LAST_T (max value 3N-2).  Width
+    //            $clog2(LAST_T+1) = $clog2(3N-1).  4 bits @N=4 (counts 0..10).
+    //   IDX_W  : holds a matrix index 0..N-1 (row/col/arrival-k/write-row).
+    //            $clog2(N).  2 bits @N=4.  >=1 for N>=2 (supported range).
+    localparam integer TCNT_W = $clog2(LAST_T + 1);
+    localparam integer IDX_W  = $clog2(N);
 
     // FSM states.
     localparam [0:0] S_IDLE = 1'b0;  // wait for start
@@ -122,14 +164,14 @@ module gemm_systolic (
 
     reg                  state;
     reg [`TM_IDX_W-1:0]  a_base_r, b_base_r, c_base_r;
-    reg [3:0]            tcnt;     // run cycle counter 0..LAST_T (needs 4 bits)
+    reg [TCNT_W-1:0]     tcnt;     // run cycle counter 0..LAST_T (TCNT_W bits)
 
     // Operand register banks (Q7.8 sign-extended to 32 bits).
     //   afull[i][k] = A[i][k] ,  bfull[k][j] = B[k][j].
     reg signed [`XLEN-1:0] afull [0:N-1][0:N-1];
     reg signed [`XLEN-1:0] bfull [0:N-1][0:N-1];
 
-    // 16 output accumulators, Q15.16, 48-bit signed.
+    // N*N output accumulators, Q15.16, 48-bit signed.
     reg signed [`ACC_W-1:0] acc [0:N-1][0:N-1];
 
     integer i, j;
@@ -140,7 +182,7 @@ module gemm_systolic (
     // ----------------------------------------------------------------------
     function signed [`XLEN-1:0] sext_lane;
         input [`LINE_W-1:0] line;
-        input [1:0]         lane;     // 0..3
+        input [IDX_W-1:0]   lane;     // 0..N-1
         reg   [`ELEM_W-1:0] raw;
         begin
             raw       = line[lane*`LANE_W +: `ELEM_W];   // low 16 bits of lane
@@ -148,23 +190,33 @@ module gemm_systolic (
         end
     endfunction
 
-    // Arrival index k = tcnt - i - j for PE[i][j] (valid only when the wavefront
-    // guard holds, in which case 0 <= k <= N-1 so 2 bits suffice).
-    // Computed in 2-bit modular arithmetic: (tcnt-i-j) mod N equals the low 2
-    // bits of the true difference, and the guard at the call site guarantees
-    // the true k is in [0,N-1], so the modular value is the exact arrival k.
-    function [1:0] arr_k;
-        input [1:0] ii;
-        input [1:0] jj;
+    // Arrival index k = tcnt - i - j for PE[i][j].  PARAMETER-CORRECT form:
+    // this is the TRUE non-negative difference (NOT a mod-N bit-truncation), so
+    // it is exact for ANY N -- not just powers of two.  It is consulted only
+    // when the wavefront guard at the call site holds (tcnt >= i+j and
+    // tcnt-i-j < N), in which case the difference lies in [0,N-1] and fits the
+    // IDX_W-bit result; the wide intermediate makes the subtraction true integer
+    // arithmetic before the (lossless, in-range) narrow to IDX_W bits.
+    function [IDX_W-1:0] arr_k;
+        input [TCNT_W-1:0] ii;
+        input [TCNT_W-1:0] jj;
         begin
-            arr_k = tcnt[1:0] - ii - jj;
+            // tcnt-ii-jj evaluates at the full TCNT_W operand width (a TRUE
+            // integer difference, NOT a mod-N truncation of pre-narrowed tcnt);
+            // under the call-site guard the value is in [0,N-1] and is captured
+            // EXACTLY by the IDX_W-bit return.  The IDX_W'() cast marks the
+            // narrowing INTENTIONAL (lossless here) -- same idiom as the shared
+            // `XLEN'/`ELEM_W' casts in tpu_defs.vh; keeps verilator -Wall clean.
+            arr_k = IDX_W'(tcnt - ii - jj);
         end
     endfunction
 
-    // Current write-back row index = (tcnt - (2N-1)) mod N, 0..N-1 (2 bits).
-    function [1:0] wr_row_f;
+    // Current write-back row index = tcnt - (2N-1), 0..N-1.  PARAMETER-CORRECT:
+    // a true subtraction (consulted only when tcnt >= FIRST_WR, so the result is
+    // in [0,N-1]) narrowed losslessly to IDX_W bits -- no mod-N bit-truncation.
+    function [IDX_W-1:0] wr_row_f;
         begin
-            wr_row_f = tcnt[1:0] - FIRST_WR[1:0];
+            wr_row_f = IDX_W'(tcnt - FIRST_WR[TCNT_W-1:0]);
         end
     endfunction
 
@@ -226,36 +278,38 @@ module gemm_systolic (
     // reads it live from the TM read data; otherwise the needed row (k < tcnt)
     // is already banked.  (Needed row index never exceeds tcnt: an A row index
     // i is live only when tcnt==i, i.e. j==k==0; a B row index k is live only
-    // when tcnt==k, i.e. i==j==0.)
+    // when tcnt==k, i.e. i==j==0.)  Row indices are compared at TCNT_W width;
+    // column/bank indices are IDX_W bits.
     // ----------------------------------------------------------------------
     function signed [`XLEN-1:0] a_sel;
-        input [2:0] rowi;   // A row index i
-        input [1:0] colk;   // A column index k
+        input [TCNT_W-1:0] rowi;   // A row index i  (compared with tcnt)
+        input [IDX_W-1:0]  colk;   // A column index k
         begin
-            if ({1'b0, rowi} == tcnt) a_sel = sext_lane(tm_rdata1, colk);
-            else                      a_sel = afull[rowi[1:0]][colk];
+            if (rowi == tcnt) a_sel = sext_lane(tm_rdata1, colk);
+            else              a_sel = afull[rowi[IDX_W-1:0]][colk];
         end
     endfunction
 
     function signed [`XLEN-1:0] b_sel;
-        input [2:0] rowk;   // B row index k
-        input [1:0] colj;   // B column index j
+        input [TCNT_W-1:0] rowk;   // B row index k  (compared with tcnt)
+        input [IDX_W-1:0]  colj;   // B column index j
         begin
-            if ({1'b0, rowk} == tcnt) b_sel = sext_lane(tm_rdata2, colj);
-            else                      b_sel = bfull[rowk[1:0]][colj];
+            if (rowk == tcnt) b_sel = sext_lane(tm_rdata2, colj);
+            else              b_sel = bfull[rowk[IDX_W-1:0]][colj];
         end
     endfunction
 
     // ----------------------------------------------------------------------
     // `done` : combinational 1-cycle pulse on the final run cycle (last C row
-    //          driven).  start->done latency = 3N-2 + 1 from start sample = 11.
-    // `sat`  : combinational reduction over ALL 16 (final, stable) accumulators,
-    //          valid together with `done`.  High iff any C element saturated.
+    //          driven).  start->done latency = 3N-2 + 1 from start sample.
+    // `sat`  : combinational reduction over ALL N*N (final, stable)
+    //          accumulators, valid together with `done`.  High iff any C
+    //          element saturated.
     // Both are pure functions of registered state -> glitch-free at sample.
     // ----------------------------------------------------------------------
-    assign done = (state == S_RUN) && (tcnt == LAST_T[3:0]);
+    assign done = (state == S_RUN) && (tcnt == LAST_T[TCNT_W-1:0]);
 
-    // `sat` : OR of the per-element saturation flags over all 16 (final,
+    // `sat` : OR of the per-element saturation flags over all N*N (final,
     // stable) accumulators -- a pure combinational reduction of `acc`.  Uses an
     // `always @(*)` so the sensitivity correctly covers every word of the `acc`
     // array (a continuous assign calling a function that reads an unpacked
@@ -279,7 +333,7 @@ module gemm_systolic (
             // --- synchronous reset: clear ALL state ---
             state     <= S_IDLE;
             busy      <= 1'b0;
-            tcnt      <= 4'd0;
+            tcnt      <= {TCNT_W{1'b0}};
             a_base_r  <= {`TM_IDX_W{1'b0}};
             b_base_r  <= {`TM_IDX_W{1'b0}};
             c_base_r  <= {`TM_IDX_W{1'b0}};
@@ -310,7 +364,7 @@ module gemm_systolic (
                         b_base_r  <= b_base;
                         c_base_r  <= c_base;
                         busy      <= 1'b1;
-                        tcnt      <= 4'd0;
+                        tcnt      <= {TCNT_W{1'b0}};
                         for (i = 0; i < N; i = i + 1)
                             for (j = 0; j < N; j = j + 1)
                                 acc[i][j] <= {`ACC_W{1'b0}};
@@ -332,34 +386,45 @@ module gemm_systolic (
                 // ----------------------------------------------------------
                 S_RUN: begin
                     // (a) bank presented rows (valid only for tcnt < N).  The
-                    //     next operand row to present is (tcnt+1) mod N.
-                    if (tcnt < N[3:0]) begin
+                    //     next operand row to present is tcnt+1; this branch is
+                    //     only reached while tcnt < N, so tcnt+1 <= N is a true
+                    //     count and NO mod-N wrap is needed (none is performed).
+                    //     At tcnt == N-1 the presented row tcnt+1 == N is a
+                    //     don't-care (never banked: the guard blocks tcnt >= N).
+                    if (tcnt < N[TCNT_W-1:0]) begin
                         for (j = 0; j < N; j = j + 1) begin
-                            afull[tcnt[1:0]][j] <= sext_lane(tm_rdata1, j[1:0]);
-                            bfull[tcnt[1:0]][j] <= sext_lane(tm_rdata2, j[1:0]);
+                            afull[tcnt[IDX_W-1:0]][j] <=
+                                sext_lane(tm_rdata1, j[IDX_W-1:0]);
+                            bfull[tcnt[IDX_W-1:0]][j] <=
+                                sext_lane(tm_rdata2, j[IDX_W-1:0]);
                         end
                         tm_raddr1 <= a_base_r +
-                            {{(`TM_IDX_W-2){1'b0}}, (tcnt[1:0] + 2'd1)};
+                            ({{(`TM_IDX_W-TCNT_W){1'b0}}, tcnt} +
+                             {{(`TM_IDX_W-1){1'b0}}, 1'b1});
                         tm_raddr2 <= b_base_r +
-                            {{(`TM_IDX_W-2){1'b0}}, (tcnt[1:0] + 2'd1)};
+                            ({{(`TM_IDX_W-TCNT_W){1'b0}}, tcnt} +
+                             {{(`TM_IDX_W-1){1'b0}}, 1'b1});
                     end
 
                     // (b) MAC the skewed wavefront for cycle `tcnt` (t<=3N-3).
                     //     PE[i][j] MACs iff its arrival k = tcnt-i-j is in
                     //     [0,N-1]; the operand selectors fetch A[i][k], B[k][j]
                     //     from the live read ports or the banks as appropriate.
-                    if (tcnt <= LAST_MAC[3:0]) begin
+                    if (tcnt <= LAST_MAC[TCNT_W-1:0]) begin
                         for (i = 0; i < N; i = i + 1)
                             for (j = 0; j < N; j = j + 1) begin
-                                if ((tcnt >= ({1'b0,i[2:0]} + {1'b0,j[2:0]})) &&
-                                    ((tcnt - {1'b0,i[2:0]} - {1'b0,j[2:0]})
-                                                                < N[3:0])) begin
+                                if ((tcnt >= (i[TCNT_W-1:0] + j[TCNT_W-1:0])) &&
+                                    ((tcnt - i[TCNT_W-1:0] - j[TCNT_W-1:0])
+                                                       < N[TCNT_W-1:0])) begin
                                     acc[i][j] <= acc[i][j]
-                                      + ($signed(a_sel(i[2:0],
-                                                       arr_k(i[1:0], j[1:0])))
-                                       * $signed(b_sel({1'b0,
-                                                        arr_k(i[1:0], j[1:0])},
-                                                       j[1:0])));
+                                      + ($signed(a_sel(i[TCNT_W-1:0],
+                                                  arr_k(i[TCNT_W-1:0],
+                                                        j[TCNT_W-1:0])))
+                                       * $signed(b_sel(
+                                                  {{(TCNT_W-IDX_W){1'b0}},
+                                                   arr_k(i[TCNT_W-1:0],
+                                                         j[TCNT_W-1:0])},
+                                                  j[IDX_W-1:0])));
                                 end else begin
                                     acc[i][j] <= acc[i][j];   // hold (no latch)
                                 end
@@ -368,22 +433,23 @@ module gemm_systolic (
 
                     // (c) overlapped writeback: row wr_row_f() = tcnt-(2N-1) is
                     //     final (its last MAC committed last cycle).  Round/sat
-                    //     its 4 accumulators and drive the TM write port.
-                    if (tcnt >= FIRST_WR[3:0]) begin
+                    //     its N accumulators (lanes 0..N-1 of the TM line) and
+                    //     drive the TM write port.
+                    if (tcnt >= FIRST_WR[TCNT_W-1:0]) begin
                         tm_we    <= 1'b1;
                         tm_waddr <= c_base_r +
-                                    {{(`TM_IDX_W-2){1'b0}}, wr_row_f()};
+                                    {{(`TM_IDX_W-IDX_W){1'b0}}, wr_row_f()};
                         for (j = 0; j < N; j = j + 1) begin
                             tm_wdata[j*`LANE_W +: `LANE_W] <=
                                 `TPU_SEXT16(rnd_sat_q78(acc[wr_row_f()][j]));
                         end
                     end
 
-                    if (tcnt == LAST_T[3:0]) begin
+                    if (tcnt == LAST_T[TCNT_W-1:0]) begin
                         busy  <= 1'b0;
                         state <= S_IDLE;
                     end else begin
-                        tcnt <= tcnt + 4'd1;
+                        tcnt <= tcnt + {{(TCNT_W-1){1'b0}}, 1'b1};
                     end
                 end
             endcase

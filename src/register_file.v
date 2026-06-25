@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
 // register_file.v  --  TPU v2.0 scalar register file (SPEC.md §3.1, §5.5)

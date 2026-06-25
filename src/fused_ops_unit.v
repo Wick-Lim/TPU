@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 `include "tpu_defs.vh"
 //============================================================================
 // fused_ops_unit  --  TPU v2.0 tile-domain elementwise post-op  (SPEC.md §5.5)
