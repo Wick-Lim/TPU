@@ -1,0 +1,7 @@
+# Build artifacts
+build/
+
+# Generated simulation waveforms
+tpu_waveform.vcd
+hazard_waveform.vcd
+*.vcd
