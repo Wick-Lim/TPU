@@ -191,8 +191,12 @@ module glm_fp_pipe_tb;
     // a "match" allowing both to be NaN (any NaN payload), else bit-exact.
     function automatic match_exact(input [31:0] a, input [31:0] b);
         begin
-            if (is_nan32(a) && is_nan32(b)) match_exact = 1'b1;
-            else                            match_exact = (a == b);
+            // An X/Z bit must NEVER count as a match: `a == b` returns X when a
+            // has X bits, and `!X` is falsy, so a broken DUT driving X would
+            // SILENTLY PASS.  Reject any unknown bit explicitly, then compare 4-state.
+            if (^a === 1'bx || ^b === 1'bx) match_exact = 1'b0;
+            else if (is_nan32(a) && is_nan32(b)) match_exact = 1'b1;
+            else                            match_exact = (a === b);
         end
     endfunction
 

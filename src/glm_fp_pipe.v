@@ -1059,14 +1059,20 @@ module fp32_exp_pipe (
     // r tap for Horner step s (s=0..4): aligned to that step's mul input.
     //   step 0 mul consumes r at r_v            -> use r directly
     //   step s mul consumes r delayed s*STEP    -> r_dl[s*STEP-1]
-    function automatic [31:0] r_tap(input integer s);
-        r_tap = (s == 0) ? r : r_dl[s*STEP-1];
-    endfunction
+    // NOTE: these MUST be explicit wires, not a function called inside the module
+    // instantiation ports below -- iverilog freezes a function-in-port at time 0
+    // (it does not re-evaluate), driving the sub-pipes with X.  STEP is a constant
+    // so r_dl[k*STEP-1] is a constant-index memory read = a valid continuous assign.
+    wire [31:0] r_tap0 = r;
+    wire [31:0] r_tap1 = r_dl[1*STEP-1];
+    wire [31:0] r_tap2 = r_dl[2*STEP-1];
+    wire [31:0] r_tap3 = r_dl[3*STEP-1];
+    wire [31:0] r_tap4 = r_dl[4*STEP-1];
 
     // ---- step 0 : p0 = C4 * r ; poly0 = C3 + p0 ----
     wire        p0_v;  wire [31:0] p0;
     fp32_mul_pipe u_m0 (.clk(clk), .rst(rst), .valid_in(r_v),
-        .a(C4), .b(r_tap(0)), .valid_out(p0_v), .result(p0));
+        .a(C4), .b(r_tap0), .valid_out(p0_v), .result(p0));
     wire        poly0_v;  wire [31:0] poly0;
     fp32_add_pipe u_a0 (.clk(clk), .rst(rst), .valid_in(p0_v),
         .a(C3), .b(p0), .valid_out(poly0_v), .result(poly0));
@@ -1074,7 +1080,7 @@ module fp32_exp_pipe (
     // ---- step 1 : p1 = poly0 * r ; poly1 = C2 + p1 ----
     wire        p1_v;  wire [31:0] p1;
     fp32_mul_pipe u_m1 (.clk(clk), .rst(rst), .valid_in(poly0_v),
-        .a(poly0), .b(r_tap(1)), .valid_out(p1_v), .result(p1));
+        .a(poly0), .b(r_tap1), .valid_out(p1_v), .result(p1));
     wire        poly1_v;  wire [31:0] poly1;
     fp32_add_pipe u_a1 (.clk(clk), .rst(rst), .valid_in(p1_v),
         .a(C2), .b(p1), .valid_out(poly1_v), .result(poly1));
@@ -1082,7 +1088,7 @@ module fp32_exp_pipe (
     // ---- step 2 : p2 = poly1 * r ; poly2 = C1 + p2 ----
     wire        p2_v;  wire [31:0] p2;
     fp32_mul_pipe u_m2 (.clk(clk), .rst(rst), .valid_in(poly1_v),
-        .a(poly1), .b(r_tap(2)), .valid_out(p2_v), .result(p2));
+        .a(poly1), .b(r_tap2), .valid_out(p2_v), .result(p2));
     wire        poly2_v;  wire [31:0] poly2;
     fp32_add_pipe u_a2 (.clk(clk), .rst(rst), .valid_in(p2_v),
         .a(C1), .b(p2), .valid_out(poly2_v), .result(poly2));
@@ -1090,7 +1096,7 @@ module fp32_exp_pipe (
     // ---- step 3 : p3 = poly2 * r ; poly3 = 1.0 + p3 ----
     wire        p3_v;  wire [31:0] p3;
     fp32_mul_pipe u_m3 (.clk(clk), .rst(rst), .valid_in(poly2_v),
-        .a(poly2), .b(r_tap(3)), .valid_out(p3_v), .result(p3));
+        .a(poly2), .b(r_tap3), .valid_out(p3_v), .result(p3));
     wire        poly3_v;  wire [31:0] poly3;
     fp32_add_pipe u_a3 (.clk(clk), .rst(rst), .valid_in(p3_v),
         .a(ONE), .b(p3), .valid_out(poly3_v), .result(poly3));
@@ -1098,7 +1104,7 @@ module fp32_exp_pipe (
     // ---- step 4 : p4 = poly3 * r ; poly4 = 1.0 + p4  (full poly) ----
     wire        p4_v;  wire [31:0] p4;
     fp32_mul_pipe u_m4 (.clk(clk), .rst(rst), .valid_in(poly3_v),
-        .a(poly3), .b(r_tap(4)), .valid_out(p4_v), .result(p4));
+        .a(poly3), .b(r_tap4), .valid_out(p4_v), .result(p4));
     wire        poly_v;  wire [31:0] poly;
     fp32_add_pipe u_a4 (.clk(clk), .rst(rst), .valid_in(p4_v),
         .a(ONE), .b(p4), .valid_out(poly_v), .result(poly));
