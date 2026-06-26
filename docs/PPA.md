@@ -5,11 +5,11 @@ tensor units, mapped to the **Lattice ECP5** FPGA cell library with the open-sou
 Yosys synthesis flow.
 
 > **Honesty note.** This report contains **real measured synthesis results** for
-> **area** and a **combinational logic-depth** proxy for timing. It does **not**
-> contain routed `fmax` or power numbers — those require place-and-route or a power
-> analyzer that is **not installed in this environment** (see
-> [§5 How to get true routed PPA next](#5-how-to-get-true-routed-ppa-next)). The
-> `fmax` figures below are **rough first-order estimates** and are flagged as such.
+> **area**, a **combinational logic-depth** proxy for timing (§3), AND — for the two
+> deepest blocks — **real routed `fmax` from place & route** (§3.1, nextpnr-ecp5).
+> The `fmax_est` column in §3 is a rough proxy; the §3.1 numbers are measured. Power
+> is still not measured (needs a bitstream + power analyzer). A key P&R finding: the
+> default-size **full TPU does not fit a single ECP5** (161 DSP > 156) — see §3.1.
 
 ---
 
@@ -176,6 +176,47 @@ reports TPU **area only** and runs `ltp` on the four tensor units (the actionabl
 pipeline candidates). Re-measure manually with
 `yosys -p "read_verilog -sv -I src <all src>; synth_ecp5 -top TPU; ltp"` if needed.
 
+### 3.1 Routed fmax — MEASURED (nextpnr-ecp5 place & route)
+
+The `fmax_est` column above is a rough proxy. We have since run **real place &
+route** with the open-source ECP5 flow (Yosys `synth_ecp5` → **nextpnr-ecp5**, speed
+grade 6), giving true post-route register-to-register `fmax` for the deepest blocks.
+Each unit is wrapped in a tiny synthesizable harness (`fpga/sm_harness.v`,
+`fpga/gemm_harness.v`) that buries its 128-bit TM ports as internal nets (otherwise
+they overflow the package I/O), seeds operands from an LFSR, and folds the result into
+a signature — so P&R fits and measures the unit's genuine internal critical path.
+
+| Block (default size) | ECP5 device | LUT / FF / DSP   | **routed fmax** | critical path |
+|----------------------|-------------|------------------|----------------:|---------------|
+| softmax_unit (LEN=8) | LFE5U-25F   | 10k / 0.9k / 10  | **~3.4 MHz**    | single-cycle **64-bit reciprocal divide** `num_rcp / sum64` (long CCU2C ripple divider, ~266 ns) |
+| gemm_systolic (N=4)  | LFE5U-45F   | 7k / 3.3k / 48   | **~28 MHz**     | operand fetch → 16-bit signed multiply → 48-bit accumulate (systolic MAC) |
+
+Both fail a 50 MHz target — confirming the headline finding: the tensor blocks carry
+**deep single-cycle combinational arithmetic** (a full reciprocal divide in softmax,
+a wide MAC in GEMM) that **must be pipelined** to clock fast (ROADMAP item 1). The
+softmax reciprocal divide (~3.4 MHz) is the single worst path and the #1 pipeline
+target — worse in absolute terms than the `ltp` proxy implied, because a 64-bit ripple
+divide is one enormous carry chain.
+
+**The full TPU does NOT fit a single ECP5.** At default sizes it needs **161
+MULT18X18D** but the largest ECP5 (LFE5U-85F) has only **156**; mapping multipliers to
+LUTs instead (`synth_ecp5 -nodsp`) needs **~161k LUT4 > 84k** available (192%). So the
+default-size full accelerator targets a larger FPGA (Xilinx UltraScale / Intel Agilex)
+or needs DSP time-multiplexing (a resource-sharing redesign). The per-block routed
+numbers above are measured on the smallest ECP5 that fits each block.
+
+**Reproduce:** install the open-source ECP5 flow (oss-cad-suite, which bundles
+`nextpnr-ecp5`), then for a harness `<h>` over unit `<unit>`:
+
+```sh
+source <oss-cad-suite>/environment
+yosys -q -p "read_verilog -sv -I src fpga/<h>.v src/<unit>.v; synth_ecp5 -top <h> -json <h>.json"
+nextpnr-ecp5 --json <h>.json --25k --package CABGA256 --speed 6 --freq 50 --textcfg /dev/null
+```
+
+and read the `Max frequency for clock '...'` line (`--25k`/`--45k`/`--85k` selects the
+device; step up if a block overflows LUTs/DSP).
+
 ⚠️ **`attention_unit` has the deepest combinational path among the four tensor
 units (ltp 2,250).** The full **TPU** top has the largest `ltp` overall (~5,168),
 since its critical path can run through the deepest sub-block plus top-level glue.
@@ -236,13 +277,15 @@ session** and are recommended for a later **v3 performance pass**:
 
 ---
 
-## 5. How to get true routed PPA next
+## 5. Getting more routed PPA
 
-The numbers above are honest about their limits: **area is real**, but **`fmax`
-and power are not routed measurements**. To obtain true PPA, run a place-and-route
-or full implementation flow. None of these are installed in this environment.
+**Routed `fmax` is now measured** for the two deepest blocks via Option A below (see
+§3.1: softmax ~3.4 MHz, gemm ~28 MHz). What remains: routed `fmax` for the rest of
+the blocks (same harness recipe), and **power** (needs a placed bitstream + a power
+analyzer). The full-design routed number is blocked by the ECP5 device-fit limit
+(§3.1) — it needs a larger FPGA or DSP time-multiplexing first.
 
-### Option A — ECP5 routed flow (closest to this report)
+### Option A — ECP5 routed flow ✅ USED for §3.1
 
 Install **oss-cad-suite** (bundles `nextpnr-ecp5`), then feed the Yosys JSON
 netlist into nextpnr:

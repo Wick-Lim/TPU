@@ -25,13 +25,19 @@ unit. The ranking is:
 attention_unit (2250)  >  softmax_unit (1580)  >  gemm_systolic (262)  >  conv2d_unit (95)
 ```
 
+**Real place & route now confirms this** ([`PPA.md`](PPA.md) §3.1, nextpnr-ecp5):
+`softmax_unit` routes at only **~3.4 MHz** (its single-cycle **64-bit reciprocal
+divide** is the worst path) and `gemm_systolic` at **~28 MHz** — both fail a 50 MHz
+target. So the depth proxy is borne out by measured timing.
+
 The tensor units are **single deep combinational datapaths** per FSM stage — the
 softmax exp/reciprocal approximation chain, the attention QK^T reduction + softmax
 reuse + ×V matmul, and the GEMM accumulation/carry chain are all unpipelined. The
-PPA report's actionable finding is to **register these chains into multiple pipeline
-stages**, attacking `attention_unit` first (deepest, and it serially reuses
-`softmax_unit`), then `softmax_unit`, then the `gemm_systolic` accumulation tree;
-`conv2d_unit` (depth 95) is already shallow and is not a priority.
+actionable finding is to **register these chains into multiple pipeline stages**,
+attacking the **softmax reciprocal divide first** (it routes worst, ~3.4 MHz, and
+`attention_unit` reuses softmax), then the attention QK^T/×V paths, then the
+`gemm_systolic` accumulation tree; `conv2d_unit` (depth 95) is shallow and not a
+priority.
 
 **Why deferred.** Adding pipeline stages **changes the cycle-accurate latency** of
 each block: results appear N cycles later and the `start`/`busy`/`done` handshake
