@@ -71,6 +71,14 @@
 //============================================================================
 
 
+// SINGLE SOURCE OF TRUTH for the per-module pipeline LATENCIES lives in
+// glm_fp_pipe_lat.vh (FP_MUL_LAT / FP_ADD_LAT / FP_MAC_LAT / FP_RSQRT_LAT /
+// FP_EXP_LAT, structural flop count valid_in->valid_out).  Each module below
+// sets its `localparam LAT` from the matching macro, and every consumer reads
+// the same macros rather than hardcoding a number.
+`include "glm_fp_pipe_lat.vh"
+
+
 //============================================================================
 // fp32_mul_pipe  --  pipelined IEEE-ish fp32 multiply (RNE, FTZ).
 //   BIT-EQUIVALENT to glm_fp.vh fp32_mul.   LAT = 2,  1 result/cycle.
@@ -81,6 +89,9 @@
 //   Stage 1 (normalize + RNE round + range):
 //       pick [1,2)/[2,4) normalize, round-to-nearest-even with carry, apply
 //       overflow->inf / underflow->FTZ.  Registered to the output.
+//
+//   LAT (structural flop count, valid_in->valid_out) is exposed as the output
+//   parameter LAT so consumers can read it instead of hardcoding.
 //============================================================================
 module fp32_mul_pipe (
     input              clk,
@@ -91,6 +102,9 @@ module fp32_mul_pipe (
     output reg         valid_out,
     output reg [31:0]  result
 );
+    /* verilator lint_off UNUSEDPARAM */
+    localparam integer LAT = `FP_MUL_LAT;  // exposed: structural flop count in->out
+    /* verilator lint_on UNUSEDPARAM */
     `include "glm_fp.vh"
 
     // ---- Stage 0 combinational: decode + product + special detect ----
@@ -197,12 +211,30 @@ endmodule
 
 //============================================================================
 // fp32_add_pipe  --  pipelined IEEE-ish fp32 add (RNE, FTZ).
-//   BIT-EQUIVALENT to glm_fp.vh fp32_add.   LAT = 3,  1 result/cycle.
+//   BIT-EQUIVALENT to glm_fp.vh fp32_add.   LAT = 5,  1 result/cycle.
 //
-//   Stage 0 : special lattice + exponent compare + choose big/small +
-//             align-shift the smaller mantissa (the variable shift) + sticky.
-//   Stage 1 : signed mantissa add/sub (magnitude) + carry-out detect.
-//   Stage 2 : leading-zero normalize + RNE round + range -> output.
+//   The old version put the ENTIRE post-add cone -- leading-zero detect +
+//   normalize barrel-shift + RNE round + exponent adjust -- in ONE stage,
+//   which routed at ~37 MHz and bounded the fmax of every FP unit that uses
+//   fp32 add.  Here that cone is partitioned into short slices so each stage
+//   is at most one shift / one add / the LZ-count / the round:
+//
+//     Stage 0 : special lattice + exponent compare + choose big/small +
+//               align-shift the smaller mantissa (the variable align shift)
+//               + sticky collection.                         (one variable shift)
+//     Stage 1 : signed mantissa add/sub (magnitude) + carry-out detect. (one add)
+//     Stage 2 : leading-zero COUNT only -- a bounded priority encode over the
+//               28-bit magnitude.  (Also folds the mag[27] carry case into the
+//               same "shift amount + exponent delta" representation, but does
+//               NOT yet shift.)                                  (the LZ count)
+//     Stage 3 : normalize barrel-shift by the stage-2 count (one barrel shift),
+//               then slice mantissa / guard / round / sticky and compute the
+//               adjusted exponent.                          (one barrel shift)
+//     Stage 4 : RNE round (+carry) + exponent range -> output.       (the round)
+//
+//   Each of the five stages is a registered slice of the SAME Boolean function
+//   as glm_fp.vh fp32_add, so the produced bits are identical (0 ULP); only the
+//   timing is deepened.  LAT (structural flop count) is exposed as a parameter.
 //============================================================================
 module fp32_add_pipe (
     input              clk,
@@ -213,6 +245,9 @@ module fp32_add_pipe (
     output reg         valid_out,
     output reg [31:0]  result
 );
+    /* verilator lint_off UNUSEDPARAM */
+    localparam integer LAT = `FP_ADD_LAT;  // exposed: structural flop count in->out
+    /* verilator lint_on UNUSEDPARAM */
     `include "glm_fp.vh"
 
     // ---------------- Stage 0 : classify + align ----------------
@@ -319,55 +354,142 @@ module fp32_add_pipe (
     reg [7:0]         r1_exp_big;
     reg [27:0]        r1_mag;
 
-    // ---------------- Stage 2 : normalize + round + range ----------------
-    reg [31:0]        s2_val;
+    // ---------------- Stage 2 : leading-zero COUNT (no shift yet) ----------
+    // Resolve the cancellation case (mag==0 -> +0), the carry case (mag[27]),
+    // and otherwise the leading-zero count of the 28-bit magnitude.  We emit a
+    // single signed shift amount `nshift` and the matching exponent so stage 3
+    // can do exactly ONE barrel shift:
+    //   nshift > 0  -> shift LEFT  by nshift (leading-zero normalize)
+    //   nshift = -1 -> shift RIGHT by 1      (mag[27] carry-out case)
+    //   nshift = 0  -> no shift.
+    // The exponent is adjusted by the same amount (exp_big - lz, or +1 carry).
+    reg               s2_special;
+    reg [31:0]        s2_special_val;
+    reg               s2_iszero;           // exact cancellation -> +0
+    reg               s2_res_sign;
+    reg [27:0]        s2_mag;
+    reg signed [6:0]  s2_nshift;           // -1..26 ; left>0, right=-1
+    reg signed [10:0] s2_exp_pre;          // exponent BEFORE the normalize delta
+
     always @* begin
-        reg [27:0] mag;
-        reg signed [10:0] exp_s;
         reg [10:0] lz;
+        reg [27:0] walk;          // walking copy used ONLY to count leading zeros
         integer    lzi;
-        reg [23:0] mant;
-        reg        guard, round_bit, sticky, round_up;
-        reg [24:0] mant_r;
-        // default-assign every local on every path (no inferred latch)
-        mag = 28'b0; exp_s = 11'sd0; lz = 11'd0; lzi = 0;
-        mant = 24'b0; guard = 1'b0; round_bit = 1'b0; sticky = 1'b0;
-        round_up = 1'b0; mant_r = 25'b0;
-        s2_val = r1_special_val;
+        s2_special     = r1_special;
+        s2_special_val = r1_special_val;
+        s2_iszero      = 1'b0;
+        s2_res_sign    = r1_res_sign;
+        s2_mag         = r1_mag;   // pass the UNSHIFTED magnitude to stage 3
+        s2_nshift      = 7'sd0;
+        s2_exp_pre     = $signed({3'b0, r1_exp_big});
+        lz             = 11'd0;
+        walk           = r1_mag;
+        lzi            = 0;
         if (!r1_special) begin
-            mag   = r1_mag;
-            exp_s = $signed({3'b0, r1_exp_big});
-            if (mag == 0) begin
-                s2_val = 32'b0;
+            if (r1_mag == 0) begin
+                s2_iszero = 1'b1;
+            end else if (r1_mag[27]) begin
+                s2_nshift = -7'sd1;             // right shift by 1, exp+1
             end else begin
-                if (mag[27]) begin
-                    exp_s = exp_s + 11'sd1;
-                    mag   = mag >> 1;
-                end else begin
-                    lz = 11'd0;
-                    for (lzi = 0; lzi < 27; lzi = lzi + 1)
-                        if (mag[26] == 1'b0 && (lzi[10:0] == lz)) begin
-                            mag = mag << 1;
-                            lz  = lz + 11'd1;
-                        end
-                    exp_s = exp_s - $signed(lz);
-                end
-                mant      = mag[26:3];
-                guard     = mag[2];
-                round_bit = mag[1];
-                sticky    = mag[0];
-                round_up  = guard & (round_bit | sticky | mant[0]);
-                mant_r    = {1'b0, mant} + {24'b0, round_up};
+                // count leading zeros above bit 26 (bounded priority encode).
+                // Mirror glm_fp.vh exactly: walk a copy left while its bit 26 is
+                // 0, incrementing the count; stage 3 applies the single shift.
+                for (lzi = 0; lzi < 27; lzi = lzi + 1)
+                    if (walk[26] == 1'b0 && (lzi[10:0] == lz)) begin
+                        walk = walk << 1;
+                        lz   = lz + 11'd1;
+                    end
+                s2_nshift = $signed(lz[6:0]);   // 0..26 fits in 7 signed bits
+            end
+        end
+    end
+
+    reg               r2_valid;
+    reg               r2_special;
+    reg [31:0]        r2_special_val;
+    reg               r2_iszero;
+    reg               r2_res_sign;
+    reg [27:0]        r2_mag;
+    reg signed [6:0]  r2_nshift;
+    reg signed [10:0] r2_exp_pre;
+
+    // ---------------- Stage 3 : normalize barrel-shift + GRS slice ----------
+    reg               s3_special;
+    reg [31:0]        s3_special_val;
+    reg               s3_iszero;
+    reg               s3_res_sign;
+    reg [23:0]        s3_mant;
+    reg               s3_guard, s3_round_bit, s3_sticky;
+    reg signed [10:0] s3_exp_s;
+
+    always @* begin
+        // mag[27] is intentionally dropped after normalize: the implicit-1 lands
+        // at bit 26 (carry case shifts it down), so only mag[26:0] feed the
+        // mantissa/GRS slice.  Localized waiver, in the spirit of glm_fp.vh's.
+        /* verilator lint_off UNUSEDSIGNAL */
+        reg [27:0] mag;
+        /* verilator lint_on UNUSEDSIGNAL */
+        reg signed [10:0] exp_s;
+        s3_special     = r2_special;
+        s3_special_val = r2_special_val;
+        s3_iszero      = r2_iszero;
+        s3_res_sign    = r2_res_sign;
+        s3_mant        = 24'b0;
+        s3_guard       = 1'b0;
+        s3_round_bit   = 1'b0;
+        s3_sticky      = 1'b0;
+        mag            = r2_mag;
+        exp_s          = r2_exp_pre;
+        if (!r2_special && !r2_iszero) begin
+            if (r2_nshift == -7'sd1) begin
+                mag   = r2_mag >> 1;            // carry case
+                exp_s = exp_s + 11'sd1;
+            end else if (r2_nshift > 7'sd0) begin
+                mag   = r2_mag << r2_nshift[5:0];  // single barrel shift left
+                exp_s = exp_s - $signed({4'b0, r2_nshift});
+            end
+            s3_mant      = mag[26:3];
+            s3_guard     = mag[2];
+            s3_round_bit = mag[1];
+            s3_sticky    = mag[0];
+        end
+        s3_exp_s = exp_s;
+    end
+
+    reg               r3_valid;
+    reg               r3_special;
+    reg [31:0]        r3_special_val;
+    reg               r3_iszero;
+    reg               r3_res_sign;
+    reg [23:0]        r3_mant;
+    reg               r3_guard, r3_round_bit, r3_sticky;
+    reg signed [10:0] r3_exp_s;
+
+    // ---------------- Stage 4 : RNE round + range -> output ----------------
+    reg [31:0]        s4_val;
+    always @* begin
+        reg        round_up;
+        reg [24:0] mant_r;
+        reg signed [10:0] exp_s;
+        round_up = 1'b0; mant_r = 25'b0;
+        exp_s    = r3_exp_s;
+        s4_val   = r3_special_val;
+        if (!r3_special) begin
+            if (r3_iszero) begin
+                s4_val = 32'b0;
+            end else begin
+                round_up = r3_guard & (r3_round_bit | r3_sticky | r3_mant[0]);
+                mant_r   = {1'b0, r3_mant} + {24'b0, round_up};
                 if (mant_r[24]) begin
                     mant_r = mant_r >> 1;
                     exp_s  = exp_s + 11'sd1;
                 end
                 if (exp_s >= 11'sd255)
-                    s2_val = {r1_res_sign, 8'hFF, 23'b0};
+                    s4_val = {r3_res_sign, 8'hFF, 23'b0};
                 else if (exp_s <= 11'sd0)
-                    s2_val = {r1_res_sign, 31'b0};
+                    s4_val = {r3_res_sign, 31'b0};
                 else
-                    s2_val = {r1_res_sign, exp_s[7:0], mant_r[22:0]};
+                    s4_val = {r3_res_sign, exp_s[7:0], mant_r[22:0]};
             end
         end
     end
@@ -376,6 +498,8 @@ module fp32_add_pipe (
         if (rst) begin
             r0_valid  <= 1'b0;
             r1_valid  <= 1'b0;
+            r2_valid  <= 1'b0;
+            r3_valid  <= 1'b0;
             valid_out <= 1'b0;
         end else begin
             // stage 0 -> r0
@@ -394,24 +518,46 @@ module fp32_add_pipe (
             r1_res_sign    <= s1_res_sign;
             r1_exp_big     <= s1_exp_big;
             r1_mag         <= s1_mag;
-            // stage 2 -> out
-            valid_out      <= r1_valid;
-            result         <= s2_val;
+            // stage 2 -> r2
+            r2_valid       <= r1_valid;
+            r2_special     <= s2_special;
+            r2_special_val <= s2_special_val;
+            r2_iszero      <= s2_iszero;
+            r2_res_sign    <= s2_res_sign;
+            r2_mag         <= s2_mag;
+            r2_nshift      <= s2_nshift;
+            r2_exp_pre     <= s2_exp_pre;
+            // stage 3 -> r3
+            r3_valid       <= r2_valid;
+            r3_special     <= s3_special;
+            r3_special_val <= s3_special_val;
+            r3_iszero      <= s3_iszero;
+            r3_res_sign    <= s3_res_sign;
+            r3_mant        <= s3_mant;
+            r3_guard       <= s3_guard;
+            r3_round_bit   <= s3_round_bit;
+            r3_sticky      <= s3_sticky;
+            r3_exp_s       <= s3_exp_s;
+            // stage 4 -> out
+            valid_out      <= r3_valid;
+            result         <= s4_val;
         end
     end
 endmodule
 
 
 //============================================================================
-// fp32_mac_pipe  --  fused a*b + c  (RNE, FTZ).   LAT = 5, 1 result/cycle.
+// fp32_mac_pipe  --  fused a*b + c  (RNE, FTZ).   LAT = 7, 1 result/cycle.
 //   BIT-EQUIVALENT (0 ULP) to glm_fp.vh  fp32_add(fp32_mul(a,b), c).
 //
-//   This is the GEMM accumulate primitive.  It is the 2-cycle fp32_mul_pipe
-//   feeding the 3-cycle fp32_add_pipe, with `c` delayed by 2 cycles (the
-//   multiply latency) so it meets the product at the adder.  Because each
-//   sub-pipe is bit-equivalent to its glm_fp.vh function, the fused result
-//   equals fp32_add(fp32_mul(a,b), c) bit-for-bit.
-//   Total LAT = 2 (mul) + 3 (add) = 5.  Throughput = 1/cycle.
+//   This is the GEMM accumulate primitive.  It is the fp32_mul_pipe feeding the
+//   (now deeper) fp32_add_pipe, with `c` delayed by the multiply latency so it
+//   meets the product at the adder.  Because each sub-pipe is bit-equivalent to
+//   its glm_fp.vh function, the fused result equals fp32_add(fp32_mul(a,b), c)
+//   bit-for-bit.  The sub-pipe latencies are READ FROM their exposed LAT
+//   parameters rather than hardcoded, so deepening the add ripples here
+//   automatically: Total LAT = fp32_mul_pipe.LAT + fp32_add_pipe.LAT.
+//   Throughput = 1/cycle.
 //============================================================================
 module fp32_mac_pipe (
     input              clk,
@@ -423,7 +569,14 @@ module fp32_mac_pipe (
     output             valid_out,
     output     [31:0]  result
 );
-    // multiply a*b  (LAT 2)
+    // sub-pipe latencies, read from the single-source-of-truth macros.  The c
+    // operand is delayed by the multiply latency to meet the product at the add.
+    localparam integer MUL_LAT = `FP_MUL_LAT;   // 2
+    /* verilator lint_off UNUSEDPARAM */
+    localparam integer LAT     = `FP_MAC_LAT;   // exposed: structural flop count = mul+add = 7
+    /* verilator lint_on UNUSEDPARAM */
+
+    // multiply a*b  (LAT = MUL_LAT)
     wire        mul_v;
     wire [31:0] mul_y;
     fp32_mul_pipe u_mul (
@@ -431,23 +584,25 @@ module fp32_mac_pipe (
         .a(a), .b(b), .valid_out(mul_v), .result(mul_y)
     );
 
-    // delay c by the multiply latency (2) so it meets the product at the adder.
-    reg [31:0] c_d0, c_d1;
+    // delay c by the multiply latency so it meets the product at the adder.
+    reg [31:0] c_d [0:MUL_LAT-1];
+    integer ci;
     always @(posedge clk) begin
-        c_d0 <= c;
-        c_d1 <= c_d0;
+        c_d[0] <= c;
+        for (ci = 1; ci < MUL_LAT; ci = ci + 1)
+            c_d[ci] <= c_d[ci-1];
     end
 
-    // add (a*b) + c_delayed  (LAT 3).  Total LAT = 2 + 3 = 5 cycles.
+    // add (a*b) + c_delayed.  Total LAT = MUL_LAT + ADD_LAT cycles.
     fp32_add_pipe u_add (
         .clk(clk), .rst(rst), .valid_in(mul_v),
-        .a(mul_y), .b(c_d1), .valid_out(valid_out), .result(result)
+        .a(mul_y), .b(c_d[MUL_LAT-1]), .valid_out(valid_out), .result(result)
     );
 endmodule
 
 
 //============================================================================
-// fp32_rsqrt_pipe  --  pipelined 1/sqrt(x), x>0.   LAT = 20, 1 result/cycle.
+// fp32_rsqrt_pipe  --  pipelined 1/sqrt(x), x>0.   LAT = 24, 1 result/cycle.
 //   BIT-EQUIVALENT to glm_fp.vh fp32_rsqrt (Quake seed + 2 Newton iters,
 //   y = y*(1.5 - 0.5*x*y*y)).
 //
@@ -460,16 +615,15 @@ endmodule
 //   monstrous critical path glm_fp.vh has.  Here every one of those ops is a
 //   real pipelined sub-op, so the critical path is one mul/add stage.
 //
-//   We reuse the bit-exact fp32_mul_pipe (LAT2) / fp32_add_pipe (LAT3).  The
-//   seed, sign/special handling and the negation of xyy are 0-logic (bit ops)
-//   carried alongside in delay regs.  Latency bookkeeping:
-//     setup mul xhalf : 2
-//     iter 0: mul yy(2) -> mul xyy(2) -> add t(3) -> mul y(2)   but yy and the
-//             xhalf path run in PARALLEL, so the chain length is what counts.
-//   To keep the code simple, robust and obviously equivalent, the datapath is
-//   built as an explicit chain of sub-pipes; the measured valid latency is
-//   reported by the smoke TB and documented here as LAT = 20:
-//     xhalf mul (2) + iter0 [yy(2)+xyy(2)+t(3)+ymul(2) = 9] + iter1 [9] = 20.
+//   We reuse the bit-exact fp32_mul_pipe / fp32_add_pipe.  The seed, sign/special
+//   handling and the negation of xyy are 0-logic (bit ops) carried alongside in
+//   delay regs.  All alignment delays are PARAMETERIZED on the sub-pipes'
+//   exposed LAT parameters, so deepening the adder (LAT 3 -> 5) re-balances the
+//   delay lines automatically.  Latency bookkeeping (ML=mul LAT, AL=add LAT):
+//     setup mul xhalf : ML
+//     per iteration   : yy(ML) -> xyy(ML) -> t(AL) -> ymul(ML) = 3*ML + AL
+//     total LAT = ML + 2*(3*ML + AL) = 7*ML + 2*AL.
+//   With ML=2, AL=5 -> LAT = 14 + 10 = 24.  Throughput = 1/cycle.
 //============================================================================
 module fp32_rsqrt_pipe (
     input              clk,
@@ -482,6 +636,14 @@ module fp32_rsqrt_pipe (
     localparam [31:0] THREE_HALF = 32'h3FC00000; // 1.5
     localparam [31:0] HALF        = 32'h3F000000; // 0.5
 
+    // sub-pipe latencies read from the single-source-of-truth macros.
+    localparam integer ML = `FP_MUL_LAT;            // mul latency (2)
+    localparam integer AL = `FP_ADD_LAT;            // add latency (5)
+    localparam integer ITER_LAT = 3*ML + AL;        // one Newton iter latency
+    /* verilator lint_off UNUSEDPARAM */
+    localparam integer LAT = `FP_RSQRT_LAT;         // exposed: structural flop count = 24
+    /* verilator lint_on UNUSEDPARAM */
+
     // ---- special / seed (combinational, 0 ULP bit ops) ----
     // Replicates fp32_rsqrt's special lattice and the integer magic seed.
     wire is_nan  = (x[30:23] == 8'hFF) && (x[22:0] != 0);
@@ -493,7 +655,7 @@ module fp32_rsqrt_pipe (
     wire special = bad || is_inf;
     wire [31:0] seed = 32'h5F3759DF - (x >> 1);
 
-    // ---- xhalf = fp32_mul(0.5, x)   (LAT 2) ----
+    // ---- xhalf = fp32_mul(0.5, x)   (LAT ML) ----
     wire        xh_v;
     wire [31:0] xhalf;
     fp32_mul_pipe u_xhalf (
@@ -501,27 +663,31 @@ module fp32_rsqrt_pipe (
         .a(HALF), .b(x), .valid_out(xh_v), .result(xhalf)
     );
 
-    // carry the seed/special/x alongside, aligned to xhalf (2 cycles).
-    reg [31:0] y0_d [0:1];
-    reg        sp_d [0:1];
-    reg [31:0] spv_d[0:1];
-    always @(posedge clk) begin
-        y0_d[0]  <= seed;        y0_d[1]  <= y0_d[0];
-        sp_d[0]  <= special;     sp_d[1]  <= sp_d[0];
-        spv_d[0] <= special_val; spv_d[1] <= spv_d[0];
+    // carry the seed/special alongside, aligned to xhalf (ML cycles).
+    reg [31:0] y0_d [0:ML-1];
+    reg        sp_d [0:ML-1];
+    reg [31:0] spv_d[0:ML-1];
+    always @(posedge clk) begin : seed_align
+        integer di;
+        y0_d[0]  <= seed;        sp_d[0]  <= special;     spv_d[0] <= special_val;
+        for (di = 1; di < ML; di = di + 1) begin
+            y0_d[di]  <= y0_d[di-1];
+            sp_d[di]  <= sp_d[di-1];
+            spv_d[di] <= spv_d[di-1];
+        end
     end
-    wire [31:0] y0     = y0_d[1];   // seed aligned with xhalf valid
-    wire        sp0    = sp_d[1];
-    wire [31:0] spv0   = spv_d[1];
+    wire [31:0] y0     = y0_d[ML-1];   // seed aligned with xhalf valid
+    wire        sp0    = sp_d[ML-1];
+    wire [31:0] spv0   = spv_d[ML-1];
 
     // =====================================================================
     // One Newton iteration as a sub-pipe-chain.  Given y_in, xhalf_in:
-    //   yy  = y*y                (mul, LAT2)
-    //   xyy = xhalf*yy           (mul, LAT2)
-    //   t   = 1.5 + (-xyy)       (add, LAT3)
-    //   y   = y*t                (mul, LAT2)
-    // y_in must be delayed to the final mul; xhalf_in delayed to the 2nd mul.
-    // We hand-instantiate twice rather than generate, for clarity.
+    //   yy  = y*y                (mul, ML)
+    //   xyy = xhalf*yy           (mul, ML)
+    //   t   = 1.5 + (-xyy)       (add, AL)
+    //   y   = y*t                (mul, ML)
+    // y_in delayed to the final mul (2*ML + AL); xhalf_in delayed to the 2nd
+    // mul (ML).  We hand-instantiate twice rather than generate, for clarity.
     // =====================================================================
 
     // ---------- ITER 0 ----------
@@ -529,45 +695,43 @@ module fp32_rsqrt_pipe (
     wire        yy0_v;  wire [31:0] yy0;
     fp32_mul_pipe u_yy0 (.clk(clk), .rst(rst), .valid_in(xh_v),
         .a(y0), .b(y0), .valid_out(yy0_v), .result(yy0));
-    // delay xhalf and y0 by 2 (mul lat) to align with yy0
-    reg [31:0] xhalf_d0a, xhalf_d0b, y0_da, y0_db;
-    always @(posedge clk) begin
-        xhalf_d0a <= xhalf;    xhalf_d0b <= xhalf_d0a;
-        y0_da     <= y0;       y0_db     <= y0_da;
+    // delay xhalf by ML (align with yy0) to feed the xyy mul.
+    reg [31:0] xhalf_d [0:ML-1];
+    always @(posedge clk) begin : xhalf_align0
+        integer di;
+        xhalf_d[0] <= xhalf;
+        for (di = 1; di < ML; di = di + 1) xhalf_d[di] <= xhalf_d[di-1];
+    end
+    // delay y0 by (2*ML + AL) to align with t0 at the final mul.
+    localparam integer YDLY = 2*ML + AL;
+    reg [31:0] y0_dl [0:YDLY-1];
+    always @(posedge clk) begin : y0_align
+        integer di;
+        y0_dl[0] <= y0;
+        for (di = 1; di < YDLY; di = di + 1) y0_dl[di] <= y0_dl[di-1];
     end
     // xyy = xhalf * yy0
     wire        xyy0_v; wire [31:0] xyy0;
     fp32_mul_pipe u_xyy0 (.clk(clk), .rst(rst), .valid_in(yy0_v),
-        .a(xhalf_d0b), .b(yy0), .valid_out(xyy0_v), .result(xyy0));
-    // delay y0 across the 2nd mul (2 more) -> total 4 so far
-    reg [31:0] y0_dc, y0_dd;
-    always @(posedge clk) begin
-        y0_dc <= y0_db;  y0_dd <= y0_dc;
-    end
+        .a(xhalf_d[ML-1]), .b(yy0), .valid_out(xyy0_v), .result(xyy0));
     // t = 1.5 + (-xyy0)   (negate xyy0 by flipping sign bit, a 0-cost bit op)
     wire [31:0] neg_xyy0 = {~xyy0[31], xyy0[30:0]};
     wire        t0_v;   wire [31:0] t0;
     fp32_add_pipe u_t0 (.clk(clk), .rst(rst), .valid_in(xyy0_v),
         .a(THREE_HALF), .b(neg_xyy0), .valid_out(t0_v), .result(t0));
-    // delay y0 across the add (3) -> need y0 aligned with t0
-    reg [31:0] y0_de, y0_df, y0_dg;
-    always @(posedge clk) begin
-        y0_de <= y0_dd;  y0_df <= y0_de;  y0_dg <= y0_df;
-    end
     // y1 = y0 * t0
     wire        y1_v;   wire [31:0] y1;
     fp32_mul_pipe u_y1 (.clk(clk), .rst(rst), .valid_in(t0_v),
-        .a(y0_dg), .b(t0), .valid_out(y1_v), .result(y1));
+        .a(y0_dl[YDLY-1]), .b(t0), .valid_out(y1_v), .result(y1));
 
-    // carry xhalf, special alongside to iter 1.  Total iter-0 chain latency:
-    //   yy(2) + xyy(2) + t(3) + ymul(2) = 9 cycles from xh_v.
-    // xhalf needs delaying 9 cycles to feed iter1's xyy; special/specialval too.
-    localparam ITER_LAT = 9;
+    // carry xhalf, special alongside to iter 1.  Total iter-0 chain latency =
+    // ITER_LAT cycles from xh_v.  xhalf needs delaying ITER_LAT to feed iter1's
+    // xyy; special/specialval too.
     reg [31:0] xhalf_chain [0:ITER_LAT-1];
     reg        sp_chain    [0:ITER_LAT-1];
     reg [31:0] spv_chain   [0:ITER_LAT-1];
-    integer k;
-    always @(posedge clk) begin
+    always @(posedge clk) begin : iter0_carry
+        integer k;
         xhalf_chain[0] <= xhalf;
         sp_chain[0]    <= sp0;
         spv_chain[0]   <= spv0;
@@ -586,34 +750,31 @@ module fp32_rsqrt_pipe (
     wire        yy1_v;  wire [31:0] yy1;
     fp32_mul_pipe u_yy1 (.clk(clk), .rst(rst), .valid_in(y1_v),
         .a(y1), .b(y1), .valid_out(yy1_v), .result(yy1));
-    reg [31:0] xhalf1_da, xhalf1_db, y1_da, y1_db;
-    always @(posedge clk) begin
-        xhalf1_da <= xhalf1;   xhalf1_db <= xhalf1_da;
-        y1_da     <= y1;       y1_db     <= y1_da;
+    reg [31:0] xhalf1_d [0:ML-1];
+    reg [31:0] y1_dl    [0:YDLY-1];
+    always @(posedge clk) begin : iter1_align
+        integer di;
+        xhalf1_d[0] <= xhalf1;
+        for (di = 1; di < ML; di = di + 1) xhalf1_d[di] <= xhalf1_d[di-1];
+        y1_dl[0] <= y1;
+        for (di = 1; di < YDLY; di = di + 1) y1_dl[di] <= y1_dl[di-1];
     end
     wire        xyy1_v; wire [31:0] xyy1;
     fp32_mul_pipe u_xyy1 (.clk(clk), .rst(rst), .valid_in(yy1_v),
-        .a(xhalf1_db), .b(yy1), .valid_out(xyy1_v), .result(xyy1));
-    reg [31:0] y1_dc, y1_dd;
-    always @(posedge clk) begin
-        y1_dc <= y1_db;  y1_dd <= y1_dc;
-    end
+        .a(xhalf1_d[ML-1]), .b(yy1), .valid_out(xyy1_v), .result(xyy1));
     wire [31:0] neg_xyy1 = {~xyy1[31], xyy1[30:0]};
     wire        t1_v;   wire [31:0] t1;
     fp32_add_pipe u_t1 (.clk(clk), .rst(rst), .valid_in(xyy1_v),
         .a(THREE_HALF), .b(neg_xyy1), .valid_out(t1_v), .result(t1));
-    reg [31:0] y1_de, y1_df, y1_dg;
-    always @(posedge clk) begin
-        y1_de <= y1_dd;  y1_df <= y1_de;  y1_dg <= y1_df;
-    end
     wire        y2_v;   wire [31:0] y2;
     fp32_mul_pipe u_y2 (.clk(clk), .rst(rst), .valid_in(t1_v),
-        .a(y1_dg), .b(t1), .valid_out(y2_v), .result(y2));
+        .a(y1_dl[YDLY-1]), .b(t1), .valid_out(y2_v), .result(y2));
 
-    // carry special/specialval across iter 1 (9 cycles) to the final mux.
+    // carry special/specialval across iter 1 (ITER_LAT cycles) to the final mux.
     reg [31:0] spv_chain2 [0:ITER_LAT-1];
     reg        sp_chain2  [0:ITER_LAT-1];
-    always @(posedge clk) begin
+    always @(posedge clk) begin : iter1_carry
+        integer k;
         spv_chain2[0] <= spv1;
         sp_chain2[0]  <= sp1;
         for (k = 1; k < ITER_LAT; k = k + 1) begin
@@ -627,9 +788,8 @@ module fp32_rsqrt_pipe (
     // ---------- final select ----------
     assign valid_out = y2_v;
     assign result    = sp_final ? spv_final : y2;
-    // Measured LAT = 20: xhalf mul (2) + iter0 (9) -> y1_v at 11; iter1 (9)
-    // -> y2_v at 20.  Throughput 1/cycle (every sub-pipe accepts a new op each
-    // cycle).  Bit-equivalent (0 ULP) to glm_fp.vh fp32_rsqrt.
+    // LAT = ML + 2*ITER_LAT = 7*ML + 2*AL = 24 (ML=2, AL=5).  Throughput 1/cycle
+    // (every sub-pipe accepts a new op each cycle).  0 ULP vs glm_fp.vh fp32_rsqrt.
 endmodule
 
 
@@ -767,33 +927,35 @@ endfunction
 
 
 //============================================================================
-// fp32_exp_pipe  --  pipelined fp32 exp(x) for the softmax range.
-//   LAT = 12, 1 result/cycle.  BIT-EQUIVALENT (0 ULP) to glm_exp_ref above
-//   (the same range-reduce + Horner + 2^k method, same fp32_mul/fp32_add
-//   contract arithmetic).  Accuracy vs true exp() < 2^-12 rel over x in
-//   [-87,0] (softmax domain), matching the combinational softmax_unit method.
+// fp32_exp_pipe  --  GENUINELY pipelined fp32 exp(x) for the softmax range.
+//   1 result/cycle.  BIT-EQUIVALENT (0 ULP) to glm_exp_ref above (the same
+//   range-reduce + Horner + 2^k method, same fp32_mul/fp32_add contract
+//   arithmetic).  Accuracy vs true exp() < 2^-11 rel over x in [-87,0]
+//   (softmax domain), matching the combinational softmax_unit method.
 //
-//   Datapath (each fp32 op a pipelined sub-op; integer k path is bit-ops in
-//   delay regs):
-//     S: kf = x * (1/ln2)         mul pipe
-//        ki = round(kf)            comb int (carried)
-//        kln2 = ki_as_fp * ln2     mul pipe
-//        r = x - kln2              add pipe
-//        Horner 5x (mul,add) ...   alternating mul/add pipes
-//        fold 2^k                  comb exponent add (carried ki)
-//   For obvious equivalence the body mirrors glm_exp_ref exactly, with the
-//   SAME ordering of fp32_mul/fp32_add, each as a registered sub-pipe; the
-//   integer ki and special handling ride in matched delay lines.  The smoke
-//   TB measures the true valid latency = 12 (an 11-deep retiming pipe plus the
-//   output register) and we document LAT = 12 to match.
+//   This is NOT a combinational cone + delay-line (the old, ~1.5 MHz version).
+//   Every fp32 op of glm_exp_ref is a real pipelined sub-op (fp32_mul_pipe /
+//   fp32_add_pipe), exactly like fp32_rsqrt_pipe, so the per-stage critical path
+//   is ONE fp-pipe slice.  The tiny integer-k conversions (fp32<->int10) are
+//   bit-ops evaluated combinationally at a stage boundary and ride in matched
+//   delay regs; they are NOT on the fp32 mantissa critical path.
 //
-//   NOTE: This module is implemented by registering glm_exp_ref's dataflow.
-//   To keep the file self-contained and the equivalence airtight, fp32_exp_pipe
-//   computes glm_exp_ref combinationally and then pushes it through a short
-//   register pipe of depth LAT so the *visible* timing is pipelined while the
-//   value is provably identical.  Synthesis retiming (yosys `retime` / vendor)
-//   distributes the registers back into the arithmetic, giving the per-stage
-//   depth reduction; the documented LAT and 1/cycle throughput hold regardless.
+//   Dataflow (mirrors glm_exp_ref op-for-op; ML=mul LAT, AL=add LAT):
+//     kf   = x * (1/ln2)                     mul   (ML)
+//     ki   = round_to_int(kf)                comb int (registered, carried)
+//     kln2 = int10_to_fp(ki) * ln2           mul   (ML)   [x delayed ML to here]
+//     r    = x + (-kln2)                     add   (AL)
+//     Horner, 5 (mul,add) pairs reusing r:
+//        p = C4*r ; poly = C3 + p            mul(ML),add(AL)
+//        p = poly*r ; poly = C2 + p          mul(ML),add(AL)
+//        p = poly*r ; poly = C1 + p          mul(ML),add(AL)
+//        p = poly*r ; poly = 1.0 + p         mul(ML),add(AL)
+//        p = poly*r ; poly = 1.0 + p         mul(ML),add(AL)   <- full poly
+//     fold 2^k : add ki to poly's biased exponent (comb, FTZ).   output reg.
+//
+//   LAT (structural flop count valid_in->valid_out) =
+//        ML (kf) + ML (kln2) + AL (r) + 5*(ML+AL) (Horner) + 1 (fold/output reg)
+//      = 7*ML + 6*AL + 1.   With ML=2, AL=5 -> 14 + 30 + 1 = 45.
 //============================================================================
 module fp32_exp_pipe (
     input              clk,
@@ -804,31 +966,163 @@ module fp32_exp_pipe (
     output reg [31:0]  result
 );
     `include "glm_fp.vh"
-    localparam LAT = 11;
 
-    // combinational reference value (single source of truth)
-    wire [31:0] exp_comb = glm_exp_ref(x);
+    localparam integer ML = `FP_MUL_LAT;   // mul latency (2)
+    localparam integer AL = `FP_ADD_LAT;   // add latency (5)
+    /* verilator lint_off UNUSEDPARAM */
+    // structural flop count valid_in -> valid_out (exposed for consumers)
+    localparam integer LAT = `FP_EXP_LAT;  // = 7*ML + 6*AL + 2 = 46
+    /* verilator lint_on UNUSEDPARAM */
 
-    // retiming-friendly register pipe of depth LAT.  Each stage is a flop;
-    // yosys/vendor retiming pushes the exp_comb logic across these flops to
-    // balance per-stage depth.  Value is unchanged (0 ULP vs glm_exp_ref).
-    reg [31:0] d [0:LAT-1];
-    reg        v [0:LAT-1];
-    integer i;
-    always @(posedge clk) begin
-        if (rst) begin
-            for (i = 0; i < LAT; i = i + 1) v[i] <= 1'b0;
-        end else begin
-            d[0] <= exp_comb;
-            v[0] <= valid_in;
-            for (i = 1; i < LAT; i = i + 1) begin
-                d[i] <= d[i-1];
-                v[i] <= v[i-1];
-            end
-        end
+    localparam [31:0] LN2     = 32'h3F317218;   // 0.6931472
+    localparam [31:0] INV_LN2 = 32'h3FB8AA3B;   // 1.4426950
+    localparam [31:0] C1      = 32'h3F000000;   // 1/2
+    localparam [31:0] C2      = 32'h3E2AAAAB;   // 1/6
+    localparam [31:0] C3      = 32'h3D2AAAAB;   // 1/24
+    localparam [31:0] C4      = 32'h3C088889;   // 1/120
+    localparam [31:0] ONE     = 32'h3F800000;   // 1.0
+
+    // ===================== kf = x * (1/ln2)  (mul, ML) =====================
+    wire        kf_v;  wire [31:0] kf;
+    fp32_mul_pipe u_kf (.clk(clk), .rst(rst), .valid_in(valid_in),
+        .a(x), .b(INV_LN2), .valid_out(kf_v), .result(kf));
+
+    // ki = round(kf) -> as fp32, computed combinationally on kf, registered.
+    // We carry BOTH the integer ki (for the final 2^k fold) and its fp32 image
+    // (the multiplicand for kln2).  These are bit-ops, off the fp critical path.
+    wire signed [9:0] ki_now   = fp32_to_int10_rne(kf);
+    wire       [31:0] kifp_now = int10_to_fp32(ki_now);
+
+    // x is needed at the 'r' add, which is fed by kln2_v.  kln2's result is valid
+    // ML (kf) + 1 (the ki/kifp register stage) + ML (kln2 mul) = 2*ML+1 cycles
+    // after valid_in, so x must be delayed by the same amount to meet it.
+    localparam integer XDLY = 2*ML + 1;
+    reg [31:0] x_dl [0:XDLY-1];
+    always @(posedge clk) begin : x_align
+        integer di;
+        x_dl[0] <= x;
+        for (di = 1; di < XDLY; di = di + 1) x_dl[di] <= x_dl[di-1];
     end
+
+    // register ki (signed 10b) and its fp image at the kf boundary; carry ki the
+    // whole way to the fold.  kifp feeds the kln2 mul one cycle later.
+    reg signed [9:0] ki_r;
+    reg       [31:0] kifp_r;
+    reg              kf_v_r;
     always @(posedge clk) begin
-        valid_out <= v[LAT-1];   // one extra flop for the output register
-        result    <= d[LAT-1];
+        ki_r   <= ki_now;
+        kifp_r <= kifp_now;
+        kf_v_r <= kf_v;
+    end
+
+    // ===================== kln2 = kifp * ln2  (mul, ML) =====================
+    wire        kln2_v;  wire [31:0] kln2;
+    fp32_mul_pipe u_kln2 (.clk(clk), .rst(rst), .valid_in(kf_v_r),
+        .a(kifp_r), .b(LN2), .valid_out(kln2_v), .result(kln2));
+
+    // x aligned to the kln2 result is x_dl[XDLY-1] (delayed 2*ML).
+    wire [31:0] neg_kln2 = {~kln2[31], kln2[30:0]};
+
+    // ===================== r = x + (-kln2)  (add, AL) ======================
+    wire        r_v;  wire [31:0] r;
+    fp32_add_pipe u_r (.clk(clk), .rst(rst), .valid_in(kln2_v),
+        .a(x_dl[XDLY-1]), .b(neg_kln2), .valid_out(r_v), .result(r));
+
+    // carry ki from the kf boundary all the way to the fold.  ki was registered
+    // at the kf boundary (1 cycle after valid_in's kf consumption); from there
+    // to the fold is: (kln2 mul ML) + (r add AL) + 5*(ML+AL) Horner.  We just
+    // push ki through a delay line of that length alongside the fp datapath.
+    // ki was registered 1 cycle (the kf boundary register); from there to the
+    // poly-ready edge is KI_TAIL = (kln2 mul ML) + (r add AL) + 5*(ML+AL) Horner.
+    localparam integer KI_TAIL = ML + AL + 5*(ML+AL); // kf-bndry -> poly ready
+    reg signed [9:0] ki_chain [0:KI_TAIL-1];
+    always @(posedge clk) begin : ki_carry
+        integer di;
+        ki_chain[0] <= ki_r;
+        for (di = 1; di < KI_TAIL; di = di + 1) ki_chain[di] <= ki_chain[di-1];
+    end
+    wire signed [9:0] ki_fold = ki_chain[KI_TAIL-1];
+
+    // ===================== Horner: 5 (mul, add) pairs ======================
+    // Each pair:  p = poly_in * r_aligned ;  poly_out = const + p
+    // r must be delayed to align with each successive poly_in.  We keep a single
+    // r delay line and tap it at multiples of (ML+AL): the first mul consumes r
+    // at r_v; each subsequent mul consumes r delayed by an extra (ML+AL).
+    localparam integer STEP   = ML + AL;        // latency of one (mul,add) pair
+    localparam integer RDEPTH = 5*STEP;         // r must survive 5 pairs
+    reg [31:0] r_dl [0:RDEPTH-1];
+    always @(posedge clk) begin : r_align
+        integer di;
+        r_dl[0] <= r;
+        for (di = 1; di < RDEPTH; di = di + 1) r_dl[di] <= r_dl[di-1];
+    end
+    // r tap for Horner step s (s=0..4): aligned to that step's mul input.
+    //   step 0 mul consumes r at r_v            -> use r directly
+    //   step s mul consumes r delayed s*STEP    -> r_dl[s*STEP-1]
+    function automatic [31:0] r_tap(input integer s);
+        r_tap = (s == 0) ? r : r_dl[s*STEP-1];
+    endfunction
+
+    // ---- step 0 : p0 = C4 * r ; poly0 = C3 + p0 ----
+    wire        p0_v;  wire [31:0] p0;
+    fp32_mul_pipe u_m0 (.clk(clk), .rst(rst), .valid_in(r_v),
+        .a(C4), .b(r_tap(0)), .valid_out(p0_v), .result(p0));
+    wire        poly0_v;  wire [31:0] poly0;
+    fp32_add_pipe u_a0 (.clk(clk), .rst(rst), .valid_in(p0_v),
+        .a(C3), .b(p0), .valid_out(poly0_v), .result(poly0));
+
+    // ---- step 1 : p1 = poly0 * r ; poly1 = C2 + p1 ----
+    wire        p1_v;  wire [31:0] p1;
+    fp32_mul_pipe u_m1 (.clk(clk), .rst(rst), .valid_in(poly0_v),
+        .a(poly0), .b(r_tap(1)), .valid_out(p1_v), .result(p1));
+    wire        poly1_v;  wire [31:0] poly1;
+    fp32_add_pipe u_a1 (.clk(clk), .rst(rst), .valid_in(p1_v),
+        .a(C2), .b(p1), .valid_out(poly1_v), .result(poly1));
+
+    // ---- step 2 : p2 = poly1 * r ; poly2 = C1 + p2 ----
+    wire        p2_v;  wire [31:0] p2;
+    fp32_mul_pipe u_m2 (.clk(clk), .rst(rst), .valid_in(poly1_v),
+        .a(poly1), .b(r_tap(2)), .valid_out(p2_v), .result(p2));
+    wire        poly2_v;  wire [31:0] poly2;
+    fp32_add_pipe u_a2 (.clk(clk), .rst(rst), .valid_in(p2_v),
+        .a(C1), .b(p2), .valid_out(poly2_v), .result(poly2));
+
+    // ---- step 3 : p3 = poly2 * r ; poly3 = 1.0 + p3 ----
+    wire        p3_v;  wire [31:0] p3;
+    fp32_mul_pipe u_m3 (.clk(clk), .rst(rst), .valid_in(poly2_v),
+        .a(poly2), .b(r_tap(3)), .valid_out(p3_v), .result(p3));
+    wire        poly3_v;  wire [31:0] poly3;
+    fp32_add_pipe u_a3 (.clk(clk), .rst(rst), .valid_in(p3_v),
+        .a(ONE), .b(p3), .valid_out(poly3_v), .result(poly3));
+
+    // ---- step 4 : p4 = poly3 * r ; poly4 = 1.0 + p4  (full poly) ----
+    wire        p4_v;  wire [31:0] p4;
+    fp32_mul_pipe u_m4 (.clk(clk), .rst(rst), .valid_in(poly3_v),
+        .a(poly3), .b(r_tap(4)), .valid_out(p4_v), .result(p4));
+    wire        poly_v;  wire [31:0] poly;
+    fp32_add_pipe u_a4 (.clk(clk), .rst(rst), .valid_in(p4_v),
+        .a(ONE), .b(p4), .valid_out(poly_v), .result(poly));
+
+    // ===================== fold 2^k + output register ======================
+    // add ki to poly's biased exponent (FTZ on under/overflow), exactly as
+    // glm_exp_ref.  This is the final stage; result is registered out.
+    always @(posedge clk) begin
+        reg [7:0]         e;
+        reg signed [9:0]  new_e;          // matches glm_exp_ref's width exactly
+        if (rst) begin
+            valid_out <= 1'b0;
+        end else begin
+            valid_out <= poly_v;
+            e     = poly[30:23];
+            new_e = $signed({2'b0, e}) + ki_fold;          // 10-bit, as glm_exp_ref
+            if (e == 8'h00)
+                result <= 32'b0;                           // poly already FTZ
+            else if (new_e >= 10'sd255)
+                result <= {poly[31], 8'hFF, 23'b0};        // overflow -> inf
+            else if (new_e <= 10'sd0)
+                result <= 32'b0;                           // underflow -> FTZ
+            else
+                result <= {poly[31], new_e[7:0], poly[22:0]};
+        end
     end
 endmodule

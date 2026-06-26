@@ -120,8 +120,8 @@ module glm_matmul_pipe_tb;
     localparam integer NMAX = 5;
     localparam integer KMAX = 256;       // DUT counter width
 
-    localparam integer L        = 5;     // fp32_mac_pipe latency (DUT crux)
-    localparam integer TREE_LAT = 9;     // 3 levels * fp32_add_pipe LAT(3)
+    localparam integer L        = 7;     // fp32_mac_pipe latency (DUT crux, = mul+add)
+    localparam integer TREE_LAT = 15;    // 3 levels * fp32_add_pipe LAT(5)
 
     // ---- tolerances ----
     localparam real TINY    = 1.0e-9;

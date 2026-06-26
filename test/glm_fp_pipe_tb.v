@@ -75,12 +75,12 @@ module glm_fp_pipe_tb;
     //   per-result scoreboard below verifies this alignment for every result.
     // ------------------------------------------------------------------------
     localparam LAT_MUL   = 1;   // structural flop count 2
-    localparam LAT_ADD   = 2;   // structural flop count 3
-    localparam LAT_MAC   = 4;   // structural flop count 5
-    localparam LAT_RSQRT = 19;  // structural flop count 20
-    localparam LAT_EXP   = 11;  // structural flop count 12
+    localparam LAT_ADD   = 4;   // structural flop count 5  (deepened add)
+    localparam LAT_MAC   = 6;   // structural flop count 7  (= mul 2 + add 5)
+    localparam LAT_RSQRT = 23;  // structural flop count 24 (= 7*mul + 2*add)
+    localparam LAT_EXP   = 45;  // structural flop count 46 (= 7*mul + 6*add + 2)
 
-    localparam integer MAXLAT = 19;     // deepest pipe (rsqrt), observable
+    localparam integer MAXLAT = 45;     // deepest pipe (exp), observable
 
     // ========================================================================
     // INDEPENDENT exp reference.  Written HERE (outside glm_fp_pipe.v) from the
@@ -524,7 +524,7 @@ module glm_fp_pipe_tb;
         end
     endtask
 
-    integer phase, i;
+    integer i;
     real    xr;
 
     initial begin

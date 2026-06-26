@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `include "glm_fp.vh"
+`include "glm_fp_pipe_lat.vh"   // FP pipeline latencies (single source of truth)
 /* verilator lint_off DECLFILENAME */
 //============================================================================
 // glm_matmul_pipe.v  --  GLM-5.2 BF16xBF16 -> FP32-accumulate -> BF16 GEMM,
@@ -120,9 +121,14 @@ module glm_matmul_pipe #(
 );
     `include "glm_fp.vh"
 
-    localparam integer L = 5;                 // fp32_mac_pipe latency
-    // adder-tree to reduce L=5 partial sums: ceil(log2 5)=3 levels of add(LAT3)
-    localparam integer TREE_LAT = 3 * 3;      // 3 levels * fp32_add_pipe LAT(3)
+    // Pipeline latencies are READ from glm_fp_pipe.v's single-source-of-truth
+    // macros (FP_MAC_LAT / FP_ADD_LAT), so deepening the FP adder ripples into
+    // the L-way interleave depth and the reduction-tree drain automatically --
+    // no hardcoded magic number to forget.
+    localparam integer L = `FP_MAC_LAT;       // fp32_mac_pipe latency (now 7)
+    // adder-tree to reduce L partial sums: ceil(log2 L) levels of fp32_add_pipe.
+    // L=7 -> ceil(log2 7)=3 levels, each fp32_add_pipe latency FP_ADD_LAT.
+    localparam integer TREE_LAT = 3 * `FP_ADD_LAT; // 3 levels * add LAT (now 15)
 
     // ----------------------------------------------------------------------
     // Control: lane counter (k mod L), K-beat counter, drain countdown.
@@ -217,30 +223,37 @@ module glm_matmul_pipe #(
         end
 
         // -------- final reduction: pipelined add-tree over ps[0..L-1] --------
-        // L=5: (ps0+ps1), (ps2+ps3), (ps4+0) -> level1; then pair those -> lvl2;
-        // then final -> lvl3.  Trigger the tree once per tile (red_go pulse).
-        // Every adder has the SAME fixed LAT and is launched in lockstep, so one
-        // representative valid per level gates the next level; the sibling
-        // valid_out bits are functionally redundant (localized lint waiver, in
-        // the same spirit as glm_fp_pipe.v's documented waivers).  The single
-        // output-latch cycle is gated by the FSM's deterministic drain_cnt.
+        // L=7 partial sums summed in ceil(log2 7)=3 levels of fp32_add_pipe:
+        //   level1 (4 adders): (ps0+ps1),(ps2+ps3),(ps4+ps5),(ps6+0)
+        //   level2 (2 adders): (a01+a23),(a45+a6)
+        //   level3 (1 adder) : (b0+b1) = full dot product
+        // Trigger the tree once per tile (red_go pulse).  Every adder has the
+        // SAME fixed LAT and is launched in lockstep, so one representative valid
+        // per level gates the next level; the sibling valid_out bits are
+        // functionally redundant (localized lint waiver, in the same spirit as
+        // glm_fp_pipe.v's documented waivers).  The single output-latch cycle is
+        // gated by the FSM's deterministic drain_cnt.  The fp32-add grouping here
+        // is part of the defined numerics; the TB golden tolerates the tree order.
         /* verilator lint_off UNUSEDSIGNAL */
-        wire        a01_v, a23_v, a4_v;
-        wire [31:0] a01_y, a23_y, a4_y;
+        // --- level 1 : 4 adders summing the 7 partial sums (+0 pad) ---
+        wire        a01_v, a23_v, a45_v, a6_v;
+        wire [31:0] a01_y, a23_y, a45_y, a6_y;
         fp32_add_pipe u_a01 (.clk(clk), .rst(rst), .valid_in(red_go),
             .a(ps[0]), .b(ps[1]), .valid_out(a01_v), .result(a01_y));
         fp32_add_pipe u_a23 (.clk(clk), .rst(rst), .valid_in(red_go),
             .a(ps[2]), .b(ps[3]), .valid_out(a23_v), .result(a23_y));
-        fp32_add_pipe u_a4  (.clk(clk), .rst(rst), .valid_in(red_go),
-            .a(ps[4]), .b(32'h0), .valid_out(a4_v), .result(a4_y));
-        // Level 1 -> 2 : (a01 + a23), (a4 + 0)
+        fp32_add_pipe u_a45 (.clk(clk), .rst(rst), .valid_in(red_go),
+            .a(ps[4]), .b(ps[5]), .valid_out(a45_v), .result(a45_y));
+        fp32_add_pipe u_a6  (.clk(clk), .rst(rst), .valid_in(red_go),
+            .a(ps[6]), .b(32'h0), .valid_out(a6_v), .result(a6_y));
+        // --- level 2 : (a01 + a23), (a45 + a6) ---
         wire        b0_v, b1_v;
         wire [31:0] b0_y, b1_y;
         fp32_add_pipe u_b0 (.clk(clk), .rst(rst), .valid_in(a01_v),
             .a(a01_y), .b(a23_y), .valid_out(b0_v), .result(b0_y));
-        fp32_add_pipe u_b1 (.clk(clk), .rst(rst), .valid_in(a4_v),
-            .a(a4_y), .b(32'h0), .valid_out(b1_v), .result(b1_y));
-        // Level 2 -> 3 : (b0 + b1) = full dot product
+        fp32_add_pipe u_b1 (.clk(clk), .rst(rst), .valid_in(a45_v),
+            .a(a45_y), .b(a6_y), .valid_out(b1_v), .result(b1_y));
+        // --- level 3 : (b0 + b1) = full dot product ---
         wire        csum_v;
         wire [31:0] csum_y;
         fp32_add_pipe u_c0 (.clk(clk), .rst(rst), .valid_in(b0_v),
