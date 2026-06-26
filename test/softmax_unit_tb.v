@@ -40,7 +40,8 @@
 //   D8 two-way tie for max       -> argmax = lowest tied index
 //   D9 saturation extremes (max/min Q7.8) one-hot
 //   R  >=200 constrained-random logit vectors (seeded $random)
-//   Every case also asserts: done pulse at exactly 22 cycles, busy high across
+//   Every case also asserts: done pulse at exactly LAT cycles (now 71 with the
+//   multi-cycle sequential reciprocal divider; was 23), busy high across
 //   the run and low at done, SUM p ~ 1.0, and argmax exact.
 //
 // GATES: prints "ALL <N> TESTS PASSED"; $fatal on any mismatch.
@@ -107,10 +108,16 @@ module softmax_unit_tb;
 
     // Committed DUT latency, measured as the number of posedges from (and
     // INCLUDING) the start edge up to and including the edge where `done` is
-    // first high.  The pipeline is S_RD0,S_RD1,S_MAX,S_EXP(x8),S_RECIP,
-    // S_NORM(x8),S_WR1,S_DONE = 22 cycles AFTER the start edge; counting the
-    // start edge inclusively gives 23.
-    localparam integer LAT = 23;
+    // first high.  The reciprocal is now a MULTI-CYCLE radix-2 sequential
+    // divider (DIV_CYCLES = DIV_W = 48 cycles), so the single-cycle S_RECIP
+    // grew to S_RECIP(1 operand-latch) + S_DIV(48).  Pipeline is now
+    // S_RD0,S_RD1,S_MAX,S_EXP(x8),S_RECIP,S_DIV(x48),S_NORM(x8),S_WR1,S_DONE.
+    // Closed form (LEN=8, NLINES=2): LAT = 5 + NLINES + 2*LEN + DIV_CYCLES
+    //   = 53 + NLINES + 2*LEN = 53 + 2 + 16 = 71  (was 23; the probabilities,
+    // argmax and sat are BIT-IDENTICAL -- only the cycle latency grew by 48).
+    localparam integer DIV_CYCLES = 48;          // softmax_unit DIV_W = 48
+    localparam integer NLINES_TB  = 2;           // ceil(8/4) for LEN=8
+    localparam integer LAT = 5 + NLINES_TB + 2*`SM_LEN + DIV_CYCLES;  // = 71
 
     // 10ns clock.
     initial clk = 1'b0;

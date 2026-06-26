@@ -21,9 +21,9 @@
 //       logits (LEN=SEQ, NO padding -- the committed softmax_unit is reused
 //       unchanged at LEN=2), so the score row spans NSCR_X=ceil(2/4)=1 X-line.
 //       The committed start->done latency for SEQ=2 is, from the LEN=SEQ closed
-//       form, LAT = (3*SEQ+1) + SEQ*(SM_LAT+1+3) + 2 with SM_LAT=5+ceil(2/4)+2*2
-//       = 10, i.e. 7 + 2*14 + 2 = 37 cycles, checked EXACTLY (it differs from the
-//       default 87, so a fixed latency would fail).
+//       form, LAT = (3*SEQ+1) + SEQ*(SM_LAT+1+3) + 2 with SM_LAT=53+ceil(2/4)+2*2
+//       = 58, i.e. 7 + 2*62 + 2 = 133 cycles, checked EXACTLY (it differs from the
+//       default 279, so a fixed latency would fail).
 //   This sits strictly inside the architectural envelope (D=2 <= LINE_LANES=4;
 //   SEQ=2 <= SM_LEN=8).
 //
@@ -52,7 +52,7 @@
 //   D8 convexity/saturation  -> all V = +max, uniform weights -> O == +max, sat 0
 //   D9 base-offset independence (passthrough at non-default bases)
 //   R  >=150 constrained-random Q/K/V within the accurate regime; per-element
-//      tolerance, latency EXACT (63), sat==gsat every vector.
+//      tolerance, latency EXACT (133), sat==gsat every vector.
 //
 // GATE: prints "ALL <N> TESTS PASSED"; $fatal on ANY mismatch.
 //============================================================================
@@ -62,11 +62,13 @@ module attention_param_tb;
     localparam integer S    = 2;          // SEQ
     localparam integer D    = 2;          // D_MODEL
     // Committed start->done latency for SEQ=2, from the LEN=SEQ softmax closed
-    // form (see the DUT header LATENCY note): SETUP=3*SEQ+1=7, SM_LAT=5+ceil(2/4)
-    // +2*2=10, PER_ROW=SM_LAT+1+3=14, LAT=SETUP+SEQ*PER_ROW+2 = 7 + 2*14 + 2 = 37.
-    // (Was 63 under the old SM_PAD=8 padding; softmax now runs over the 2 real
-    // logits, so attention is SHORTER -- and still != the default 87.)
-    localparam integer LAT  = 37;         // committed start->done for SEQ=2
+    // form (see the DUT header LATENCY note): SETUP=3*SEQ+1=7, SM_LAT=53+ceil(2/4)
+    // +2*2=58, PER_ROW=SM_LAT+1+3=62, LAT=SETUP+SEQ*PER_ROW+2 = 7 + 2*62 + 2 = 133.
+    // (Was 37 before the softmax reciprocal divide was PIPELINED into a multi-cycle
+    // sequential divider: that added DIV_CYCLES=48 per softmax invocation, and
+    // attention reuses the softmax once per output row, so LAT grew by SEQ*48 = 96.
+    // The values are UNCHANGED -- only the latency grew -- and 133 != the default 279.)
+    localparam integer LAT  = 133;        // committed start->done for SEQ=2
     localparam integer ATOL = 2;          // per-element Q7.8 tolerance (LSB)
     localparam integer NRAND = 180;       // constrained-random vectors
 

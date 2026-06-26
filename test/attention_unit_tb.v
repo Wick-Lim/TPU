@@ -47,7 +47,7 @@
 //   CONSTRAINED RANDOM block for why the 512 cap is principled (a larger logit
 //   makes a peaked softmax sensitive to 1/256 Q7.8-logit quantization -- an
 //   inherent low-precision-attention property, exercised separately/unambiguously
-//   by directed D7/D8).  done/busy LATENCY is checked EXACTLY (87 cycles).  The
+//   by directed D7/D8).  done/busy LATENCY is checked EXACTLY (279 cycles).  The
 //   `sat` flag is checked EXACTLY against the golden's boundary flag `gsat`:
 //   because the context is a CONVEX combination of the value vectors, it provably
 //   never clamps for in-range V, so both must read 0 on every vector.
@@ -85,11 +85,14 @@ module attention_unit_tb;
     localparam integer S    = `SEQ_LEN;   // 4
     localparam integer D    = `D_MODEL;   // 4
     // Committed start->done latency, from the LEN=SEQ softmax closed form (see the
-    // DUT header LATENCY note): with SETUP=3*SEQ+1, SM_LAT=5+ceil(SEQ/4)+2*SEQ,
+    // DUT header LATENCY note): with SETUP=3*SEQ+1, SM_LAT=53+ceil(SEQ/4)+2*SEQ,
     // PER_ROW=SM_LAT+1 /*WT*/ +3, LAT=SETUP+SEQ*PER_ROW+2.  At SEQ=4 (NSCR_X=1,
-    // SM_LAT=14): 13 + 4*18 + 2 = 87.  (Was 123 under the old SM_PAD=8 padding;
-    // the softmax now runs over the 4 real logits, so attention is SHORTER.)
-    localparam integer LAT  = 87;         // committed start->done (see DUT header)
+    // SM_LAT=62): 13 + 4*66 + 2 = 279.  (Was 87 before the softmax reciprocal
+    // divide was PIPELINED into a multi-cycle sequential divider: that added
+    // DIV_CYCLES=48 per softmax invocation, and attention reuses the softmax once
+    // per output row, so LAT grew by SEQ*48 = 192.  The context/sat/argmax values
+    // are UNCHANGED -- only this cycle-accurate latency grew.)
+    localparam integer LAT  = 279;        // committed start->done (see DUT header)
     localparam integer ATOL = 2;          // per-element Q7.8 tolerance (LSB)
     localparam integer NRAND = 230;       // constrained-random vectors
 

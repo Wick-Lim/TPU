@@ -61,9 +61,10 @@
 //   Because there is no `Q78_MIN sentinel, the old pad-collision corner (all SEQ
 //   real logits saturating to the Q7.8 floor and colliding with the pad value ->
 //   uniform 1/SM_PAD weights -> SEQ/SM_PAD magnitude loss) is IMPOSSIBLE BY
-//   CONSTRUCTION.  Running over SEQ lanes instead of the old 8-lane padded vector
-//   also makes the softmax -- and hence attention -- STRICTLY SHORTER (see the
-//   LATENCY note): LAT_TOTAL drops from the old 123 to 87 at the default SEQ=4.
+//   CONSTRUCTION.  (Latency note: the softmax reciprocal divide was later
+//   PIPELINED into a multi-cycle sequential divider (+DIV_CYCLES=48 per softmax
+//   invocation), so LAT_TOTAL is now 279 at the default SEQ=4 -- see the LATENCY
+//   note; the probabilities/context are UNCHANGED, only the latency grew.)
 //
 // Q-FORMATS  (single source of truth: tpu_defs.vh, SPEC §1.3)
 //   Q, K, V elements   : Q7.8   signed 16-bit (low 16 bits of a 32-bit TM lane).
@@ -146,9 +147,11 @@
 //   committed start->done latency of THIS RTL is `LAT_TOTAL` cycles (a
 //   localparam, derived below from SEQ and the softmax submodule's own closed
 //   form at LEN=SEQ); the TB asserts it bit-exactly.  At the default SEQ=4
-//   (LEN=SEQ=4, NSCR_X=1, softmax LAT 14) LAT_TOTAL = 87.  Running softmax over
-//   the SEQ real logits (instead of the old 8-lane padded vector) makes this
-//   STRICTLY SHORTER than the previous padded figure of 123.
+//   (LEN=SEQ=4, NSCR_X=1, softmax LAT 62) LAT_TOTAL = 279.  The softmax's
+//   reciprocal divide was PIPELINED into a multi-cycle sequential divider
+//   (+DIV_CYCLES=48 per softmax invocation); attention reuses the softmax once
+//   per output row, so LAT_TOTAL grew by SEQ*48 (87 -> 279 at SEQ=4).  The
+//   probabilities/context/argmax/sat are UNCHANGED -- only the latency grew.
 //
 // SYNTHESIZABILITY
 //   Synchronous reset on ALL state; every reg assigned on every path of the one
@@ -238,26 +241,31 @@ module attention_unit #(
     // high `LAT_TOTAL` cycles later.  Breakdown:
     //   SETUP   = ST_RDQ(SEQ) + ST_RDK(SEQ) + ST_RDV(SEQ) + ST_SCORE(1)
     //   SM_LAT  = the softmax submodule's committed closed form for SM_LEN_=SEQ
-    //             lanes (NO padding):  5 + ceil(SEQ/4) + 2*SEQ
-    //               (== 14 for SEQ=4 / NSCR_X=1;  == 10 for SEQ=2).
+    //             lanes (NO padding).  The softmax reciprocal divide was
+    //             PIPELINED into a multi-cycle radix-2 restoring sequential
+    //             divider (DIV_CYCLES=48 added), so its closed form is now
+    //             53 + ceil(SEQ/4) + 2*SEQ  (was 5 + ceil(SEQ/4) + 2*SEQ)
+    //               (== 62 for SEQ=4 / NSCR_X=1;  == 58 for SEQ=2).
     //   SM_WT   = SM_LAT + 1 : sm_start is REGISTERED in ST_SM_GO, so the
     //             submodule samples it one cycle into ST_SM_WT and then runs its
     //             SM_LAT-cycle pipeline; +1 is the cycle sm_done is observed.
     //   PER_ROW = ST_SM_LD(1) + ST_SM_GO(1) + ST_SM_WT(SM_WT) + ST_CTX(1)
     //   TAIL    = ST_DONE entry (1) + the registered done-observed edge (1) = 2
-    // LAT_TOTAL = SETUP + SEQ*PER_ROW + TAIL.  Running softmax over the SEQ real
-    // logits (instead of the old 8-lane padded vector) makes the softmax -- and
-    // hence attention -- STRICTLY SHORTER.  At default SEQ=4 / NSCR_X=1 this is
-    // 13 + 4*18 + 2 = 87 (was 123 under the old SM_PAD=8 scheme); at SEQ=2 it is
-    // 7 + 2*14 + 2 = 37.  These are PURE DOCUMENTATION localparams (the latency
-    // is structural in the FSM, not parameter-driven in logic), so they are not
-    // referenced in logic; the lint_off records that.
+    // LAT_TOTAL = SETUP + SEQ*PER_ROW + TAIL.  attention serially REUSES the
+    // softmax once per output row, so the softmax's +DIV_CYCLES(48) per
+    // invocation adds SEQ*48 to LAT_TOTAL.  At default SEQ=4 / NSCR_X=1 this is
+    // 13 + 4*66 + 2 = 279 (was 87 before the softmax divider was pipelined; the
+    // PROBABILITIES/context/argmax/sat are UNCHANGED -- only the cycle-accurate
+    // latency grew); at SEQ=2 it is 7 + 2*62 + 2 = 133 (was 37).  These are PURE
+    // DOCUMENTATION localparams (the latency is structural in the FSM, not
+    // parameter-driven in logic), so they are not referenced in logic; the
+    // lint_off records that.
     /* verilator lint_off UNUSEDPARAM */
-    localparam integer SM_LAT    = 5 + NSCR_X + 2*SM_LEN_;            // 14 @ SEQ4
-    localparam integer SM_WT_LAT = SM_LAT + 1;                        // 15
+    localparam integer SM_LAT    = 53 + NSCR_X + 2*SM_LEN_;           // 62 @ SEQ4
+    localparam integer SM_WT_LAT = SM_LAT + 1;                        // 63
     localparam integer SETUP     = 3*SEQ + 1;                         // 13 @ SEQ4
-    localparam integer PER_ROW   = 1 /*LD*/ + 1 /*GO*/ + SM_WT_LAT /*WT*/ + 1; // 18
-    localparam integer LAT_TOTAL = SETUP + (S * PER_ROW) + 2;         // = 87 @ SEQ4
+    localparam integer PER_ROW   = 1 /*LD*/ + 1 /*GO*/ + SM_WT_LAT /*WT*/ + 1; // 66
+    localparam integer LAT_TOTAL = SETUP + (S * PER_ROW) + 2;         // = 279 @ SEQ4
     /* verilator lint_on UNUSEDPARAM */
 
     // ===================== latched operands / results ========================

@@ -15,7 +15,8 @@ The normative state of what *is* done lives in [`../README.md`](../README.md),
 
 ## 1. Pipeline the deep combinational tensor blocks
 
-**Status: NOT done. Recommended for a v3 performance pass.**
+**Status: STARTED — the #1 path (softmax reciprocal divide) is PIPELINED and
+re-measured; the remaining tensor paths use the same pattern.**
 
 The PPA characterization ([`PPA.md`](PPA.md) §3–4) measured the longest topological
 logic-cell depth (`ltp`, a structural proxy, not a routed delay) of each tensor
@@ -25,10 +26,14 @@ unit. The ranking is:
 attention_unit (2250)  >  softmax_unit (1580)  >  gemm_systolic (262)  >  conv2d_unit (95)
 ```
 
-**Real place & route now confirms this** ([`PPA.md`](PPA.md) §3.1, nextpnr-ecp5):
-`softmax_unit` routes at only **~3.4 MHz** (its single-cycle **64-bit reciprocal
-divide** is the worst path) and `gemm_systolic` at **~28 MHz** — both fail a 50 MHz
-target. So the depth proxy is borne out by measured timing.
+**Real place & route confirmed this** ([`PPA.md`](PPA.md) §3.1, nextpnr-ecp5): the
+single-cycle **64-bit reciprocal divide** in `softmax_unit` routed at only **~3.4
+MHz**. ✅ **It is now pipelined** into a multi-cycle radix-2 restoring sequential
+divider (bit-exact quotient), lifting softmax to **~20.9 MHz (6.1×)** — the divide is
+gone from the critical path, all values are unchanged, and the cost is latency
+(softmax 23→71, attention 87→279, asserted exactly by the TBs). `gemm_systolic` (~28
+MHz, the wide MAC) and the attention QK^T/×V reductions are the **same pattern** and
+the next targets.
 
 The tensor units are **single deep combinational datapaths** per FSM stage — the
 softmax exp/reciprocal approximation chain, the attention QK^T reduction + softmax

@@ -188,15 +188,18 @@ a signature — so P&R fits and measures the unit's genuine internal critical pa
 
 | Block (default size) | ECP5 device | LUT / FF / DSP   | **routed fmax** | critical path |
 |----------------------|-------------|------------------|----------------:|---------------|
-| softmax_unit (LEN=8) | LFE5U-25F   | 10k / 0.9k / 10  | **~3.4 MHz**    | single-cycle **64-bit reciprocal divide** `num_rcp / sum64` (long CCU2C ripple divider, ~266 ns) |
+| softmax_unit — original | LFE5U-25F | 10k / 0.9k / 10 | ~3.4 MHz | single-cycle **64-bit reciprocal divide** `num_rcp / sum64` (long CCU2C ripple divider, ~266 ns) |
+| **softmax_unit — pipelined ✅** | LFE5U-25F | 10k / 0.9k / 10 | **~20.9 MHz** | exp-LUT / running-sum datapath (`mag17`→exp LUT→`sumacc`, ~48 ns); the divide is **gone** from the critical path |
 | gemm_systolic (N=4)  | LFE5U-45F   | 7k / 3.3k / 48   | **~28 MHz**     | operand fetch → 16-bit signed multiply → 48-bit accumulate (systolic MAC) |
 
-Both fail a 50 MHz target — confirming the headline finding: the tensor blocks carry
-**deep single-cycle combinational arithmetic** (a full reciprocal divide in softmax,
-a wide MAC in GEMM) that **must be pipelined** to clock fast (ROADMAP item 1). The
-softmax reciprocal divide (~3.4 MHz) is the single worst path and the #1 pipeline
-target — worse in absolute terms than the `ltp` proxy implied, because a 64-bit ripple
-divide is one enormous carry chain.
+**The softmax reciprocal divide was the #1 path and is now PIPELINED** (ROADMAP §1):
+the single-cycle 64-bit `/` is replaced by a multi-cycle **radix-2 restoring sequential
+divider** (bit-exact quotient, 48 iteration cycles), lifting softmax from **~3.4 MHz to
+~20.9 MHz — a 6.1× routed-fmax win** — at the cost of latency (softmax 23→71 cycles,
+attention 87→279). All probability/argmax/sat values are unchanged (integer division is
+bit-identical); only the cycle-accurate latency grew, and the TBs assert the new exact
+latencies. The remaining tensor paths (the wide GEMM MAC at ~28 MHz, the attention
+QK^T/×V reductions) are the **same pipelining pattern** and the next targets.
 
 **The full TPU does NOT fit a single ECP5.** At default sizes it needs **161
 MULT18X18D** but the largest ECP5 (LFE5U-85F) has only **156**; mapping multipliers to

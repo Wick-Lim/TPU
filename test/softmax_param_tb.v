@@ -22,7 +22,9 @@
 //       * |p_dut - p_gold| <= 2 LSB of Q0.16 per element,
 //       * |SUM p_dut - 0xFFFF| <= 8 LSB,
 //       * argmax (low 3 bits, the fixed status port) checked EXACTLY,
-//       * done/busy timing checked EXACTLY (LAT = 5 + NLINES + 2*LEN).
+//       * done/busy timing checked EXACTLY
+//         (LAT = 5 + NLINES + 2*LEN + DIV_CYCLES; the reciprocal is now a
+//          multi-cycle radix-2 sequential divider, DIV_CYCLES = 48).
 //
 // STRUCTURE
 //   A reusable harness module `sm_harness #(LEN)` owns its own TM model + DUT +
@@ -45,7 +47,12 @@ module sm_harness #(
 );
     localparam integer NLANES = `LINE_LANES;
     localparam integer NLINES = (LEN + NLANES - 1) / NLANES;
-    localparam integer LAT    = 5 + NLINES + 2*LEN;   // start-edge..done-edge incl.
+    // The reciprocal is now a MULTI-CYCLE radix-2 sequential divider
+    // (DIV_CYCLES = DIV_W = 48 cycles in softmax_unit), so the closed-form
+    // start-edge..done-edge latency gained exactly DIV_CYCLES vs. the old
+    // single-cycle divide:  LAT = 5 + NLINES + 2*LEN + DIV_CYCLES.
+    localparam integer DIV_CYCLES = 48;               // softmax_unit DIV_W = 48
+    localparam integer LAT    = 5 + NLINES + 2*LEN + DIV_CYCLES; // start..done incl.
 
     reg rst;
 

@@ -71,15 +71,25 @@
 //   normalized probabilities track true floating-point softmax to within the
 //   documented +/-2 LSB of Q0.16 tolerance (see TB).
 //
-// RECIPROCAL
-//   1/S in Q1.30 is computed as a single rounded fixed-point reciprocal
+// RECIPROCAL  (PIPELINED -- multi-cycle SEQUENTIAL divider)
+//   1/S in Q1.30 is the rounded fixed-point reciprocal
 //       recip = ( 2^46 + (S>>1) ) / S
-//   (since S is Q15.16, 1/S_real = 2^16/S; in Q1.30 that is 2^46/S).  This is a
-//   single combinational integer divide registered into one state -- a
-//   legitimate synthesizable reciprocal (SPEC §5.3 permits "Newton-Raphson OR a
-//   reciprocal LUT"; an explicit hardware divide is the exact-quotient form of
-//   the same).  S is always >= LUT[0] = 65536 (the max element contributes
-//   exp(0)=1.0), so S != 0 and recip <= 2^30 (fits Q1.30 / 32 bits).
+//   (since S is Q15.16, 1/S_real = 2^16/S; in Q1.30 that is 2^46/S).  This used
+//   to be a SINGLE-CYCLE combinational 64-bit integer divide -- the MEASURED
+//   critical path (PPA.md §3.1, softmax routed at only ~3.4 MHz; the long CCU2C
+//   ripple divider was the #1 worst path).  It is now a MULTI-CYCLE radix-2
+//   RESTORING sequential unsigned divider that computes the SAME integer
+//   quotient one bit per cycle, dramatically shortening the per-cycle path at
+//   the cost of DIV_CYCLES added LATENCY (the probabilities are BIT-IDENTICAL:
+//   integer division is exact, and a throwaway probe confirmed the radix-2
+//   restoring quotient == Verilog "/" over the full operand range, sum64 in
+//   [65536, 32*65536], num_rcp = 2^46 + sum64/2).  The S==0 guard (recip=0) is
+//   preserved (div_zero latched from sumacc==0).  S is always >= LUT[0]=65536
+//   (the max element contributes exp(0)=1.0), so S != 0 and recip <= 2^30 (fits
+//   Q1.30 / 32 bits).  SPEC §5.3 permits "Newton-Raphson OR a reciprocal LUT";
+//   an explicit sequential hardware divide is the exact-quotient form.
+//   DIVIDER GEOMETRY:  DIV_W = 48-bit dividend/quotient, DIV_CYCLES = 48.  The
+//   divide spans S_RECIP (1 operand-latch cycle) + S_DIV (DIV_W iterations).
 //
 // NORMALIZE
 //   p_i = round( e_i(Q15.16) * recip(Q1.30) ) to Q0.16
@@ -110,23 +120,30 @@
 //   tm_wdata [LINE_W-1:0]    (out)        line data to write
 //
 // LATENCY (deterministic; asserted by the TB)
-//   FSM stages, in order:
-//     S_RD(NLINES) S_MAX(1) S_EXP(LEN) S_RECIP(1) S_NORM(LEN) S_WR(1) S_DONE(1)
+//   FSM stages, in order (the reciprocal is now a MULTI-CYCLE divide):
+//     S_RD(NLINES) S_MAX(1) S_EXP(LEN) S_RECIP(1) S_DIV(DIV_CYCLES)
+//     S_NORM(LEN) S_WR(1) S_DONE(1)
 //   The NORM pass writes each FULLY-PROBED output line in the same cycle its
 //   last lane is produced (the historic "write line 0 during S_NORM cnt==3"
 //   trick, generalized to every line); the FINAL line is drained in the
 //   dedicated S_WR cycle.  Generic start->done latency (posedges from the start
 //   edge to the done edge, inclusive of both, == the TB's `LAT`):
-//       LAT = 1 + NLINES + 1 + LEN + 1 + LEN + 1 + 1
-//           = 5 + NLINES + 2*LEN
+//       LAT = 1 + NLINES + 1 + LEN + 1 + DIV_CYCLES + LEN + 1 + 1
+//           = 5 + NLINES + 2*LEN + DIV_CYCLES
+//   The single-cycle S_RECIP divide became S_RECIP(1 operand-latch) +
+//   S_DIV(DIV_CYCLES iterations), so the divide region grew from 1 -> 1+
+//   DIV_CYCLES cycles, i.e. the closed form gained exactly DIV_CYCLES vs. the
+//   old  5 + NLINES + 2*LEN.  With DIV_CYCLES = DIV_W = 48:
+//       LAT = 53 + NLINES + 2*LEN.
 //   COUNTING CONVENTION (the two numbers describe the SAME waveform):
 //     * (LAT-1) = stage-edges traversed AFTER the start edge, EXCLUSIVE of it.
 //     * LAT     = posedges from the edge that samples `start` to the edge that
 //       raises `done`, INCLUSIVE of the start edge -- this is what the unit TB
 //       measures and asserts.
-//   For the DEFAULT LEN=8 (NLINES=2):  LAT = 5 + 2 + 16 = 23  (UNCHANGED, the
-//   committed figure SPEC §3.3 lists).  `busy` is high from the start cycle
-//   through the cycle before `done`.
+//   For the DEFAULT LEN=8 (NLINES=2):  LAT = 53 + 2 + 16 = 71  (was 23; the
+//   probabilities/argmax/sat are UNCHANGED -- only the cycle-accurate latency
+//   grew by DIV_CYCLES=48).  `busy` is high from the start cycle through the
+//   cycle before `done`.
 //
 // SYNTHESIZABILITY
 //   Synchronous reset on ALL state; every reg assigned on every path of the one
@@ -182,10 +199,33 @@ module softmax_unit #(
     localparam [3:0] S_RD    = 4'd1;  // read logits lines 0..NLINES-1 (NLINES cyc)
     localparam [3:0] S_MAX   = 4'd2;  // max + argmax over all LEN logits
     localparam [3:0] S_EXP   = 4'd3;  // LEN cycles: e_i = exp(x_i-max), accum S
-    localparam [3:0] S_RECIP = 4'd4;  // reciprocal 1/S in Q1.30
+    localparam [3:0] S_RECIP = 4'd4;  // latch divider operands (1 cyc), -> S_DIV
+    localparam [3:0] S_DIV   = 4'd8;  // sequential reciprocal divide (DIV_W cyc)
     localparam [3:0] S_NORM  = 4'd5;  // LEN cycles: p_i = e_i*recip -> Q0.16
     localparam [3:0] S_WR    = 4'd6;  // write the FINAL probs line, done next
     localparam [3:0] S_DONE  = 4'd7;  // 1-cycle done pulse
+
+    // ---- sequential reciprocal divider geometry --------------------------
+    // The reciprocal recip = num_rcp / sum64 was a single-cycle combinational
+    // 64-bit divide (the measured critical path, PPA.md §3.1 ~3.4 MHz).  It is
+    // now a MULTI-CYCLE radix-2 RESTORING unsigned divider producing the SAME
+    // integer quotient bit-for-bit, one quotient bit per cycle.  The dividend
+    // num_rcp = 2^46 + (S>>1) is <= 2^47 (47 significant bits); a 48-bit-wide
+    // divider (48 iterations) covers the full operand range exactly (verified
+    // by a throwaway probe against the Verilog "/" over the real operand ranges:
+    // sum64 in [65536, 32*65536], num_rcp = 2^46 + sum64/2 -- IDENTICAL for all).
+    //   DIV_W      : dividend / quotient register width and the iteration count.
+    //   DIV_CYCLES : extra latency added vs. the old 1-cycle divide.  The divide
+    //                region now spans S_RECIP(1 setup) + S_DIV(DIV_W iterations);
+    //                it replaced the old single S_RECIP cycle, so the net added
+    //                latency is DIV_CYCLES = (1 + DIV_W) - 1 = DIV_W.
+    localparam integer DIV_W      = 48;     // 48-bit radix-2 restoring divider
+    // DIV_CYCLES documents the latency the divide adds (used by the TBs' LAT
+    // closed form); it is not referenced elsewhere in the RTL, so it is lint_off
+    // for UNUSEDPARAM (it stays here as the single source of the cycle figure).
+    /* verilator lint_off UNUSEDPARAM */
+    localparam integer DIV_CYCLES = DIV_W;  // +48 cycles vs. the old 1-cyc divide
+    /* verilator lint_on UNUSEDPARAM */
 
     // Maclaurin reciprocal-of-factorial constants in Q0.16 (divide-free):
     //   1/6  ~= round(2^16/6)  = 10923
@@ -213,6 +253,28 @@ module softmax_unit #(
     // element pass counter (0..LEN-1) and line counter for the RD/WR loops.
     reg [CNT_W-1:0]          cnt;
     reg [LINE_W_-1:0]        lcnt;     // line index during the read loop
+
+    // ---- sequential reciprocal divider state -----------------------------
+    // div_dividend : the full DIV_W-bit dividend (latched num_rcp); the iteration
+    //                shifts in dividend bits MSB-first via div_idx.
+    // div_divisor  : the latched divisor (sum64).
+    // div_quot     : accumulating quotient (one bit set per iteration).
+    // div_rem      : partial remainder.  After each restoring step the remainder
+    //                is < divisor <= 2^DIV_W and the dividend is < 2^DIV_W, so the
+    //                registered remainder always fits in DIV_W bits; the trial
+    //                subtract's extra sign bit lives only in the combinational
+    //                wires below (div_rem_sh / div_sub).
+    // div_idx      : current dividend bit index (DIV_W-1 down to 0); a 0..DIV_W
+    //                counter (needs $clog2(DIV_W+1) bits).
+    // div_zero     : sticky S==0 guard (sum64==0) latched at operand-latch time;
+    //                forces recip=0 exactly as the old combinational guard did.
+    localparam integer DIDX_W = $clog2(DIV_W + 1);     // holds 0..DIV_W
+    reg [DIV_W-1:0]  div_dividend;
+    reg [DIV_W-1:0]  div_divisor;
+    reg [DIV_W-1:0]  div_quot;
+    reg [DIV_W-1:0]  div_rem;
+    reg [DIDX_W-1:0] div_idx;
+    reg              div_zero;
 
     integer w;
 
@@ -370,19 +432,64 @@ module softmax_unit #(
     /* verilator lint_on UNUSEDSIGNAL */
 
     // ----------------------------------------------------------------------
-    // Reciprocal 1/S in Q1.30: recip = (2^46 + (S>>1)) / S  (rounded).
-    // Numerator up to 2^46+ : use 64-bit operands for the divide.  The high
-    // bits of the 64-bit temporaries are intentionally unused (the quotient is
-    // <= 2^30), so the divide region is under a narrow scoped lint_off.
+    // Reciprocal 1/S in Q1.30: recip = (2^46 + (S>>1)) / S  (rounded), computed
+    // by a MULTI-CYCLE radix-2 RESTORING sequential divider (was a single-cycle
+    // combinational 64-bit "/", the measured critical path, PPA.md §3.1).
+    //
+    //   * The divide operands are formed combinationally here (DIV_W-wide):
+    //       sum64   = S (the Q15.16 exp-sum accumulator), the DIVISOR.
+    //       num_rcp = 2^46 + (S>>1), the DIVIDEND (since 1/S_real = 2^16/S, in
+    //                 Q1.30 that is 2^46/S; +(S>>1) is the round-half bias).
+    //     These wires are LATCHED into div_divisor/div_dividend in S_RECIP, then
+    //     the FSM iterates the divider one quotient bit per cycle in S_DIV.
+    //   * The S==0 guard (recip=0) is preserved: div_zero is latched from
+    //     (sumacc==0) at operand-latch time; if set the quotient is forced 0.
+    //   * Bit-exactness vs. the Verilog "/" was confirmed by a throwaway probe
+    //     over the full operand range (sum64 in [65536, 32*65536], num_rcp =
+    //     2^46 + sum64/2): the radix-2 restoring quotient is IDENTICAL for all.
+    // The high bits of the DIV_W operands above the meaningful range are unused
+    // (the quotient is <= 2^30), so the divide region is under a scoped lint_off.
     // ----------------------------------------------------------------------
     /* verilator lint_off UNUSEDSIGNAL */
-    wire [63:0] sum64   = {{(64-`ACC_W){1'b0}}, sumacc};
-    wire [63:0] num_rcp = (64'd1 <<< 46) + (sum64 >> 1);
-    wire [63:0] rcp64   = (sumacc == {`ACC_W{1'b0}}) ? 64'd0 : (num_rcp / sum64);
+    wire [DIV_W-1:0] sum64   = {{(DIV_W-`ACC_W){1'b0}}, sumacc};
+    wire [DIV_W-1:0] num_rcp = (DIV_W'(1) <<< 46) + (sum64 >> 1);
+
+    // The bit index being processed this cycle, as a DIDX_W-wide value:
+    // (div_idx - 1), i.e. DIV_W-1 down to 0 over the DIV_W iterations.
+    wire [DIDX_W-1:0] div_bit = div_idx - DIDX_W'(1);
+    // One radix-2 restoring iteration (combinational): shift the working
+    // remainder left, bring in the dividend bit at div_bit, trial-subtract the
+    // divisor; if non-negative keep the subtract (quotient bit 1) else restore.
+    wire [DIV_W-1:0] div_bitsel = div_dividend >> div_bit;
+    // shifted remainder (DIV_W+1 bits) and the trial subtract (one sign bit).
+    wire [DIV_W:0]   div_rem_sh = {div_rem, div_bitsel[0]};
+    wire [DIV_W:0]   div_sub    = div_rem_sh - {1'b0, div_divisor};
+    wire             div_qbit   = (div_sub[DIV_W] == 1'b0);   // rem_sh >= divisor
+    // next registered remainder: always fits in DIV_W bits (kept value's top bit
+    // is 0 -- restore keeps rem_sh<divisor, subtract keeps the non-negative sub).
+    wire [DIV_W-1:0] div_rem_nx = div_qbit ? div_sub[DIV_W-1:0]
+                                           : div_rem_sh[DIV_W-1:0];
+    // quotient bit goes to position div_bit (MSB-first generation).
+    wire [DIV_W-1:0] div_quot_nx =
+        div_quot | (div_qbit ? (DIV_W'(1) << div_bit)
+                             : {DIV_W{1'b0}});
+
+    // recip_clamp(q): S==0-guard + Q1.30 clamp of a completed quotient `q`.
+    //   * div_zero (sumacc==0) forces 0 -- the preserved S==0 guard.
+    //   * clamp to Q1.30 range (<= 2^30); S>=65536 guarantees rcp<=2^30 anyway.
+    // Applied to the freshly-completed quotient at the last divide iteration.
+    function [`Q130_W-1:0] recip_clamp;
+        input [DIV_W-1:0] q;
+        begin
+            if (div_zero)
+                recip_clamp = {`Q130_W{1'b0}};
+            else if (q > {{(DIV_W-32){1'b0}}, 32'h40000000})
+                recip_clamp = 32'h40000000;
+            else
+                recip_clamp = q[`Q130_W-1:0];
+        end
+    endfunction
     /* verilator lint_on UNUSEDSIGNAL */
-    // Clamp to Q1.30 range (<= 2^30); S>=65536 guarantees rcp<=2^30 anyway.
-    wire [`Q130_W-1:0] recip_calc =
-        (rcp64 > {32'd0, 32'h40000000}) ? 32'h40000000 : rcp64[`Q130_W-1:0];
 
     // ----------------------------------------------------------------------
     // Normalize p_i = round( e_i(Q15.16) * recip(Q1.30) ) to Q0.16.
@@ -481,6 +588,12 @@ module softmax_unit #(
             recip    <= {`Q130_W{1'b0}};
             cnt      <= {CNT_W{1'b0}};
             lcnt     <= {LINE_W_{1'b0}};
+            div_dividend <= {DIV_W{1'b0}};
+            div_divisor  <= {DIV_W{1'b0}};
+            div_quot     <= {DIV_W{1'b0}};
+            div_rem      <= {DIV_W{1'b0}};
+            div_idx      <= {DIDX_W{1'b0}};
+            div_zero     <= 1'b0;
             tm_raddr <= {`TM_IDX_W{1'b0}};
             tm_we    <= 1'b0;
             tm_waddr <= {`TM_IDX_W{1'b0}};
@@ -559,14 +672,42 @@ module softmax_unit #(
                 end
 
                 // ---------------------------------------------------------
-                // Reciprocal 1/S in Q1.30.  Also rewind `lcnt` to 0 so the
-                // NORM pass numbers OUTPUT lines from the p_base (the read loop
-                // left lcnt at NLINES-1).
+                // Reciprocal 1/S in Q1.30 -- OPERAND LATCH (1 cycle).  Latch the
+                // dividend/divisor and the S==0 guard, initialize the radix-2
+                // restoring divider (quotient=0, remainder=0, bit index=DIV_W),
+                // then iterate one quotient bit per cycle in S_DIV.  Also rewind
+                // `lcnt` to 0 so the NORM pass numbers OUTPUT lines from p_base
+                // (the read loop left lcnt at NLINES-1).
                 S_RECIP: begin
-                    recip <= recip_calc;
-                    cnt   <= {CNT_W{1'b0}};
-                    lcnt  <= {LINE_W_{1'b0}};
-                    state <= S_NORM;
+                    div_dividend <= num_rcp;
+                    div_divisor  <= sum64;
+                    div_zero     <= (sumacc == {`ACC_W{1'b0}});
+                    div_quot     <= {DIV_W{1'b0}};
+                    div_rem      <= {DIV_W{1'b0}};
+                    div_idx      <= DIDX_W'(DIV_W);   // process bits DIV_W-1 .. 0
+                    cnt          <= {CNT_W{1'b0}};
+                    lcnt         <= {LINE_W_{1'b0}};
+                    state        <= S_DIV;
+                end
+
+                // ---------------------------------------------------------
+                // Sequential reciprocal divide: DIV_W cycles, one quotient bit
+                // per cycle (radix-2 restoring).  Each cycle processes dividend
+                // bit (div_idx-1): shift remainder, trial-subtract, set the
+                // quotient bit on a non-negative result, else restore.  On the
+                // last iteration (div_idx==1) the full quotient is ready, so
+                // register recip (clamped, S==0-guarded) and advance to S_NORM.
+                S_DIV: begin
+                    div_quot <= div_quot_nx;
+                    div_rem  <= div_rem_nx;
+                    div_idx  <= div_idx - DIDX_W'(1);
+                    if (div_idx == DIDX_W'(1)) begin
+                        // div_quot_nx holds the COMPLETE quotient this cycle
+                        // (the LSB, bit 0, is generated on this last iteration);
+                        // S==0-guard + Q1.30-clamp it into recip.
+                        recip <= recip_clamp(div_quot_nx);
+                        state <= S_NORM;
+                    end
                 end
 
                 // ---------------------------------------------------------
