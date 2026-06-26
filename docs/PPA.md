@@ -220,6 +220,46 @@ nextpnr-ecp5 --json <h>.json --25k --package CABGA256 --speed 6 --freq 50 --text
 and read the `Max frequency for clock '...'` line (`--25k`/`--45k`/`--85k` selects the
 device; step up if a block overflows LUTs/DSP).
 
+### 3.2 Power — first-order estimate refined with MEASURED switching activity
+
+Power needs a placed bitstream + a power analyzer (Lattice Radiant) for sign-off, but
+we refined the first-order estimate by **measuring the real switching activity** from
+functional simulation. Each unit is run back-to-back from its `fpga/*_harness.v`
+(LFSR operands); a VCD of the **unit instance only** (`dut.dut`, excluding the harness)
+is parsed for Hamming-distance bit-toggles, **gated on `busy`** to get the active-state
+activity factor α (toggles / (net-bits × active cycle)).
+
+| Unit (active) | measured **α** (busy) | transitions/cyc | fmax used |
+|---------------|----------------------:|----------------:|----------:|
+| gemm_systolic | **10.3 %** | ~125 | 28 MHz |
+| softmax_unit (pipelined) | **3.0 %** | ~69 | 20.9 MHz |
+
+(softmax is low because its pipelined sequential divider is a thin ~1-bit/cycle path —
+a nice side effect: the pipelining that fixed fmax also keeps instantaneous activity
+low.) These measured α are **lower than the textbook ~15 % assumption**, so the dynamic
+power is lower than a naïve guess.
+
+Plugging measured α into `P_dyn = α·C_eff·V²·f` with first-order ECP5 coefficients
+(V=1.1 V; ~30 fF/LUT4, ~3 pF/DSP) and the real cell counts (§2):
+
+| Term | estimate | note |
+|------|---------:|------|
+| active-unit logic + DSP dynamic | **~0.15–1 mW** | one unit runs at a time (~5k LUT, ~10–48 DSP) at the measured α |
+| clock distribution (~19k FF clocked every cycle @ ~20–28 MHz) | **~7–10 mW** | independent of α |
+| static / leakage | **~30–100 mW** | device- and temperature-dependent; the dominant term |
+| **total (running)** | **≈ 0.05–0.12 W** | **leakage-dominated**, then clock; switching is minor |
+
+**Key takeaways:** (1) measured activity is modest and **only one tensor unit is active
+at a time**, so the *dynamic* power from computation is a few mW — **static leakage and
+clock distribution dominate**, not toggling; (2) the design is **low-power (tens of
+mW)**, well under the ~0.3–0.7 W a naïve "whole chip toggling" guess gives; (3) thermals
+are a non-issue (§ below). **Caveats:** the per-cell capacitances are first-order (could
+be 2–3× off — the *measured* quantity is α); RTL α omits pure-combinational glitch power
+(gate-level would add a ~10–30 % margin; the ECP5 `cells_sim` gate-level sim hit an
+iverilog include-collision, so RTL activity was used); real watts still want Radiant's
+power calculator fed this activity (SAIF), and the full design needs a larger FPGA than
+ECP5 anyway (§3.1).
+
 ⚠️ **`attention_unit` has the deepest combinational path among the four tensor
 units (ltp 2,250).** The full **TPU** top has the largest `ltp` overall (~5,168),
 since its critical path can run through the deepest sub-block plus top-level glue.
