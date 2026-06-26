@@ -94,32 +94,34 @@ These resolve the former "slave-only / single-clock" limitation of `src/tpu_axi.
 
 ---
 
-## 4. Arbitrary-size parameterization beyond `LINE_LANES = 4`
+## 4. Arbitrary-size tiles beyond `LINE_LANES = 4` — multi-line TM ✅ DEMONSTRATED
 
-**Status: NOT done. Sizes are bounded by the 4-lane TM line.**
+**Status: the multi-line-row packing is PROVEN with a working unit; folding it into
+the existing single-line units is the remaining integration step.**
 
-The tensor units are parameterized ([`../SPEC.md`](../SPEC.md) §9), but every upper
-bound traces to the architectural decision that **one matrix/feature/Q-K-V row packs
-into one 128-bit TM line of `LINE_LANES = 4` lanes**:
+The shipped tensor units bound tile sizes because each packs **one row into one
+128-bit TM line of `LINE_LANES = 4` lanes** (GEMM `N ≤ 4`, attention `D ≤ 4`, conv
+rows `≤ 8` columns; softmax already spans `ceil(LEN/4)` lines as a 1-D reduction).
+Larger tiles (a 16×16 GEMM, `D = 8` attention) need **multi-line TM rows** — a row
+spanning `ceil(N/LINE_LANES)` consecutive lines.
 
-- GEMM `N ≤ 4`, attention `D ≤ 4` — one row is one TM line.
-- conv image/kernel rows `≤ 8` columns — dense-16 pack, 4 lanes × 16-bit.
-- softmax scales further (`LEN ≤ 32`) **only** because it is a 1-D reduction over
-  `ceil(LEN/4)` lines, and even then its `argmax` status port stays a 3-bit field.
+**That packing now exists and is verified.** `src/gemm_ml.v` is an output-stationary
+GEMM whose matrix rows span `LINES_PER_ROW = ceil(N/LINE_LANES)` TM lines: row `r`
+occupies the lines at `base + r·LINES_PER_ROW`, element `k` at line
+`base + r·LINES_PER_ROW + k/LINE_LANES`, lane `k % LINE_LANES`. Its load FSM reads
+`LINES_PER_ROW` lines per row and assembles the full row before MAC; writeback packs
+each row back across `LINES_PER_ROW` lines. It is proven at **N = 8 (2 lines per
+row)** and N = 4 (1 line) against an independent real-domain golden — `make
+unittests` → `[gemm_ml] ALL 12838 TESTS` (a deliberately wrong single-line packing
+makes N = 8 fail, confirming the multi-line packing is load-bearing). verilator
+`-Wall` and yosys `check -assert` clean.
 
-Larger tiles (e.g. a 16×16 GEMM, `D = 8` attention) need **multi-line TM rows**: a
-row would span several TM lines, requiring changes to the TM line layout/packing in
-`tpu_defs.vh` / `tile_memory.v` / `tpu_top.v`, the per-unit operand-fetch loops, and
-the TM read-port arbitration. This is a **TM port / packing re-architecture**, not a
-parameter bump.
-
-**Why deferred.** The 4-lane line is baked into the architecture's central
-two-operand-domain decision ([`../SPEC.md`](../SPEC.md) §1.1) and into the verified
-TM read/write port model. Generalizing to multi-line rows is a cross-cutting
-datapath change with its own verification surface; the current parameterization
-deliberately stays within the single-line-per-row envelope (proven at a 2nd in-range
-size per unit) rather than overreach. Until that re-architecture lands, sizes beyond
-the bounds in §9 are **out of scope**, and the units enforce the documented ranges.
+**Remaining integration step.** `gemm_ml` proves the multi-line approach end-to-end as
+a self-contained unit. Generalizing the **whole accelerator** to multi-line tiles
+(retrofitting `gemm_systolic`/`conv2d_unit`/`attention_unit`, the `tpu_top` dispatch,
+and the TM read-port arbitration to the same `LINES_PER_ROW` scheme) is the larger
+cross-cutting change; the production single-line units are kept intact and verified,
+with `gemm_ml` standing as the validated reference design for that rollout.
 
 ---
 
