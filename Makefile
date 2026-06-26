@@ -115,6 +115,11 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/gemm_ml_sim test/gemm_ml_tb.v src/gemm_ml.v
 	@printf '[%s] ' "gemm_ml"; $(VVP) $(BUILD_DIR)/gemm_ml_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: gemm_ml"; exit 1; }
+	@# ---- GLM-5.2 datapath units (bf16/fp32, fp32-golden verified) ----
+	@# rmsnorm_unit: bf16 in/out, fp32 reduce + rsqrt; the FP numerics foundation.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/rmsnorm_unit_sim test/rmsnorm_unit_tb.v src/rmsnorm_unit.v
+	@printf '[%s] ' "rmsnorm_unit"; $(VVP) $(BUILD_DIR)/rmsnorm_unit_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: rmsnorm_unit"; exit 1; }
 	@# 2nd-size proof for the parameterized attention_unit (SEQ=2,D=2); it
 	@# additionally needs softmax_unit (instantiated at SM_PAD lanes).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/attention_param_sim test/attention_param_tb.v src/attention_unit.v src/softmax_unit.v
