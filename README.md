@@ -13,6 +13,7 @@ with the GLM-5.2 accelerator, which is the active work.
 
 The normative documents:
 - **[`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md)** — the GLM-5.2 accelerator architecture: exact config, MLA + DSA + MoE detail, the fp64-golden methodology, the memory/streaming system, and the RTL build order.
+- **[`docs/SYSTEM_SINGLE_PACKAGE.md`](docs/SYSTEM_SINGLE_PACKAGE.md)** — a single-package system design to run the real 753B GLM-5.2-FP8 (FP8 compute die + 64 GB HBM + 1 TB Flash): memory tiering, MoE expert caching/streaming, the bottleneck/perf/cost model, and how the committed RTL is the compute die.
 - **[`SPEC.md`](SPEC.md)** / **[`docs/ISA.md`](docs/ISA.md)** — the underlying scalar TPU core microarchitecture + ISA.
 
 ---
