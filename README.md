@@ -36,13 +36,6 @@ experts top-8 + 1 shared (`moe_intermediate 2048`), dense `intermediate 12288`,
 **DSA** sparse attention (`index_topk 2048`), vocab 154880, 1M context,
 `rope_theta 8e6` interleaved, RMSNorm `eps 1e-5`, MTP (`num_nextn_predict_layers 1`).
 
-### Verification stance
-
-We verify that **our RTL computes the FP8 operations correctly**, against a *faithful
-FP8 reference* (the same E4M3 + [128,128] block-scale arithmetic, in fp64). We do
-**not** try to prove "FP8 ≈ an fp32 ideal model" — the GLM authors already shipped
-FP8, so model quality is their concern, not the accelerator's.
-
 ---
 
 ## Status
@@ -98,15 +91,13 @@ gives the resource-fit answer without it.
 
 ---
 
-## Scale honesty
+## Slice configuration
 
-The committed RTL is a **small-but-faithful slice** (MODEL_DIM=128, 6 layers, 4 heads,
-MLA nope16/rope16/v32, q_lora64/kv_lora32, 8-expert top-2 + shared, VOCAB=256) — every
-operator and ratio of GLM-5.2 is present, sized for near-exhaustive verification. The
-slice *proves the computation is correct and complete*. Running the real 753B model fast
-additionally needs the hundreds-of-GB memory/streaming system documented in
-[`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md) (multi-chip / host-streaming territory, even
-in FP8 ≈ 753 GB) and array scaling — a chip+system effort beyond the RTL slice.
+The RTL is built at a small-but-faithful slice that keeps every GLM-5.2 operator and
+ratio: MODEL_DIM=128, 6 layers (3 dense + 3 MoE), 4 heads, MLA nope16/rope16/v32,
+q_lora64/kv_lora32, 8-expert top-2 + 1 shared, INTER_MOE=64, INTER_DENSE=256, VOCAB=256,
+S_MAX=8. Running the real 753B model adds the hundreds-of-GB memory/streaming system
+documented in [`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md) and array scaling.
 
 ---
 
