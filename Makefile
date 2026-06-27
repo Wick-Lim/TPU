@@ -161,6 +161,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_sim test/mla_attn_fp8_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "mla_attn_fp8"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: mla_attn_fp8"; exit 1; }
+	@# moe_router_fp8: MoE router, W_g GEMV via glm_matmul_fp8, bf16 sigmoid/topk/renorm*2.5 tail.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/moe_router_fp8_sim test/moe_router_fp8_tb.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/topk_select.v src/glm_fp_pipe.v
+	@printf '[%s] ' "moe_router_fp8"; $(VVP) $(BUILD_DIR)/moe_router_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: moe_router_fp8"; exit 1; }
 	@# swiglu_expert: SwiGLU FFN expert (gate/up/down GEMM + silu*up), dense + MoE modes.
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_sim test/swiglu_expert_tb.v src/swiglu_expert.v src/glm_matmul_pipe.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "swiglu_expert"; $(VVP) $(BUILD_DIR)/swiglu_expert_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
