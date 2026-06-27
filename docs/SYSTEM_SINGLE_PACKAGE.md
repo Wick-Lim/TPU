@@ -107,18 +107,51 @@ batch reuse, the **miss rate** — not raw compute — governs throughput.
 
 ## 7. Performance model [EST]
 
-Assuming in-package wide Flash ~50–100 GB/s, modest FP8 die (~1 TFLOP/s effective), batch=1:
+### 7.1 Measured cache hit rate (calibrated GLM-scale trace, RTL-confirmed)
 
-| Config | Routed bytes/token | Dominant time | ~tokens/s |
+The make-or-break unknown — the expert-cache hit rate — was simulated at GLM scale (256
+experts × 75 layers, top-8) with a routing trace calibrated to a *trained* MoE router
+(load-balanced → mild popularity skew, weak temporal locality), fed through the **real
+`expert_cache_ctrl` RTL** (hit/miss bit-exact vs a python LRU model). Tools:
+`tools/route_trace.py`, `tools/glm_cache_confirm_tb.v`.
+
+**batch=1 (interactive decode) hit rate vs HBM cache size:**
+
+| HBM cache | slots | uniform-ish (realistic) | skewed (optimistic) |
 |---|---|---|---|
-| FP8, cold cache (all miss) | 22 GB | Flash 0.22–0.44 s | ~2–5 |
-| FP8, 64 GB cache (skewed hits) | ~8–12 GB effective | Flash ~0.1–0.24 s | ~4–10 |
-| **INT4** (re-quant), 64 GB cache | ~4–6 GB | Flash ~0.05–0.12 s | **~8–20** |
-| + batching ×B | amortized /B | — | ~×B until compute-bound |
-| + speculative/MTP ×K tokens/pass | /K weight passes | — | ~×K |
+| 5.5 GB | 150 | **0 %** | **0 %** |
+| 22 GB | 600 | 26 % | 51 % |
+| **34 GB** (the 64 GB-HBM config) | 900 | **27 %** | 53 % |
+| 66 GB | 1800 | 31 % | 58 % |
 
-So: **a few tokens/s at FP8 batch=1, scaling to tens/s with INT4 + caching + batching +
-speculative decoding.** Interactive, not real-time-serving. Compute and the single die are
+Two non-obvious findings the sim revealed:
+- **Hard threshold at ~22 GB (= one token's 600-expert footprint).** Below it the hit rate is
+  **0 %** — in batch=1 the decoder sweeps all 75 layers per token, so an expert is evicted long
+  before the *next* token revisits its layer unless the cache holds a full token's footprint.
+  **The 64 GB HBM (34 GB cache) sits just past this knee.**
+- **Trained routers are load-balanced → less cacheable than a naive Zipf.** The realistic
+  ("uniform-ish") hit rate at 34 GB is **~27 %**, not the ~67 % a synthetic skewed trace
+  suggested.
+
+**Batching is the real lever, not cache size.** With layer-major batched access (experts reused
+within a layer across the batch) the hit rate is ~28–50 % (batch 8) to ~47–66 % (batch 32)
+**even at a 5.5 GB cache** — cache size becomes nearly irrelevant.
+
+### 7.2 Throughput
+
+Flash ~50–100 GB/s, modest FP8 die (~1 TFLOP/s), routed bytes/token = (1 − hit) × 22 GB:
+
+| Config | hit rate | routed Flash bytes/token | ~tokens/s |
+|---|---|---|---|
+| FP8 batch=1, 34 GB cache (realistic) | ~27 % | ~16 GB | **~3–6** |
+| FP8 batch=1, cache < 22 GB | ~0 % | ~22 GB | ~2–5 |
+| FP8 batch=32 | ~50 % | ~11 GB/token-equiv, ÷batch | **tens/s** |
+| **INT4** (re-quant) + batch | — | ×½ bytes | **~2× the above** |
+| + speculative/MTP ×K tokens/pass | — | ÷K weight passes | ~×K |
+
+So: **~3–6 tokens/s at FP8 batch=1** (the cache helps only modestly — ~27 % — because trained
+routing is balanced), **scaling to tens/s with batching** (the dominant lever), and further
+with INT4 + speculative/MTP. Interactive, not real-time-serving. Compute and the single die are
 *not* the limit (the die idles waiting on Flash).
 
 ## 8. MoE expert-cache subsystem (the heart of it)
@@ -190,8 +223,11 @@ package, capacity-constrained) and the custom compute-die NRE + die cost. For co
 
 ## 13. Open questions / honest limits
 
-- **Expert-cache hit rate** is the make-or-break unknown — depends on real GLM-5.2 routing
-  skew + batch reuse; needs measurement on real routing traces.
+- **Expert-cache hit rate** — now estimated (§7.1) on a *calibrated* GLM-scale trace through
+  the real `expert_cache_ctrl` RTL: ~27 % at batch=1 / 34 GB cache, with a hard 0 % floor below
+  ~22 GB, and batching as the dominant lever. Still **calibrated, not captured** — the actual
+  numbers need a *real* GLM-5.2 routing trace (can't run 753B here); the trained-router balance
+  assumption could be off in either direction.
 - **In-package Flash bandwidth** (~10s GB/s) is assumed; real wide-NAND integration BW must be
   validated — NAND read physics caps it well below HBM.
 - **64 GB HBM is comfortable for FP8** (hot 28 GB + ~34 GB cache); **48 GB is tight**, **INT4

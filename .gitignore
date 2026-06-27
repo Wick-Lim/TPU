@@ -9,3 +9,6 @@ scratchpad_build/
 tpu_waveform.vcd
 hazard_waveform.vcd
 *.vcd
+
+# Generated routing trace (regenerate with tools/route_trace.py --dump)
+tools/*.hex
