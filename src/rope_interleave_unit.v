@@ -3,7 +3,7 @@
 //============================================================================
 // rope_interleave_unit.v -- GLM-5.2 DECOUPLED INTERLEAVED RoPE   (§4.1, §3 #6)
 //----------------------------------------------------------------------------
-// FUNCTION
+// FUNCTION  (UNCHANGED interface / semantics)
 //   Applies the GLM-5.2 decoupled, ADJACENT-PAIR ("GPT-NeoX interleaved")
 //   rotary position embedding to a ROT_DIM-element bf16 vector.  The vector is
 //   treated as ROT_DIM/2 adjacent pairs (x[2i], x[2i+1]); pair i is rotated by
@@ -16,80 +16,73 @@
 //   k_rope[64], and the DSA indexer reuses it.  It is NOT rotate-half.
 //
 //----------------------------------------------------------------------------
-// NUMERICS  (the §6 contract; all FP ops come from glm_fp.vh)
-//   * Vector elements stream in/out as BF16.
-//   * The ANGLE is computed in FULL PRECISION.  POS is up to 2^20-1 (1M ctx) and
-//     inv_freq[i] = THETA^(-2i/ROT_DIM) spans ~7 decades, so the *product*
-//     POS*inv_freq[i] reaches ~1e6 radians: a bf16 (or even fp32) angle cannot
-//     resolve a single position there.  We therefore RANGE-REDUCE EXACTLY in
-//     fixed point: a Q56 ROM holds INVF_Q56[i] = inv_freq[i] * 2^56 (an
-//     integer); phase = POS*INVF_Q56[i] is an EXACT integer product, and
-//     reduced = phase mod (2*pi in Q56) is an EXACT integer modulo -> NO
-//     large-argument cancellation.  The reduced angle (in [0,2*pi), < 2*pi) is
-//     then converted to an fp32 angle in [-pi,pi] and fed to an fp32 CORDIC.
-//   * cos/sin: 16-iteration fp32 CORDIC (rotation mode), preceded by a one-step
-//     fold of [-pi,pi] into [-pi/2,pi/2] (CORDIC's convergence range).  Measured
-//     worst-case |err| <= 3.1e-5 for both cos and sin over all ROT_DIM/2 freqs x
-//     positions spanning [1 .. 2^20-1]  (target <= 2^-12 = 2.44e-4) -- ~8x
-//     inside spec.  The rotation x0*cos-x1*sin etc. is done in fp32 and rounded
-//     back to bf16 (RNE) on output.
+// LEAN REBUILD  (drop-in; same module/params/ports as the prior CORDIC unit)
+//   The previous unit reduced the angle with a 128-bit EXACT integer modulo and
+//   computed cos/sin with a 16-iteration fp32 CORDIC.  That was ~1.34M cells and
+//   stopped yosys synth_ecp5 from converging.  bf16 storage only needs ~1/256
+//   accuracy, so both pieces are replaced with far leaner schemes that stay
+//   inside the EXISTING golden tolerance:
+//
+//   (1) RANGE REDUCTION as FRACTIONAL TURNS (modulo becomes a bit-truncate).
+//       Instead of reducing radians mod 2*pi (an expensive 128-bit `%`), we work
+//       in TURNS.  Per pair we hold a Q48 constant
+//            F[i] = round( inv_freq[i] / (2*pi) * 2^48 )            (turns/pos)
+//       built AT ELABORATION by the SAME pure-integer log2/exp2 ROM math the old
+//       unit used for inv_freq (no `real`, constant-folds to a ROM).  Then
+//            phase = POS * F[i]                                     (exact int)
+//            frac_turns = phase[47:0]   == (POS*inv_freq/2pi) mod 1
+//       i.e. reduction mod one full turn is simply the LOW 48 BITS -- no divide,
+//       no 128-bit modulo.  F[i] carries <2^-29 turn error over POS<=2^20, and
+//       (like before) inv_freq[0] is EXACTLY 1 so the fastest pair is exact and
+//       POS=0 is a bit-exact identity.
+//
+//   (2) cos/sin from the turn fraction by QUADRANT FOLD + fp32 TAYLOR.
+//       frac_turns[47:46] selects the quadrant; the remaining 46 bits become an
+//       fp32 angle theta in [0, pi/2).  cos/sin(theta) use Taylor series
+//            sin = th*(1 - th^2/6 + th^4/120 - th^6/5040 + th^8/362880)
+//            cos =     1 - th^2/2 + th^4/24  - th^6/720  + th^8/40320
+//       (Horner in u=theta^2), then the quadrant applies the sign/swap mapping.
+//       Worst-case |err| over [0,pi/2] is ~2.5e-5 for both -- inside the golden's
+//       cross-term allowance (CROSS = 2^-13 ~= 1.22e-4).  All fp32 ops come from
+//       glm_fp.vh; the interleaved rotation pairing is byte-identical to before.
 //
 //----------------------------------------------------------------------------
-// inv_freq / cos-sin METHOD SUMMARY
-//   INVF_Q56 ROM (ROT_DIM/2 entries) is built AT ELABORATION by a PURE-INTEGER
-//   function (log2 via 56 fixed-point squarings + 2^frac via a 56-entry Q56
-//   table) -- no `real`, no `$pow`/`$ln`, so yosys elaborates it cleanly and it
-//   constant-folds to a ROM.  Worst-case rel-err of an INVF_Q56 entry vs the
-//   true inv_freq is < 5e-6, and because reduction is an exact integer modulo,
-//   the residual angle error stays < ~2^20 * 2^-56 ~ 2^-36 turns -- negligible.
-//
-//----------------------------------------------------------------------------
-// PARAMETERS
-//   ROT_DIM : rotated-vector length (default 64 = GLM qk_rope_head_dim).
-//             MUST be even; NPAIR = ROT_DIM/2 pairs.
+// PARAMETERS  (names/defaults UNCHANGED)
+//   ROT_DIM : rotated-vector length (default 64 = GLM qk_rope_head_dim). Even.
 //   THETA   : RoPE base (default 8000000 = GLM-5.2 rope_theta = 8e6).
-//   LANES   : PAIRS processed/produced PER CYCLE (default 4).  Throughput knob:
-//             each cycle the unit consumes LANES pairs (= LANES*2 bf16 elts),
-//             rotates them, and emits LANES rotated pairs.  NPAIR must be a
-//             multiple of LANES.  Each lane has its own combinational CORDIC.
+//   LANES   : pairs processed/produced per cycle (default 4). NPAIR % LANES == 0.
 //   POSW    : width of the position input (default 20 -> POS in [0, 2^20-1]).
 //
 //----------------------------------------------------------------------------
-// INTERFACE  (clean req/valid handshake, deterministic latency, sync reset)
+// INTERFACE  (PORT LIST / TYPES / SEMANTICS UNCHANGED -- byte-identical to old)
 //   clk, rst              : synchronous, active-high reset.
 //   start                 : 1-cycle pulse to begin a new vector.
 //   pos    [POSW-1:0]      : token position; captured at start.
-//   --- input stream (unit pulls LANES pairs/cycle) ---
 //   in_req                : high while the unit wants the next input beat.
-//   x_in   [LANES*32-1:0]  : LANES pairs; lane j = {x[2i+1], x[2i]} packed as
-//                           x_in[32*j +: 32] = {bf16 odd, bf16 even}
-//                           (i.e. x_in[32*j +: 16] = x_even = x[2i],
-//                                 x_in[32*j+16 +:16] = x_odd  = x[2i+1]).
+//   x_in   [LANES*32-1:0]  : LANES pairs; x_in[32*j +:16]=x_even=x[2i],
+//                           x_in[32*j+16 +:16]=x_odd=x[2i+1].
 //   x_valid               : producer asserts when x_in holds the requested beat.
-//   --- output stream (LANES rotated pairs/cycle, input order) ---
 //   y_valid               : high when y_out holds a valid output beat.
 //   y_out  [LANES*32-1:0]  : LANES rotated pairs, same packing as x_in.
-//   --- status ---
 //   busy                  : high from start until done.
 //   done                  : 1-cycle pulse when the whole vector has been emitted.
 //
 //----------------------------------------------------------------------------
-// PIPELINE / LATENCY   (NBEATS = NPAIR/LANES)
+// PIPELINE / LATENCY   (UNCHANGED; NBEATS = NPAIR/LANES)
 //   S_IDLE -> (start) -> S_RUN (NBEATS beats, 1 beat/cycle when x_valid) -> S_DONE.
-//   Each S_RUN beat is fully combinational input->output (angle gen + CORDIC +
-//   rotate), registered once into y_out.  With the producer answering every
-//   in_req on the next cycle:
-//       latency(start -> done) = NBEATS + 2  cycles
-//       throughput             = LANES pairs/cycle (NPAIR/LANES beats/vector).
-//   Stalls (x_valid low) simply hold the beat; latency grows 1 cycle/stall.
+//   Each S_RUN beat is fully combinational input->output (turn gen + poly trig +
+//   rotate), registered once into y_out.
+//       latency(start -> done) = NBEATS + 2  cycles   (same as before)
+//       throughput             = LANES pairs/cycle.
+//   Stalls (x_valid low) hold the beat; latency grows 1 cycle/stall.
 //
 //----------------------------------------------------------------------------
-// CORRECTNESS / STYLE
-//   * Angle reduction EXACT in Q56 integer; cos/sin fp32 CORDIC (<=3.1e-5).
-//   * All FP arithmetic from glm_fp.vh (fp32_add/fp32_mul, bf16<->fp32).
-//   * Synchronous active-high reset; every reg written on every path (no
-//     inferred latch); no combinational loop (CORDIC is a feed-forward fp32_add
-//     chain, registered between beats).  No `real` -> yosys-synthesizable.
+// STYLE
+//   * Turn reduction via Q48 ROM + bit-truncate (no 128-bit modulo, no divide).
+//   * cos/sin: quadrant fold + fp32 Taylor (no CORDIC).
+//   * All FP arithmetic from glm_fp.vh.  Sync active-high reset; every reg
+//     written on every path (no latch); no combinational loop (trig is a
+//     feed-forward fp32 chain, registered between beats); no `real`.
 //============================================================================
 module rope_interleave_unit #(
     parameter integer ROT_DIM = 64,
@@ -120,16 +113,30 @@ module rope_interleave_unit #(
     localparam integer BAW    = (NBEATS <= 1) ? 1 : $clog2(NBEATS);
     localparam [BAW:0] LAST_BEAT = (BAW+1)'(NBEATS-1);
 
-    // 2*pi in Q56 (rounded).  reduced angle is computed as phase mod this.
-    localparam [127:0] TWO_PI_Q56 = 128'h06487ed5110b4600;
+    // turn fixed-point: F[i] = round(inv_freq[i]/(2*pi) * 2^BFR); phase = pos*F.
+    localparam integer BFR = 48;                       // fractional-turn bits
+    localparam integer PW  = POSW + BFR;               // phase width (pos*F)
 
-    // fp32 constants for the CORDIC fold + gain.
-    localparam [31:0] FP_PI      = 32'h40490FDB;   // pi
-    localparam [31:0] FP_PI_HALF = 32'h3FC90FDB;   // pi/2
-    localparam [31:0] FP_K       = 32'h3F1B74EE;   // 1/An (16-iter CORDIC gain)
+    // 1/(2*pi) in Q64 (round(2^64 / (2*pi))) -- exact integer constant.
+    localparam [127:0] INV_2PI_Q64 = 128'h0000000000000000_28BE60DB9391054A;
+
+    // fp32 constants for the trig polynomial.
+    localparam [31:0] FP_PI_HALF = 32'h3FC90FDB;       // pi/2
+    // sin Taylor coeffs in u = theta^2:  sin = th*(S0 + u*(S1 + u*(S2 + u*(S3 + u*S4))))
+    localparam [31:0] S0 = 32'h3F800000;               //  1
+    localparam [31:0] S1 = 32'hBE2AAAAB;               // -1/6
+    localparam [31:0] S2 = 32'h3C088889;               //  1/120
+    localparam [31:0] S3 = 32'hB9500D01;               // -1/5040
+    localparam [31:0] S4 = 32'h3638EF1D;               //  1/362880
+    // cos Taylor coeffs in u = theta^2:  cos = C0 + u*(C1 + u*(C2 + u*(C3 + u*C4)))
+    localparam [31:0] C0 = 32'h3F800000;               //  1
+    localparam [31:0] C1 = 32'hBF000000;               // -1/2
+    localparam [31:0] C2 = 32'h3D2AAAAB;               //  1/24
+    localparam [31:0] C3 = 32'hBAB60B61;               // -1/720
+    localparam [31:0] C4 = 32'h37D00D01;               //  1/40320
 
     //========================================================================
-    // ELABORATION-TIME PURE-INTEGER MATH  (builds INVF_Q56 ROM; yosys-friendly)
+    // ELABORATION-TIME PURE-INTEGER MATH  (builds the per-pair turn ROM)
     //========================================================================
     // log2 of a 128-bit integer x (x>=1) as a Q56 fixed-point value.
     function automatic [127:0] log2_q56(input [127:0] x);
@@ -153,8 +160,7 @@ module rope_interleave_unit #(
         end
     endfunction
 
-    // 2^f for f in [0,1) given Q56 -> Q56 value in [1,2).  Product of the
-    // precomputed Q56 constants 2^(2^-k) selected by the fractional bits.
+    // 2^f for f in [0,1) given Q56 -> Q56 value in [1,2).
     function automatic [127:0] exp2_frac_q56(input [127:0] f);
         integer k;
         reg [127:0] r, tab;
@@ -196,9 +202,7 @@ module rope_interleave_unit #(
         end
     endfunction
 
-    // INVF_Q56[idx] = THETA^(-2*idx/ROT_DIM) * 2^56  (an integer in (0, 2^56]).
-    //   value = 2^(-e),  e = (2*idx/ROT_DIM)*log2(THETA)  (Q56, >=0)
-    //   value*2^56 = 2^(56 - e); split (56 - e) into integer P + frac FR.
+    // inv_freq[idx] * 2^56  (an integer in (0, 2^56]).
     function automatic [127:0] invf_q56(input integer idx);
         reg [127:0] L2T, e_q56, fr, m, r;
         reg signed [127:0] E;
@@ -216,131 +220,114 @@ module rope_interleave_unit #(
         end
     endfunction
 
-    // INVF_Q56 ROM, ELABORATED ONCE into NPAIR constants.  Each entry is a
-    // CONSTANT (invf_q56 is called with a compile-time genvar), so the heavy
-    // log2/exp2 elaboration math constant-folds away to a fixed bit pattern --
-    // the synthesized hardware is a plain NPAIR x 128-bit ROM, NOT a live
-    // integer-pow datapath.  (Calling invf_q56 with a RUNTIME index would
-    // instead instantiate that datapath per lane; the genvar ROM avoids it.)
-    wire [127:0] invf_rom [0:NPAIR-1];
+    // F[idx] = round( inv_freq[idx] / (2*pi) * 2^BFR )  (turns per position, Q48).
+    //   inv_freq*2^56 (Q56) times 1/(2pi)*2^64 (Q64) = inv_freq/(2pi) * 2^120;
+    //   shift right (120-BFR) with round-to-nearest -> Q(BFR).
+    function automatic [PW-1:0] turn_per_pos(input integer idx);
+        reg [255:0] prod;
+        localparam integer SH = 120 - BFR;                       // = 72
+        begin
+            prod = invf_q56(idx) * INV_2PI_Q64;                  // Q120, < 2^118
+            prod = prod + (256'd1 << (SH-1));                    // round to nearest
+            turn_per_pos = prod[SH +: PW];                       // (>>SH) Q48 turns/pos
+        end
+    endfunction
+
+    // Per-pair turn ROM, ELABORATED ONCE into NPAIR constants (constant-folds to
+    // a plain ROM; the log2/exp2 datapath disappears because idx is a genvar).
+    wire [PW-1:0] turn_rom [0:NPAIR-1];
     genvar gp;
     generate
-        for (gp = 0; gp < NPAIR; gp = gp + 1) begin : GEN_INVF_ROM
-            assign invf_rom[gp] = invf_q56(gp);
+        for (gp = 0; gp < NPAIR; gp = gp + 1) begin : GEN_TURN_ROM
+            assign turn_rom[gp] = turn_per_pos(gp);
         end
     endgenerate
 
     //========================================================================
     // RUNTIME COMBINATIONAL PRIMITIVES
     //========================================================================
-    // 16-iteration fp32 CORDIC rotation, input angle a in [-pi/2,pi/2].
-    // returns {cos, sin} (each fp32).  Pure feed-forward fp32_add chain.
-    function automatic [63:0] cordic_raw(input [31:0] ang);
-        integer i;
-        reg [31:0] x, y, z, xn, yn, xi, yi;
-        reg        dneg;
-        reg [31:0] ATAN [0:15];
-        begin
-            ATAN[0]=32'h3F490FDB; ATAN[1]=32'h3EED6338; ATAN[2]=32'h3E7ADBB0;
-            ATAN[3]=32'h3DFEADD5; ATAN[4]=32'h3D7FAADE; ATAN[5]=32'h3CFFEAAE;
-            ATAN[6]=32'h3C7FFAAB; ATAN[7]=32'h3BFFFEAB; ATAN[8]=32'h3B7FFFAB;
-            ATAN[9]=32'h3AFFFFEB; ATAN[10]=32'h3A7FFFFB; ATAN[11]=32'h39FFFFFF;
-            ATAN[12]=32'h39800000; ATAN[13]=32'h39000000; ATAN[14]=32'h38800000;
-            ATAN[15]=32'h38000000;
-            x = FP_K; y = 32'h0; z = ang;
-            for (i = 0; i < 16; i = i + 1) begin
-                dneg = z[31];                                     // z<0 ?
-                // xi = x * 2^-i via exponent decrement (0 if it would underflow)
-                xi = (x[30:23] > i[7:0]) ? {x[31], x[30:23]-i[7:0], x[22:0]} : 32'h0;
-                yi = (y[30:23] > i[7:0]) ? {y[31], y[30:23]-i[7:0], y[22:0]} : 32'h0;
-                if (!dneg) begin
-                    // rotate by -atan(2^-i):  x-=yi, y+=xi, z-=atan
-                    xn = fp32_add(x, {~yi[31], yi[30:0]});
-                    yn = fp32_add(y, xi);
-                    z  = fp32_add(z, {1'b1, ATAN[i][30:0]});
-                end else begin
-                    // rotate by +atan(2^-i):  x+=yi, y-=xi, z+=atan
-                    xn = fp32_add(x, yi);
-                    yn = fp32_add(y, {~xi[31], xi[30:0]});
-                    z  = fp32_add(z, ATAN[i]);
-                end
-                x = xn; y = yn;
-            end
-            cordic_raw = {x, y};
-        end
-    endfunction
-
-    // cos/sin of an fp32 angle a in [-pi,pi]: fold |a|>pi/2 into [-pi/2,pi/2]
-    // (a -> sign(a)*(pi-|a|), cos flips sign), then CORDIC.
-    function automatic [63:0] cossin(input [31:0] a);
-        reg [31:0] aa, c, s;
-        reg [63:0] cs;
-        reg        negc;
-        // `ad` = fp32(pi-|a|), always >=0 so its sign bit [31] is computed but
-        // never read (we re-attach the original sign).  Waive the unused-bit lint.
+    // Convert a 46-bit unsigned fraction (value/2^46 in [0,1)) to fp32.
+    function automatic [31:0] frac46_to_fp32(input [45:0] fbits);
+        integer i, msb, e;
+        reg [22:0] m23;
         /* verilator lint_off UNUSEDSIGNAL */
-        reg [31:0] ad;
+        reg [68:0] norm;                                         // only low 23 read
         /* verilator lint_on UNUSEDSIGNAL */
         begin
-            aa = a; negc = 1'b0;
-            if ({1'b0, aa[30:0]} > FP_PI_HALF) begin
-                ad   = fp32_add(FP_PI, {1'b1, aa[30:0]});         // pi - |a|
-                aa   = {a[31], ad[30:0]};                         // keep sign
-                negc = 1'b1;
-            end
-            cs = cordic_raw(aa);
-            c  = cs[63:32];
-            s  = cs[31:0];
-            if (negc) c = {c[31]^1'b1, c[30:0]};
-            cossin = {c, s};
-        end
-    endfunction
-
-    // convert a reduced Q56 angle in [0, 2*pi) to an fp32 angle in [-pi,pi].
-    function automatic [31:0] q56_to_fp32_centered(input [127:0] q);
-        reg [127:0] mag, HALF, FULL;
-        reg         sgn;
-        integer     msb, i, e;
-        reg [22:0]  m23;
-        // `norm` is a 128-bit shifter result; only its low 23 bits (the fp32
-        // mantissa) are read -- the high bits are the implicit-1 + above, never
-        // stored.  Waive the unused-upper-bits lint exactly as glm_fp.vh does.
-        /* verilator lint_off UNUSEDSIGNAL */
-        reg [127:0] norm;
-        /* verilator lint_on UNUSEDSIGNAL */
-        begin
-            HALF = TWO_PI_Q56 >> 1;
-            FULL = TWO_PI_Q56;
-            if (q >= HALF) begin sgn = 1'b1; mag = FULL - q; end  // -> negative
-            else           begin sgn = 1'b0; mag = q;        end  // [0,pi]
             msb = -1;
-            for (i = 0; i < 128; i = i + 1) if (mag[i]) msb = i;
-            if (msb < 0) q56_to_fp32_centered = 32'h0;            // angle 0
+            for (i = 0; i < 46; i = i + 1) if (fbits[i]) msb = i;
+            if (msb < 0) frac46_to_fp32 = 32'h0;                 // exactly 0
             else begin
-                e = msb - 56;                                    // value exponent
-                // align the implicit leading 1 (at msb) to bit 23; mantissa =
-                // the 23 fraction bits just below it.
-                if (msb >= 23) norm = mag >> (msb - 23);
-                else           norm = mag << (23 - msb);
+                e = msb - 46;                                    // value exponent
+                if (msb >= 23) norm = {23'd0, fbits} >> (msb - 23);
+                else           norm = {23'd0, fbits} << (23 - msb);
                 m23 = norm[22:0];
-                q56_to_fp32_centered = {sgn, 8'(e + 127), m23};
+                frac46_to_fp32 = {1'b0, 8'(e + 127), m23};
             end
+        end
+    endfunction
+
+    // cos/sin of theta in [0, pi/2] (fp32) via Horner Taylor; returns {cos,sin}.
+    function automatic [63:0] cossin_quad(input [31:0] th);
+        reg [31:0] u, sp, cp, sinv, cosv;
+        begin
+            u = fp32_mul(th, th);                                // theta^2
+            // sin = th * (S0 + u(S1 + u(S2 + u(S3 + u*S4))))
+            sp   = fp32_add(S3, fp32_mul(u, S4));
+            sp   = fp32_add(S2, fp32_mul(u, sp));
+            sp   = fp32_add(S1, fp32_mul(u, sp));
+            sp   = fp32_add(S0, fp32_mul(u, sp));
+            sinv = fp32_mul(th, sp);
+            // cos = C0 + u(C1 + u(C2 + u(C3 + u*C4)))
+            cp   = fp32_add(C3, fp32_mul(u, C4));
+            cp   = fp32_add(C2, fp32_mul(u, cp));
+            cp   = fp32_add(C1, fp32_mul(u, cp));
+            cosv = fp32_add(C0, fp32_mul(u, cp));
+            cossin_quad = {cosv, sinv};
+        end
+    endfunction
+
+    // cos/sin from a Q48 turn fraction.  Bits [47:46] = quadrant; the remaining
+    // 46 bits scale to theta in [0,pi/2].  Apply quadrant sign/swap.
+    function automatic [63:0] cossin_turn(input [BFR-1:0] frac);
+        reg [1:0]  q;
+        reg [31:0] r, th, cs_lo, cs_hi, sinv, cosv, cf, sf;
+        reg [63:0] cs;
+        begin
+            q  = frac[BFR-1 -: 2];                               // quadrant 0..3
+            r  = frac46_to_fp32(frac[BFR-3 -: 46]);              // r in [0,1)
+            th = fp32_mul(r, FP_PI_HALF);                        // theta in [0,pi/2)
+            cs = cossin_quad(th);
+            cosv = cs[63:32];
+            sinv = cs[31:0];
+            case (q)
+                2'd0: begin cf = cosv;                  sf = sinv;                  end
+                2'd1: begin cf = {~sinv[31], sinv[30:0]}; sf = cosv;                end
+                2'd2: begin cf = {~cosv[31], cosv[30:0]}; sf = {~sinv[31], sinv[30:0]}; end
+                default: begin cf = sinv;               sf = {~cosv[31], cosv[30:0]}; end
+            endcase
+            cs_hi = cf; cs_lo = sf;
+            cossin_turn = {cs_hi, cs_lo};
         end
     endfunction
 
     //========================================================================
     // PER-LANE COMBINATIONAL DATAPATH
-    //   For the current beat, lane j handles pair index (beat*LANES + j).
-    //   angle_j = POS * INVF_Q56[pair] mod 2pi  (exact integer), -> fp32 ->
-    //   cos/sin -> rotate (x0,x1) -> {y1,y0} bf16.
+    //   lane j handles pair index (beat*LANES + j):
+    //   phase = POS * F[pair];  frac_turns = phase[BFR-1:0]  (mod-1 = truncate);
+    //   cos/sin from frac_turns; rotate (x0,x1) -> {y1,y0} bf16.
     //========================================================================
     reg  [POSW-1:0]      pos_q;                                   // captured POS
     reg  [BAW:0]         beat;
 
     integer              j;
-    reg  [127:0]         phase_j;
-    reg  [127:0]         red_j;
-    reg  [31:0]          ang_j;
+    // phase_j high bits [PW-1:BFR] are the whole-turn count, intentionally
+    // discarded (mod-1 reduction keeps only [BFR-1:0]).  Waive the unused-upper
+    // lint, exactly as glm_fp.vh does for its wide intermediates.
+    /* verilator lint_off UNUSEDSIGNAL */
+    reg  [PW-1:0]        phase_j;
+    /* verilator lint_on UNUSEDSIGNAL */
+    reg  [BFR-1:0]       frac_j;
     reg  [63:0]          cs_j;
     reg  [31:0]          cos_j, sin_j;
     reg  [31:0]          x0_j, x1_j;
@@ -351,12 +338,11 @@ module rope_interleave_unit #(
     always @* begin
         rot_beat = {LANES*32{1'b0}};
         for (j = 0; j < LANES; j = j + 1) begin : LANE
-            // pair index this lane processes (beat*LANES + j); INVF ROM lookup
-            phase_j = {{(128-POSW){1'b0}}, pos_q}
-                      * invf_rom[32'(beat) * LANES + j];
-            red_j   = phase_j % TWO_PI_Q56;                       // exact mod
-            ang_j   = q56_to_fp32_centered(red_j);
-            cs_j    = cossin(ang_j);
+            // pair index this lane processes (beat*LANES + j); turn ROM lookup
+            phase_j = {{(PW-POSW){1'b0}}, pos_q}
+                      * turn_rom[32'(beat) * LANES + j];
+            frac_j  = phase_j[BFR-1:0];                          // (pos*invf/2pi) mod 1
+            cs_j    = cossin_turn(frac_j);
             cos_j   = cs_j[63:32];
             sin_j   = cs_j[31:0];
             // x_in lane packing: [32*j +:16]=x_even=x0, [32*j+16 +:16]=x_odd=x1
@@ -375,7 +361,7 @@ module rope_interleave_unit #(
     end
 
     //========================================================================
-    // FSM
+    // FSM  (UNCHANGED)
     //========================================================================
     localparam [1:0] S_IDLE=2'd0, S_RUN=2'd1, S_DONE=2'd2;
     reg [1:0] state;
