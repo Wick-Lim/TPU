@@ -1,254 +1,162 @@
-# TPU v2.0 — a small, real, self-checking tensor-processing core (Verilog)
+# TPU — a GLM-5.2-FP8 inference accelerator in Verilog
 
-A synthesizable Verilog model of a tensor/AI accelerator: a classic **5-stage
-scalar pipeline** (IF → ID → EX → MEM → WB) with full data-hazard forwarding and
-load-use stalls, augmented with a **variable-length busy stall** that hands
-multi-cycle tensor instructions off to dedicated compute units operating on real
-tensor tiles in an on-chip **tile memory**.
+A synthesizable Verilog accelerator whose single deliverable goal is to **run one
+real model well: [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8)** —
+the published FP8 checkpoint of GLM-5.2 (`GlmMoeDsaForCausalLM`). The full GLM-5.2
+operator datapath is built and verified at a small-but-faithful slice, the complete
+forward pass produces correct next tokens, and the datapath is being re-targeted to
+**native FP8 E4M3** to match the published checkpoint and to fit real silicon.
 
-This is v2.0: every "tensor" EX unit is a **real algorithm on real tiles** with
-full-width fixed-point arithmetic and an explicit, documented Q-format contract —
-it supersedes the v1.5 toy core (which packed "matrices" into single 32-bit words).
+Underneath sits a classic **5-stage scalar TPU core** (the original *TPU v2.0*, see
+[`SPEC.md`](SPEC.md)) used as the control/integration substrate; this README leads
+with the GLM-5.2 accelerator, which is the active work.
 
-The normative documents are:
-- **[`SPEC.md`](SPEC.md)** — microarchitecture, sizes, fixed-point contract, per-unit design.
-- **[`docs/ISA.md`](docs/ISA.md)** — instruction encodings, register model, illegal-opcode behavior.
-- **[`src/tpu_defs.vh`](src/tpu_defs.vh)** — the single source of truth for opcodes, sizes, field positions, and the shared rounding/saturation macros.
+The normative documents:
+- **[`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md)** — the GLM-5.2 accelerator architecture: exact config, MLA + DSA + MoE detail, the fp64-golden methodology, the memory/streaming system, and the RTL build order.
+- **[`SPEC.md`](SPEC.md)** / **[`docs/ISA.md`](docs/ISA.md)** — the underlying scalar TPU core microarchitecture + ISA.
 
 ---
 
-## What the core is
+## The target: `zai-org/GLM-5.2-FP8`
 
-Two architecturally distinct operand domains:
+GLM-5.2 is a 753B-param MoE model (≈40B active/token). The published checkpoint is
+FP8, and its `config.json` *quantization_config* is what drives the hardware:
 
-| Domain | Storage | Used by |
+| Field | Value | Hardware consequence |
 |---|---|---|
-| **Scalar** | register file `RF` (16 × 32-bit, `r0` hardwired 0) + data memory `DMEM` (256 × 32-bit) | control/address/ALU math, LOADI, loads/stores, DMA, gather/scatter |
-| **Tensor** | tile memory `TM` (32 × 128-bit lines = 4 × 32-bit lanes) | GEMM, CONV2D, SOFTMAX, ATTENTION, fused RELU post-ops |
+| `quant_method` / `fmt` | **fp8 / e4m3** | a 4-bit-exponent / 3-bit-mantissa float multiply (a 4×4 mantissa multiply) |
+| `weight_block_size` | **[128, 128]** | one bf16 dequant scale per 128×128 weight block (block-scaled accumulation) |
+| `activation_scheme` | **dynamic** | activations quantized to E4M3 at runtime (per-token pow2 scale, derived on-chip) |
+| `modules_to_not_convert` | norms / router / embed / lm_head | those stay **bf16** — so our "bf16 tail" matches the checkpoint, it is not an approximation |
 
-Tensor instructions are **TM → TM**: they name tiles by a 5-bit base line index
-(from a register or an immediate), read operands directly out of `TM`
-combinationally, run a per-unit FSM, and write result tile(s) back through a
-dedicated `TM` write port. On completion they retire a scalar **status word** to
-`rC` (saturation / unit id / argmax) so software can branch on it.
+Architecture (the slice preserves every ratio): hidden 6144, 78 layers
+(`first_k_dense_replace=3`), 64 heads (`head_dim=192`), **MLA** latent attention
+(`qk_nope 192 + qk_rope 64`, `v 256`, `kv_lora 512`, `q_lora 2048`), **MoE** 256
+experts top-8 + 1 shared (`moe_intermediate 2048`), dense `intermediate 12288`,
+**DSA** sparse attention (`index_topk 2048`), vocab 154880, 1M context,
+`rope_theta 8e6` interleaved, RMSNorm `eps 1e-5`, MTP (`num_nextn_predict_layers 1`).
 
-### Real algorithms (committed default sizes)
+### Verification stance
 
-| Unit | Algorithm | Size | Q-format | start→done latency |
-|---|---|---|---|---|
-| `gemm_systolic.v` | output-stationary systolic GEMM `C=A·B` | 4×4 | `Q7.8` data, `Q15.16` 48-bit accum | **11** |
-| `conv2d_unit.v` | true 2-D line/window-buffered convolution | 8×8 ∗ 3×3 (valid → 6×6) | `Q7.8`, `Q15.16` accum | **48** = 11 load + 36 compute + 1 done |
-| `softmax_unit.v` | exp-softmax (64-entry `exp(-k·0.25)` LUT + degree-4 Maclaurin residual; exact integer-divide reciprocal in `Q1.30`) | len 8 | `Q7.8` in, `Q0.16` probs | **23** (inclusive of start edge) |
-| `attention_unit.v` | scaled-dot-product attention `softmax(Q·Kᵀ/√d)·V` (reuses `softmax_unit` per row) | seq=4, d=4 | `Q7.8`, 48-bit accums | **123** = SETUP 13 + 4×27 + TAIL 2 |
-| `fused_ops_unit.v` | tile-domain elementwise RELU post-op (packing-aware: 32-bit lane for GEMM, dense-16 for CONV) | one TM line/cycle | `Q7.8` | combinational; sweeps the full result tile |
-
-All narrowing is **round-half-up then saturate**, with a sticky `sat` flag in the
-status register — there is no silent truncation. The shared narrowing macros live
-in `tpu_defs.vh` so no two units can diverge on the arithmetic contract.
-
-### Pipeline & hazards
-
-- Combinational RF read (3 ports, `r0=0`); combinational DMEM read (dual-port for DMA); synchronous writes; synchronous reset on all state.
-- A control decoder emits per-opcode `writes_reg / mem_read / mem_write / uses_tensor` (never `opcode != 0`).
-- Full operand **forwarding** from EX, EX/MEM, MEM/WB into the ID operand path; an EX-stage tensor producer forwards its **status word** (not the raw eff-addr) to a directly-dependent consumer.
-- One-cycle **load-use stall** for LOAD/GATHER/DMA producers; the rC-consumer set covers SCATTER **and ATTENTION** (whose `o_base` is read from `rC`).
-- Multi-cycle tensor ops freeze IF/ID/EX on a **busy stall**; the shared `TM` port is held by a draining scalar `TLOAD/TSTORE` until it fully retires (the tensor dispatch FSM waits in IDLE), preserving one-live-TM-consumer.
-- Illegal opcode → `illegal_opcode` flag + sticky status bit + safe NOP (no architectural side effects).
+We verify that **our RTL computes the FP8 operations correctly**, against a *faithful
+FP8 reference* (the same E4M3 + [128,128] block-scale arithmetic, in fp64). We do
+**not** try to prove "FP8 ≈ an fp32 ideal model" — the GLM authors already shipped
+FP8, so model quality is their concern, not the accelerator's.
 
 ---
 
-## Parameterized tensor units
+## Status
 
-The four tensor units are **module-parameterized** over their tile sizes, with the
-defaults set to the committed `tpu_defs.vh` sizes so that an unparameterized
-instance is **byte-identical in behavior** to the original fixed design (the
-per-unit TBs still pass with the same assertion counts). Every internal index,
-counter width (`$clog2`-derived), loop bound, and packing index is derived from
-the parameter — no hardcoded size literals or mod-4 bit tricks remain.
+### bf16 reference datapath — COMPLETE (the dev scaffold + golden)
 
-| Unit | Module parameter(s) | Default | Supported range | 2nd-size proof |
-|---|---|---|---|---|
-| `gemm_systolic.v` | `N` | `GEMM_N`=4 | `2 ≤ N ≤ 4` | `gemm_systolic_tb` runs N=2/N=3 |
-| `conv2d_unit.v` | `IMG_H`, `IMG_W`, `K` | 8/8/3 | `IMG_W,K ≤ 8`; `K ≤ IMG_H,IMG_W` | `test/conv2d_param_tb.v` (6×6∗3 → 4×4) |
-| `softmax_unit.v` | `LEN` | `SM_LEN`=8 | `2 ≤ LEN ≤ 32` | `test/softmax_param_tb.v` (LEN=4 and LEN=16) |
-| `attention_unit.v` | `SEQ`, `D` | 4/4 | `D ≤ 4`, `SEQ ≤ 8` | `test/attention_param_tb.v` (SEQ=2/D=2) |
+Every GLM-5.2 operator, built and verified against an independent fp64 X-aware golden,
+committed to `main`. The **full model forward pass runs and predicts the correct next
+token**.
 
-> **Supported-range caveat (the architectural bound).** Per-row packing is bounded
-> by **`LINE_LANES = 4`**: one matrix/feature/Q-K-V row is packed into **one
-> 128-bit TM line of 4 lanes**, baked into `tpu_defs.vh` / `tile_memory.v` /
-> `tpu_top.v`. So GEMM `N` and attention `D` cannot exceed 4, and a conv image/kernel
-> row cannot exceed 8 columns (4 lanes × 16-bit dense pack). softmax is a 1-D
-> reduction that spans `ceil(LEN/4)` lines, so it scales to `LEN ≤ 32`, but its
-> `argmax` status port stays a 3-bit architectural field (exact for `LEN ≤ 8`).
-> **Arbitrary sizes beyond these bounds need a multi-line-per-row TM
-> re-architecture** (a TM port / packing change) and are out of scope for these
-> units. The 2nd-size proofs above each check an in-range size against an
-> independent `real` golden; `make unittests` builds and runs them.
+| Layer | Units |
+|---|---|
+| FP primitives | `glm_fp.vh`, `glm_fp_pipe.v` (pipelined add/mul/mac/rsqrt/exp) |
+| Ops | `rmsnorm_unit`, `topk_select`, `glm_matmul(_pipe)`, `glm_act`, `rope_interleave_unit` (lean cos/sin-LUT rebuild, 10.5× smaller), `glm_softmax` |
+| Attention | `dsa_indexer` (DSA IndexShare), `mla_attn` (full MLA) |
+| FFN / MoE | `swiglu_expert`, `moe_router` |
+| Integration | `glm_decoder_block` (one full layer, 10/10), **`glm_model` (full forward pass, 5/5, next-token argmax matches golden)** |
+| Output | `sampler`, `mtp_head` (t+2 speculative) |
 
----
+### FP8 E4M3 datapath — IN PROGRESS
 
-## AXI4-Lite wrapper (`src/tpu_axi.v`)
+Re-targeting every **weight** matmul to native FP8 E4M3 (4×4 mantissa multiply → fp32
+accumulate → per-[128,128]-block scale → bf16), keeping norms/softmax/rope/residual and
+the activation×activation attention matmuls in bf16.
 
-`src/tpu_axi.v` (module `tpu_axi`) is an **AXI4-Lite SLAVE** wrapper that makes the
-verified core a drop-in, SoC-integratable IP. **The core is wrapped, never edited.**
-
-- **Single clock domain.** `ACLK` drives both the AXI slave logic and the core;
-  `ARESETn` is active-LOW (`core.rst = ~ARESETn`), assumed synchronous to `ACLK`.
-- **Single-step issue model.** The wrapper owns the core's `instruction_in`. A host
-  writes the `INSTR` register, then writes `CTRL.STEP`, which drives `INSTR` onto
-  `instruction_in` for **exactly one `ACLK` cycle** (the cycle the W-channel write
-  commits); every other cycle `instruction_in` is forced to `NOP`. A program runs
-  by issuing INSTR-then-STEP per instruction in sequence and reading `RESULT`/`STATUS`
-  back after the pipeline latency.
-- **Five channels** AW/W/B/AR/R with registered VALID/READY handshakes (no
-  combinational handshake loops); single outstanding transaction.
-
-Register map (32-bit registers; byte address = word offset × 4):
-
-| Byte | Name | Access | Meaning |
-|---|---|---|---|
-| `0x00` | `CTRL`/`STEP` | W | bit0 `STEP` → issue `INSTR` for one cycle; bit1 `CLR_ILL` → clear sticky illegal. R: bit0 `STEP_DONE`, bit1 `LAST_ILL` |
-| `0x04` | `INSTR` | RW | the 32-bit instruction word to issue (WSTRB-honoured RMW) |
-| `0x08` | `RESULT` | RO | mirror of core `result_out` (committed WB word) |
-| `0x0C` | `STATUS` | RO | bit0 sticky `illegal_opcode`, bit1 live `illegal_opcode`, bit2 `STEP_DONE` |
-
-Mapped accesses return `OKAY` (`2'b00`); unmapped offsets read 0 / drop writes and
-return `SLVERR` (`2'b10`). `make axi` builds and runs the BFM testbench
-(`test/tpu_axi_tb.v`), which drives a real program through the AW/W/B/AR/R channels
-and checks it against independent goldens → `ALL N TESTS PASSED`.
+| Unit | What is FP8 | Verification |
+|---|---|---|
+| `fp8_e4m3.vh` | E4M3 decode / encode-RNE+saturate / 4×4 mantissa multiply | **exhaustive** — ALL 66069 (256 decodes + all 256×256 multiply pairs vs fp64) |
+| `glm_matmul_fp8.v` | block-scaled FP8 GEMM ([128,128], dynamic act) | 224 tests, worst err/tol 0.43 |
+| `swiglu_expert_fp8.v` | gate/up/down GEMMs FP8, bf16 silu tail | 1024 tests, dense + MoE |
+| `mla_attn_fp8.v` | 7 weight projections FP8, bf16 attention/rope/norm/softmax/dsa | 7 tests, worst rel-err 0.39% |
+| `moe_router_fp8.v` | gate GEMV FP8, bf16 sigmoid/topk/renorm | 185 tests, top-K indices exact |
+| `glm_decoder_block_fp8.v` | assembles the FP8 leaf units | *building* |
+| `glm_model_fp8.v` | full FP8 forward pass | *next* |
 
 ---
 
-## PPA flow (`make ppa`, [`docs/PPA.md`](docs/PPA.md))
+## Tang Nano 20K (Gowin GW2A-18) — why FP8
 
-`make ppa` runs **Yosys `synth_ecp5`** to map each tensor unit (and the full TPU
-top) to real Lattice **ECP5** FPGA primitives and reports:
+Measured (Yosys `synth_gowin`) fit on the GW2A-18 (budget: ~20,736 LUT4, ~15,552 FF,
+~48 DSP, 46×18Kb BSRAM, + 8 MB on-board PSRAM):
 
-- **Area** — measured per-primitive cell counts (LUT4, TRELLIS_FF, MULT18X18D DSP,
-  DP16KD BRAM, CCU2C carry, mux primitives) from the post-synth `stat`.
-- **Timing proxy** — `ltp` longest topological **logic-cell depth** for the four
-  tensor units (a structural depth metric, **not** a routed delay; the full TPU top
-  is area-only to keep the run fast).
+- **fp32 does NOT fit** — `mla_attn` alone ≈ **396 DSP-equiv** (8× the device), because
+  each fp32 multiply maps to ~4 DSP (a 24×24 mantissa multiply).
+- **FP8 frees the scarce DSP** — its 4×4 mantissa multiply sips DSP and spends the
+  plentiful LUT instead (the opposite resource profile). On a DSP-constrained device
+  this is the enabling change; the precise decoder-block LUT fit is being measured with
+  the FP8 synth.
 
-Filtered per-unit logs land in `build/ppa/<unit>.log`. **Area is measured; routed
-`fmax`/power are NOT** — those need place-and-route (`nextpnr-ecp5`), which is not
-installed here. The deepest combinational path is `attention_unit` (ltp 2250) >
-`softmax_unit` (1580), which is the actionable signal for the future pipelining
-work. See [`docs/PPA.md`](docs/PPA.md) for the full report, methodology, and honesty
-notes, and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is intentionally deferred.
+A *real flashable bitstream* additionally needs the open-source Gowin P&R
+(`nextpnr-himbaechel`/apicula) installed and the physical board; `synth_gowin` here
+gives the resource-fit answer without it.
 
 ---
 
-## ISA summary
+## Scale honesty
 
-8-bit opcode, two 32-bit instruction formats (R-format and the I-format `LOADI`).
-Full table, semantics, and field positions are in **[`docs/ISA.md`](docs/ISA.md)**;
-the encodings are defined once in **[`src/tpu_defs.vh`](src/tpu_defs.vh)**.
+The committed RTL is a **small-but-faithful slice** (MODEL_DIM=128, 6 layers, 4 heads,
+MLA nope16/rope16/v32, q_lora64/kv_lora32, 8-expert top-2 + shared, VOCAB=256) — every
+operator and ratio of GLM-5.2 is present, sized for near-exhaustive verification. The
+slice *proves the computation is correct and complete*. Running the real 753B model fast
+additionally needs the hundreds-of-GB memory/streaming system documented in
+[`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md) (multi-chip / host-streaming territory, even
+in FP8 ≈ 753 GB) and array scaling — a chip+system effort beyond the RTL slice.
 
-Classes: scalar/control (`NOP, LOADI, LOAD, STORE, ADD/SUB/AND/OR/XOR/SHL/SHR,
-RELU, ADDI, RDSTATUS, CLRSTATUS`), memory-movement (`DMA, GATHER, SCATTER`),
-tile transfer (`TLOAD, TSTORE`), tensor compute (`GEMM, CONV2D, SOFTMAX,
-ATTENTION`), fused (`FUSE_GEMM_RELU, FUSE_CONV_RELU`). Any unassigned opcode is
-illegal.
+---
 
-Programs seed all state through `LOADI` + `STORE`/`TLOAD` — there are **no
-hierarchical testbench pokes** for program-visible state.
+## Underlying scalar TPU core (substrate)
+
+A classic **5-stage scalar pipeline** (IF→ID→EX→MEM→WB) with full data-hazard
+forwarding, load-use stalls, and a variable-length busy stall that hands multi-cycle
+tensor instructions to dedicated compute units operating on real tiles in an on-chip
+tile memory. Includes parameterized tensor units (`gemm_systolic`, `conv2d_unit`,
+`softmax_unit`, `attention_unit`), an AXI4-Lite slave wrapper (`tpu_axi.v`), and a Yosys
+`synth_ecp5` PPA flow. Full detail in [`SPEC.md`](SPEC.md), [`docs/ISA.md`](docs/ISA.md),
+[`docs/PPA.md`](docs/PPA.md).
 
 ---
 
 ## Toolchain
 
 ```sh
-# Icarus Verilog (sim), Verilator (lint), Yosys (synth check), GTKWave (optional)
+# Icarus Verilog (sim), Verilator (lint), Yosys (synth + synth_gowin fit)
 brew install icarus-verilog verilator yosys
-brew install gtkwave        # optional, waveform viewer
 ```
 
-## Build / test / lint / synth / wave (Makefile)
+iverilog/vvp 13.0, verilator 5.048, yosys 0.66. Every GLM-5.2 unit is verified against
+an independent fp64 / faithful-fp8 X-aware golden; on success a TB prints
+`ALL N TESTS PASSED`, on any mismatch it prints the failing case and `$fatal`s.
+
+## Build / test
 
 ```sh
-make build      # compile design + system TB           -> build/tpu_sim
-make test       # build, run system integration TB      -> ALL N TESTS PASSED
-make hazard     # build, run hazard/pipeline TB          -> ALL N TESTS PASSED
-make unittests  # build+run every per-unit TB + the 4 param 2nd-size proofs
-                #   (conv2d_param, attention_param, softmax_param) + the AXI BFM TB
-make axi        # build+run the AXI4-Lite BFM TB on src/tpu_axi.v -> ALL N TESTS PASSED
-make ppa        # yosys synth_ecp5 area (+ ltp logic-depth) per unit -> build/ppa/*.log
-make lint       # verilator --lint-only -Wall on the whole design -> clean
-make synth      # yosys elaborate/synth gate (no error, no latch)
-make wave       # run system TB, leave ./tpu_waveform.vcd (a real VCD)
-make clean      # remove build/ and generated *.vcd
+make unittests   # build+run every per-unit TB, including the GLM-5.2 + FP8 units
+make lint        # verilator --lint-only -Wall on the design
+make synth       # yosys elaborate/synth gate (no error, no latch)
 ```
 
-`make all` runs `test hazard unittests lint synth`. The `axi` and `ppa` targets
-are separate gates (`unittests` itself also builds+runs the AXI BFM TB and the
-three parameterized 2nd-size proofs).
-
-Each TB is self-checking: on success it prints `ALL N TESTS PASSED`; on any
-mismatch it prints the failing case and exits non-zero via `$fatal`.
-
-## Raw commands (canonical compile)
-
-`-o` names the **simulation binary**, not the VCD; the VCD is produced at run
-time by `$dumpfile`/`$dumpvars`.
+Per-GLM-unit canonical compile (list sources explicitly — zsh does not word-split):
 
 ```sh
 mkdir -p build
-iverilog -g2012 -Wall -I src -o build/tpu_sim \
-    test/tpu_tb.v \
-    src/tpu_top.v src/instruction_decoder.v src/register_file.v src/memory.v \
-    src/tile_memory.v src/vector_alu.v src/dma_controller.v src/scatter_gather.v \
-    src/gemm_systolic.v src/conv2d_unit.v src/softmax_unit.v src/attention_unit.v \
-    src/fused_ops_unit.v
-vvp build/tpu_sim                # runs the sim, writes ./tpu_waveform.vcd
+# full bf16 forward-pass capstone:
+iverilog -g2012 -Wall -I src -o build/glm_model_sim \
+    test/glm_model_tb.v src/glm_model.v src/glm_decoder_block.v src/rmsnorm_unit.v \
+    src/mla_attn.v src/rope_interleave_unit.v src/glm_matmul_pipe.v src/dsa_indexer.v \
+    src/glm_softmax.v src/topk_select.v src/glm_act.v src/swiglu_expert.v \
+    src/moe_router.v src/sampler.v src/glm_fp_pipe.v
+vvp build/glm_model_sim          # -> ALL 5 TESTS PASSED (next-token argmax matches golden)
 
-# lint and synth gates
-verilator --lint-only -Wall -Isrc --top-module TPU src/*.v
-yosys -q -p "read_verilog -sv -I src src/*.v; hierarchy -top TPU -check; proc; opt; check -assert; stat"
+# FP8 E4M3 primitives (exhaustive):
+iverilog -g2012 -Wall -I src -o build/fp8 test/fp8_e4m3_tb.v && vvp build/fp8   # ALL 66069 TESTS PASSED
 
-# verify a real VCD was written
-grep -c '^#' tpu_waveform.vcd    # number of timestamps, must be > 0
-gtkwave tpu_waveform.vcd         # optional: inspect the waveform
+# GW2A-18 (Tang Nano 20K) resource fit for an FP8 unit:
+yosys -p "read_verilog -sv -I src src/glm_matmul_fp8.v src/glm_fp_pipe.v; \
+          synth_gowin -top glm_matmul_fp8; stat"
 ```
-
-## Verification
-
-- **Per-unit self-checking TBs** (`test/<unit>_tb.v`): each scalar and tensor unit
-  standalone, with an **independent `real`-typed golden model** (floating
-  matmul/conv/exp/softmax/attention) computed differently from the DUT, plus
-  directed corner cases and constrained-random sweeps. The golden never shares
-  the DUT's fixed-point path, so the two cannot share a bug.
-- **Hazard/pipeline TB** (`test/hazard_tb.v`): back-to-back RAW forwarding,
-  load-use stalls, tensor busy stalls, the ATTENTION `o_base` load-use stall,
-  illegal-opcode handling, `r0`-write-ignored, LOADI seeding.
-- **System integration TB** (`test/tpu_tb.v`): a program-driven end-to-end run
-  covering every opcode against an end-to-end `real` reference, leaving a real VCD.
-
----
-
-## Scope & limitations (honest)
-
-- **Small fixed sizes by design.** 4×4 GEMM, 8×8∗3×3 conv, len-8 softmax, seq=4/d=4
-  attention. These are small enough for near-exhaustive directed + random
-  verification yet each exercises the *full* algorithm (a genuine systolic array,
-  genuine line/window buffers, a genuine LUT exp, a real Q·Kᵀ→softmax→·V). They
-  are not tuned for throughput.
-- **One committed Q-format per op** (`Q7.8` data, 48-bit accumulators, `Q0.16`
-  probabilities). softmax/attention use a LUT-based exp, so their unit TBs compare
-  to a small documented tolerance (±1–2 LSB); GEMM/CONV/FUSE are bit-exact.
-- **No instruction memory / branches / interrupts.** The core executes the
-  instruction presented on `instruction_in` each cycle (the TB acts as a fetch
-  unit that freezes on `dbg_pipe_stall`). There is no PC, branch, or exception
-  model beyond illegal-opcode → safe NOP.
-- **`DMEM` is 256 words.** `DMA` length is encoded in `imm12` but **saturates to
-  256** (it does not wrap); copies longer than the memory are meaningless.
-- **`ATTENTION` overloads `rC`**: its value supplies the `o_base` at dispatch and
-  is then overwritten by the status word on retire — do not assume `rC` survives
-  an ATTENTION (documented in `docs/ISA.md` §3).
-- **Tile memory has no ECC / no banking.** A single shared 2R+1W port is
-  arbitrated so exactly one consumer (a tensor unit, or a scalar `TLOAD/TSTORE`)
-  is live at a time.
-
-The v1.5 toy units (`matrix_multiply.v` / `convolution_unit.v`) and their packed-
-scalar "tensor" ops have been **removed**; consult `SPEC.md` / `docs/ISA.md` for
-the current architecture.
