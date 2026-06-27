@@ -145,6 +145,14 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_matmul_pipe_sim test/glm_matmul_pipe_tb.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_matmul_pipe"; $(VVP) $(BUILD_DIR)/glm_matmul_pipe_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: glm_matmul_pipe"; exit 1; }
+	@# fp8_e4m3: GLM-5.2-FP8 E4M3 primitives (decode/encode-RNE/mul), exhaustive 256x256 vs fp64.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/fp8_e4m3_sim test/fp8_e4m3_tb.v
+	@printf '[%s] ' "fp8_e4m3"; $(VVP) $(BUILD_DIR)/fp8_e4m3_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: fp8_e4m3"; exit 1; }
+	@# glm_matmul_fp8: FP8 E4M3 GEMM (4x4 mantissa mult + fp32 accumulate + block scale -> bf16).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_matmul_fp8_sim test/glm_matmul_fp8_tb.v src/glm_matmul_fp8.v src/glm_fp_pipe.v
+	@printf '[%s] ' "glm_matmul_fp8"; $(VVP) $(BUILD_DIR)/glm_matmul_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: glm_matmul_fp8"; exit 1; }
 	@# swiglu_expert: SwiGLU FFN expert (gate/up/down GEMM + silu*up), dense + MoE modes.
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_sim test/swiglu_expert_tb.v src/swiglu_expert.v src/glm_matmul_pipe.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "swiglu_expert"; $(VVP) $(BUILD_DIR)/swiglu_expert_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
