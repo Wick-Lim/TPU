@@ -153,6 +153,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_matmul_fp8_sim test/glm_matmul_fp8_tb.v src/glm_matmul_fp8.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_matmul_fp8"; $(VVP) $(BUILD_DIR)/glm_matmul_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: glm_matmul_fp8"; exit 1; }
+	@# swiglu_expert_fp8: FP8 SwiGLU expert (gate/up/down via glm_matmul_fp8 + bf16 silu*up tail).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_fp8_sim test/swiglu_expert_fp8_tb.v src/swiglu_expert_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "swiglu_expert_fp8"; $(VVP) $(BUILD_DIR)/swiglu_expert_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: swiglu_expert_fp8"; exit 1; }
 	@# swiglu_expert: SwiGLU FFN expert (gate/up/down GEMM + silu*up), dense + MoE modes.
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_sim test/swiglu_expert_tb.v src/swiglu_expert.v src/glm_matmul_pipe.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "swiglu_expert"; $(VVP) $(BUILD_DIR)/swiglu_expert_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \

@@ -6,11 +6,15 @@
 //
 //   GOLDEN MODEL: an INDEPENDENT fp64 GEMM whose inputs are first quantized to
 //   E4M3 exactly as the DUT does (activation: bf16 -> *2^a_shift -> E4M3 encode;
-//   weight: the given E4M3 code), so the golden MODELS the fp8 inputs.  The fp8
-//   per-element quantization error is therefore INSIDE the golden; the only
-//   residual DUT/golden gap is fp32 accumulation (vs fp64) + the fp32 dequant
-//   multiply + the final bf16 rounding.  The tolerance is built from those
-//   (scales with K for the accumulation term), NOT from the raw 2^-3 E4M3 ulp.
+//   weight: the given E4M3 code), and whose REDUCTION uses the SAME [128,128]
+//   BLOCK-SCALED scheme as the DUT: fp8 products are inner-accumulated per
+//   128-wide K-block, each block partial is multiplied by that block's bf16
+//   weight scale, the scaled block partials are outer-accumulated, and finally
+//   the per-token 2^-a_shift is undone.  The fp8 per-element quantization error
+//   is therefore INSIDE the golden; the only residual DUT/golden gap is fp32
+//   accumulation (vs fp64) + the fp32 dequant multiply + the final bf16
+//   rounding.  The tolerance is built from those (scales with K for the
+//   accumulation term), NOT from the raw 2^-3 E4M3 ulp.
 //
 //   X-AWARE: any X in a captured output bit is a hard failure.
 //   Emits "ALL <N> TESTS PASSED" and $fatal on any mismatch / X.
@@ -20,6 +24,8 @@ module glm_matmul_fp8_tb;
     localparam integer PE_M = 4;
     localparam integer PE_N = 4;
     localparam integer KMAX = 256;
+    localparam integer BLK  = 128;
+    localparam integer NB   = (KMAX + BLK - 1) / BLK;   // # K-blocks (= 2)
     localparam integer KW   = $clog2(KMAX+1);
 
     // ---- include the contract functions for the encode step of the golden ----
@@ -34,12 +40,12 @@ module glm_matmul_fp8_tb;
     reg  [16*PE_M-1:0]        a_col = 0;
     reg  [ 8*PE_N-1:0]        w_row = 0;
     reg  [ 8*PE_M-1:0]        a_shift = 0;
-    reg  [16*PE_N-1:0]        w_scale = 0;
+    reg  [16*PE_N*NB-1:0]     w_scale = 0;          // bf16 scale per (col, K-block)
     wire                      busy;
     wire                      out_valid;
     wire [16*PE_M*PE_N-1:0]   c_out;
 
-    glm_matmul_fp8 #(.PE_M(PE_M), .PE_N(PE_N), .KMAX(KMAX)) dut (
+    glm_matmul_fp8 #(.PE_M(PE_M), .PE_N(PE_N), .KMAX(KMAX), .BLK(BLK)) dut (
         .clk(clk), .rst(rst), .start(start), .k_len(k_len),
         .in_valid(in_valid), .a_col(a_col), .w_row(w_row),
         .a_shift(a_shift), .w_scale(w_scale),
@@ -99,7 +105,7 @@ module glm_matmul_fp8_tb;
     reg [15:0] A  [0:PE_M-1][0:KMAX-1];   // bf16 activations
     reg [ 7:0] W  [0:KMAX-1][0:PE_N-1];   // E4M3 weights
     reg [ 7:0] ash_v [0:PE_M-1];          // per-row activation pow2 shift (signed)
-    reg [15:0] wsc_v [0:PE_N-1];          // per-col weight dequant scale (bf16)
+    reg [15:0] wsc_v [0:PE_N-1][0:NB-1];  // bf16 weight BLOCK scale per (col, K-block)
 
     integer kk;
 
@@ -130,11 +136,12 @@ module glm_matmul_fp8_tb;
     // Drive one tile and check every output element vs the fp64 golden.
     //----------------------------------------------------------------------
     task run_tile(input integer K, input [127:0] tag);
-        integer pi, pj, k, t;
-        real    acc, sum_abs, golden, dutr, err, tol;
+        integer pi, pj, k, t, b, kstart, kend;
+        real    golden, sum_abs, dutr, err, tol;
+        real    bsum, babs, wsr, ashf;
         reg [31:0] sfp;
         reg [ 7:0] aq;
-        real    aqr, wr, ashf;
+        real    aqr, wr;
         reg [15:0] cbits;
         reg signed [9:0] ksh;
         begin
@@ -143,7 +150,8 @@ module glm_matmul_fp8_tb;
             for (pi = 0; pi < PE_M; pi = pi + 1)
                 a_shift[8*pi +: 8] = ash_v[pi];
             for (pj = 0; pj < PE_N; pj = pj + 1)
-                w_scale[16*pj +: 16] = wsc_v[pj];
+                for (b = 0; b < NB; b = b + 1)
+                    w_scale[16*(b*PE_N + pj) +: 16] = wsc_v[pj][b];
             k_len    = K[KW-1:0];
             start    = 1'b1;
             in_valid = 1'b0;
@@ -173,24 +181,32 @@ module glm_matmul_fp8_tb;
                 end
             end
 
-            // ---- check every output element ----
+            // ---- check every output element vs the [128,128] block-scaled golden ----
             for (pi = 0; pi < PE_M; pi = pi + 1) begin
                 for (pj = 0; pj < PE_N; pj = pj + 1) begin
                     ksh  = $signed(ash_v[pi]);
                     ashf = 2.0 ** real'(ksh);
-                    acc = 0.0; sum_abs = 0.0;
-                    for (k = 0; k < K; k = k + 1) begin
-                        sfp = scaled_fp32(A[pi][k], ksh);          // bf16*2^ash as fp32
-                        aq  = fp32_to_fp8e4m3(sfp);                // DUT-identical encode
-                        aqr = e4m3_real(aq);                       // independent fp64 decode
-                        wr  = e4m3_real(W[k][pj]);
-                        acc     = acc + aqr * wr;
-                        sum_abs = sum_abs + (aqr*wr >= 0.0 ? aqr*wr : -(aqr*wr));
+                    golden = 0.0; sum_abs = 0.0;
+                    // outer loop over 128-wide K-blocks; inner accumulate then scale.
+                    for (b = 0; b < NB; b = b + 1) begin
+                        kstart = b * BLK;
+                        kend   = (b + 1) * BLK; if (kend > K) kend = K;
+                        bsum = 0.0; babs = 0.0;
+                        for (k = kstart; k < kend; k = k + 1) begin
+                            sfp = scaled_fp32(A[pi][k], ksh);      // bf16*2^ash as fp32
+                            aq  = fp32_to_fp8e4m3(sfp);            // DUT-identical encode
+                            aqr = e4m3_real(aq);                   // independent fp64 decode
+                            wr  = e4m3_real(W[k][pj]);
+                            bsum = bsum + aqr * wr;
+                            babs = babs + (aqr*wr >= 0.0 ? aqr*wr : -(aqr*wr));
+                        end
+                        wsr      = bf16_real(wsc_v[pj][b]);        // this block's weight scale
+                        golden   = golden  + bsum * wsr;
+                        sum_abs  = sum_abs + babs * (wsr >= 0.0 ? wsr : -wsr);
                     end
-                    // dequant: undo the pow2 prescale, apply the weight scale.
-                    golden  = (acc / ashf) * bf16_real(wsc_v[pj]);
-                    sum_abs = (sum_abs / ashf) * (bf16_real(wsc_v[pj]) >= 0.0 ?
-                                bf16_real(wsc_v[pj]) : -bf16_real(wsc_v[pj]));
+                    // undo the per-token pow2 prescale.
+                    golden  = golden  / ashf;
+                    sum_abs = sum_abs / ashf;
 
                     cbits = c_out[16*(pi*PE_N + pj) +: 16];
                     // X-aware: any X bit is a failure.
@@ -221,7 +237,17 @@ module glm_matmul_fp8_tb;
         end
     endtask
 
-    integer ti, pi2, pj2, ki2;
+    // helper: set ALL K-blocks of every column to 1.0 (for single-block tests).
+    task set_unit_scales;
+        integer pj2, b2;
+        begin
+            for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1)
+                for (b2 = 0; b2 < NB; b2 = b2 + 1)
+                    wsc_v[pj2][b2] = 16'h3F80;  // 1.0
+        end
+    endtask
+
+    integer ti, pi2, pj2, ki2, b2;
 
     initial begin
         max_ratio = 0.0;
@@ -232,10 +258,10 @@ module glm_matmul_fp8_tb;
         @(negedge clk);
 
         //==================================================================
-        // TEST 1: small K, all a_shift=0, w_scale=1.0, simple values.
+        // TEST 1: small K, all a_shift=0, all block scales 1.0, simple values.
         //==================================================================
         for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) ash_v[pi2] = 8'sd0;
-        for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1) wsc_v[pj2] = 16'h3F80; // 1.0
+        set_unit_scales;
         for (ki2 = 0; ki2 < 8; ki2 = ki2 + 1) begin
             for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) A[pi2][ki2] = rnd_bf16(124, 129);
             for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1) W[ki2][pj2] = rnd_e4m3();
@@ -250,7 +276,7 @@ module glm_matmul_fp8_tb;
         run_tile(1, "K1");
 
         //==================================================================
-        // TEST 3: zeros (E4M3 +0/-0 weights and tiny acts -> exact 0 output).
+        // TEST 3: zeros (E4M3 +0 weights -> exact 0 output).
         //==================================================================
         for (ki2 = 0; ki2 < 16; ki2 = ki2 + 1) begin
             for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) A[pi2][ki2] = rnd_bf16(124, 129);
@@ -259,13 +285,14 @@ module glm_matmul_fp8_tb;
         run_tile(16, "ZERO");
 
         //==================================================================
-        // TEST 4: per-row activation shifts + per-col weight scales.
+        // TEST 4: per-row activation shifts + per-col weight scales (single block).
         //==================================================================
         ash_v[0] = 8'sd3; ash_v[1] = -8'sd2; ash_v[2] = 8'sd0; ash_v[3] = 8'sd5;
-        wsc_v[0] = 16'h3F80; // 1.0
-        wsc_v[1] = 16'h4000; // 2.0
-        wsc_v[2] = 16'h3E80; // 0.25
-        wsc_v[3] = 16'h40A0; // 5.0
+        set_unit_scales;
+        wsc_v[0][0] = 16'h3F80; // 1.0
+        wsc_v[1][0] = 16'h4000; // 2.0
+        wsc_v[2][0] = 16'h3E80; // 0.25
+        wsc_v[3][0] = 16'h40A0; // 5.0
         for (ki2 = 0; ki2 < 64; ki2 = ki2 + 1) begin
             // smaller activations so the +shift lands them inside E4M3 range
             for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) A[pi2][ki2] = rnd_bf16(118, 126);
@@ -274,32 +301,55 @@ module glm_matmul_fp8_tb;
         run_tile(64, "SCALES");
 
         //==================================================================
-        // TEST 5: full KMAX reduction (the K-scaling of the tolerance).
+        // TEST 5: full KMAX reduction -> TWO 128-wide K-blocks with DISTINCT
+        //         per-block weight scales (exercises block-scaled accumulation).
         //==================================================================
         for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) ash_v[pi2] = 8'sd0;
-        wsc_v[0] = 16'h3F00; // 0.5
-        wsc_v[1] = 16'h3F80; // 1.0
-        wsc_v[2] = 16'h3FC0; // 1.5
-        wsc_v[3] = 16'h4040; // 3.0
+        // K-block 0 scales
+        wsc_v[0][0] = 16'h3F00; // 0.5
+        wsc_v[1][0] = 16'h3F80; // 1.0
+        wsc_v[2][0] = 16'h3FC0; // 1.5
+        wsc_v[3][0] = 16'h4040; // 3.0
+        // K-block 1 scales (DIFFERENT from block 0)
+        wsc_v[0][1] = 16'h4000; // 2.0
+        wsc_v[1][1] = 16'h3E80; // 0.25
+        wsc_v[2][1] = 16'h40A0; // 5.0
+        wsc_v[3][1] = 16'h3F40; // 0.75
         for (ki2 = 0; ki2 < KMAX; ki2 = ki2 + 1) begin
             for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) A[pi2][ki2] = rnd_bf16(123, 130);
             for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1) W[ki2][pj2] = rnd_e4m3();
         end
-        run_tile(KMAX, "KMAX");
+        run_tile(KMAX, "KMAX2BLK");
 
         //==================================================================
-        // TESTS 6..13: random matrices, random shifts/scales, varied K.
+        // TEST 6: K=200 -> a FULL block + a PARTIAL second block, distinct scales.
+        //==================================================================
+        ash_v[0] = 8'sd1; ash_v[1] = 8'sd0; ash_v[2] = -8'sd1; ash_v[3] = 8'sd2;
+        wsc_v[0][0] = 16'h3F80; wsc_v[0][1] = 16'h3FC0; // 1.0 / 1.5
+        wsc_v[1][0] = 16'h4000; wsc_v[1][1] = 16'h3F00; // 2.0 / 0.5
+        wsc_v[2][0] = 16'h3F40; wsc_v[2][1] = 16'h4040; // 0.75 / 3.0
+        wsc_v[3][0] = 16'h3E80; wsc_v[3][1] = 16'h3F80; // 0.25 / 1.0
+        for (ki2 = 0; ki2 < 200; ki2 = ki2 + 1) begin
+            for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) A[pi2][ki2] = rnd_bf16(120, 127);
+            for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1) W[ki2][pj2] = rnd_e4m3();
+        end
+        run_tile(200, "K200");
+
+        //==================================================================
+        // TESTS 7..14: random matrices, random shifts/scales, varied K
+        //              (alternating single-block 100 and two-block 200).
         //==================================================================
         for (ti = 0; ti < 8; ti = ti + 1) begin
             for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1)
-                ash_v[pi2] = ($random % 5);            // small +/- shift
+                ash_v[pi2] = ($random % 5);             // small +/- shift
             for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1)
-                wsc_v[pj2] = rnd_bf16(124, 130);        // random positive-ish scale
-            for (ki2 = 0; ki2 < 100; ki2 = ki2 + 1) begin
+                for (b2 = 0; b2 < NB; b2 = b2 + 1)
+                    wsc_v[pj2][b2] = rnd_bf16(124, 130); // random positive-ish scale per block
+            for (ki2 = 0; ki2 < 200; ki2 = ki2 + 1) begin
                 for (pi2 = 0; pi2 < PE_M; pi2 = pi2 + 1) A[pi2][ki2] = rnd_bf16(121, 130);
                 for (pj2 = 0; pj2 < PE_N; pj2 = pj2 + 1) W[ki2][pj2] = rnd_e4m3();
             end
-            run_tile(100, "RND");
+            run_tile((ti & 1) ? 200 : 100, "RND");
         end
 
         //==================================================================
