@@ -1,6 +1,10 @@
 # Build artifacts
 build/
 
+# Agent / tooling scratch dirs (smoke TBs, synth/pnr logs, build artifacts)
+scratchpad/
+scratchpad_build/
+
 # Generated simulation waveforms
 tpu_waveform.vcd
 hazard_waveform.vcd

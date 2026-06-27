@@ -359,14 +359,22 @@ module glm_decoder_block #(
         T_FFN_D  = 5'd5,    // dense swiglu(nrm) -> fbuf
         T_ROUTE  = 5'd6,    // moe_router(nrm) -> sel
         T_EXP    = 5'd7,    // run routed/shared expert e
-        T_EXPW   = 5'd8,    // wait expert done; scale+accumulate
-        T_FCOMB  = 5'd9,    // finalize fbuf from facc (MoE)
-        T_RADD2  = 5'd10,   // y = h + fbuf (bf16, per-elt)
-        T_DONE   = 5'd11;
+        T_EXPW   = 5'd8,    // wait expert done
+        T_ACC    = 5'd9,    // scale+accumulate expert y into facc (1 elt/cycle)
+        T_FCOMB  = 5'd10,   // finalize fbuf from facc (MoE, 1 elt/cycle)
+        T_RADD2  = 5'd11,   // y = h + fbuf (bf16, per-elt)
+        T_DONE   = 5'd12;
     reg [4:0] state;
 
     // residual-add element cursor (shared by T_RADD1 / T_RADD2)
     reg [$clog2(MODEL_DIM+1)-1:0] radd_i;
+    // FFN combine element cursor (shared by T_ACC / T_FCOMB).  The per-element
+    // fp32 scale+accumulate and the fp32->bf16 narrow are streamed ONE element
+    // per cycle (mirroring the residual adds) instead of 128 parallel inlined
+    // fp32 datapaths in a single cycle -- this keeps area and the combinational
+    // critical path bounded (one fp32_mul+fp32_add, not 128) and the numerics
+    // identical (same ops, just time-multiplexed).
+    reg [$clog2(MODEL_DIM+1)-1:0] comb_i;
 
     // MoE expert loop bookkeeping
     reg [$clog2(TOPK+2)-1:0] exp_i;   // 0..TOPK-1 routed, TOPK = shared
@@ -390,13 +398,18 @@ module glm_decoder_block #(
             rn_start   <= 1'b0; rn_src <= 1'b0; rn_gwhich <= 1'b0;
             rn_x_in    <= 16'h0; rn_x_valid <= 1'b0;
             rn_gamma_in<= 16'h0; rn_g_valid <= 1'b0;
-            rn_ridx    <= {$clog2(MODEL_DIM+1){1'b0}};
-            rn_widx    <= {$clog2(MODEL_DIM+1){1'b0}};
+            // NOTE: rn_ridx / rn_widx / rn_gidx are owned EXCLUSIVELY by the
+            // dedicated rmsnorm beat-counter always-block below (reset + update
+            // there).  They must NOT be driven here too -- two clocked processes
+            // assigning the same reg is a multiple-driver conflict (synthesis
+            // builds two $dff cells fighting for the same Q net, even though sim
+            // happens to agree because both write the same reset value).
             at_start   <= 1'b0;
             rt_start   <= 1'b0;
             ed_start   <= 1'b0; em_start <= 1'b0;
             fw_shared  <= 1'b0; fw_eidx <= {EIDXW{1'b0}};
             radd_i     <= {$clog2(MODEL_DIM+1){1'b0}};
+            comb_i     <= {$clog2(MODEL_DIM+1){1'b0}};
             exp_i      <= {$clog2(TOPK+2){1'b0}};
             exp_is_shared <= 1'b0;
             cur_gate_f <= 32'h0;
@@ -541,17 +554,26 @@ module glm_decoder_block #(
                     cur_gate_f <= bf16_to_fp32(sel_w[exp_i[TKIW-1:0]]);
                 state  <= T_EXPW;
             end
-            //---------------------------------------------------------------- expert wait + scale/accumulate
+            //---------------------------------------------------------------- expert wait
             T_EXPW: begin
+                // em_y (u_moe.y_out) holds stable after em_done until the next
+                // em_start, so T_ACC can stream it across MODEL_DIM cycles.
                 if (em_done) begin
-                    // scale+accumulate this expert's whole output into facc
-                    for (ii=0; ii<MODEL_DIM; ii=ii+1)
-                        facc[ii] <= fp32_add(facc[ii],
-                                       fp32_mul(cur_gate_f,
-                                                bf16_to_fp32(em_y[16*ii +: 16])));
-                    // advance to next expert: TOPK routed then 1 shared
+                    comb_i <= {$clog2(MODEL_DIM+1){1'b0}};
+                    state  <= T_ACC;
+                end
+            end
+            //---------------------------------------------------------------- scale+accumulate (1 elt/cycle)
+            T_ACC: begin
+                // facc[comb_i] += cur_gate_f * em_y[comb_i]   (one fp32 MAC/cycle)
+                facc[comb_i[$clog2(MODEL_DIM)-1:0]] <=
+                    fp32_add(facc[comb_i[$clog2(MODEL_DIM)-1:0]],
+                             fp32_mul(cur_gate_f,
+                                      bf16_to_fp32(em_y[16*comb_i +: 16])));
+                if (comb_i == MODEL_DIM[$clog2(MODEL_DIM+1)-1:0]-1'b1) begin
+                    // last element accumulated -> advance to next expert / finalize
                     if (exp_is_shared) begin
-                        // all done -> finalize
+                        comb_i <= {$clog2(MODEL_DIM+1){1'b0}};
                         state  <= T_FCOMB;
                     end else if (exp_i == TOPK[$clog2(TOPK+2)-1:0]-1'b1) begin
                         // routed experts done -> run shared expert (weight 1)
@@ -568,15 +590,21 @@ module glm_decoder_block #(
                         em_start  <= 1'b1;
                         state     <= T_EXP;
                     end
+                end else begin
+                    comb_i <= comb_i + 1'b1;
                 end
             end
-            //---------------------------------------------------------------- moe combine finalize
+            //---------------------------------------------------------------- moe combine finalize (1 elt/cycle)
             T_FCOMB: begin
-                // narrow each fp32 accumulator to bf16 -> fbuf
-                for (ii=0; ii<MODEL_DIM; ii=ii+1)
-                    fbuf[ii] <= fp32_to_bf16(facc[ii]);
-                radd_i <= {$clog2(MODEL_DIM+1){1'b0}};
-                state  <= T_RADD2;
+                // narrow each fp32 accumulator to bf16 -> fbuf, one elt/cycle
+                fbuf[comb_i[$clog2(MODEL_DIM)-1:0]] <=
+                    fp32_to_bf16(facc[comb_i[$clog2(MODEL_DIM)-1:0]]);
+                if (comb_i == MODEL_DIM[$clog2(MODEL_DIM+1)-1:0]-1'b1) begin
+                    radd_i <= {$clog2(MODEL_DIM+1){1'b0}};
+                    state  <= T_RADD2;
+                end else begin
+                    comb_i <= comb_i + 1'b1;
+                end
             end
             //---------------------------------------------------------------- residual add 2
             T_RADD2: begin
