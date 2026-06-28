@@ -161,9 +161,16 @@ can't be statically placed — it's a **caching + scheduling** problem:
 
 - **Cache** (HBM, ~34 GB): LRU/LFU of expert blocks; exploits expert-popularity skew.
 - **Batching**: many tokens/sequences route to overlapping experts → load once, reuse across
-  the batch (biggest throughput lever; costs latency).
-- **Prefetch/predict**: speculate next experts (e.g. from prior-layer routing) and DMA ahead
-  to hide Flash latency (can't hide Flash *bandwidth*).
+  the batch (biggest throughput lever; costs latency). **RTL-measured** through the committed
+  `expert_cache_ctrl` at 34 GB cache: batch 1 / 8 / 32 → **26.5 % / 29.7 % / 50.5 %** hit rate
+  (same router picks, only access order changes — isolating batching as the lever).
+- **Prefetch/predict**: speculate next experts (the next layer's router is cheap and runs ahead)
+  and DMA into HBM during the current layer's compute → hide Flash *latency* (not bandwidth).
+  Built + measured as **`src/expert_cache_pf.v`** (a prefetch hint port + demand-priority
+  background Flash fetch + a `demand_stall_cycles` counter; demand path bit-exact to
+  `expert_cache_ctrl` with prefetch off). On the decode trace under a compute-window model, the
+  demand stall is cut **59 % (compute window TC=12)** to **99 % (TC ≥ flash latency)** — the
+  fetch is fully overlapped with compute when the window is long enough.
 - **Layout**: store co-activated experts contiguously / aligned for sequential Flash reads
   (bandwidth- not IOPS-bound, since each expert is a ~37 MB contiguous block).
 - **Speculative / MTP decoding**: GLM-5.2 ships an MTP head (built here as `mtp_head`) — verify

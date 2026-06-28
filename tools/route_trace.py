@@ -79,15 +79,25 @@ def lru_hitrate(trace, slots):
             if len(cache) > slots: cache.popitem(last=False)
     return hit, len(trace)
 
-# --dump: write a trace + python LRU reference for the RTL confirmation TB, then exit
+# --dump: write trace(s) + python LRU reference for the RTL confirmation TBs, then exit.
+#   Same calibration (sigma=0.6, rho=0.30) and SAME seed for all three access patterns,
+#   so gen_trace rebuilds an IDENTICAL per-token top-k selection `sel` and only the
+#   FLATTEN ORDER differs (decode = token-major batch=1; batch8/batch32 = layer-major
+#   across an 8-/32-token batch).  This isolates BATCHING as the pure lever: same router
+#   picks, same cache, only the access order changes -> the hit-rate delta is batching.
 if '--dump' in sys.argv:
-    tr = gen_trace(0.6, 0.30, 'decode', seed=7)[:18000]   # moderate calib, ~30 tokens
-    with open('tools/glm_trace.hex', 'w') as f:
-        for x in tr: f.write(f"{x:04x}\n")
-    for slots in (600, 900):
-        h, n = lru_hitrate(tr, slots)
-        print(f"PYREF slots={slots} hits={h} miss={n-h} hit_rate={100*h/n:.2f}%")
-    print(f"wrote tools/glm_trace.hex ({len(tr)} accesses)")
+    SLICE = 18000
+    dumps = [('decode',  'tools/glm_trace.hex'),
+             ('batch8',  'tools/glm_trace_b8.hex'),
+             ('batch32', 'tools/glm_trace_b32.hex')]
+    for pat, path in dumps:
+        tr = gen_trace(0.6, 0.30, pat, seed=7)[:SLICE]   # moderate calib, same seed
+        with open(path, 'w') as f:
+            for x in tr: f.write(f"{x:04x}\n")
+        for slots in (600, 900):
+            h, n = lru_hitrate(tr, slots)
+            print(f"PYREF {pat:>7} slots={slots} hits={h} miss={n-h} hit_rate={100*h/n:.2f}%")
+        print(f"wrote {path} ({len(tr)} accesses)")
     sys.exit(0)
 
 # per-token routed footprint

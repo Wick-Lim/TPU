@@ -51,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi soc unittests sim wave lint synth ppa clean
+.PHONY: all build test hazard axi soc unittests cache-study sim wave lint synth ppa clean
 
 all: test hazard unittests lint synth
 
@@ -239,6 +239,19 @@ unittests:
 	@printf '[%s] ' "tpu_soc"; $(VVP) $(SOC_BIN) | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: tpu_soc"; exit 1; }
 	@echo "unittests: all per-unit TBs passed"
+
+# Single-package system study: regenerate the calibrated GLM-scale routing traces, then run
+# the cache hit-rate + batching + prefetch sims through the real RTL (these need the generated
+# tools/*.hex, so they are kept out of the self-contained `unittests`). See docs/SYSTEM_SINGLE_PACKAGE.md.
+cache-study:
+	@python3 tools/route_trace.py --dump >/dev/null
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_cache_batch tools/glm_cache_batch_tb.v src/expert_cache_ctrl.v
+	@printf '[%s] ' "cache-batch"; $(VVP) $(BUILD_DIR)/glm_cache_batch | grep -E 'ALL [0-9]+ TESTS PASSED|BATCHING LEVER' \
+	    || { echo "FAILED: cache-batch"; exit 1; }
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/expert_cache_pf test/expert_cache_pf_tb.v src/expert_cache_pf.v src/expert_cache_ctrl.v
+	@printf '[%s] ' "expert_cache_pf"; $(VVP) $(BUILD_DIR)/expert_cache_pf | grep -E 'ALL [0-9]+ TESTS PASSED|stall cut' \
+	    || { echo "FAILED: expert_cache_pf"; exit 1; }
+	@echo "cache-study: batching + prefetch sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
 
 wave: $(SIM_BIN)
 	$(VVP) $(SIM_BIN)
