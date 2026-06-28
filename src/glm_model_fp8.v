@@ -206,7 +206,17 @@ module glm_model_fp8 #(
     output wire                          lw_req,
     output wire [VTW-1:0]                lw_vtile,   // which VOCAB tile (cols group)
     output wire [DIMW-1:0]               lw_k,       // reduction index 0..MODEL_DIM-1
-    input  wire [LM_TN*16-1:0]           lw_col      // LM_TN bf16 weight lanes
+    input  wire [LM_TN*16-1:0]           lw_col,     // LM_TN bf16 weight lanes
+
+    // ---- hidden-state out (BACKWARD-COMPATIBLE, ADDITIVE) ----
+    //   xN = the final-RMSNorm result (= the LM-head input vector), packed bf16,
+    //   MODEL_DIM elements.  It is exactly the vector this module already computes
+    //   and feeds to the LM head -- exposed here so the MTP draft head can consume
+    //   it as h_t in the speculative-decode loop.  Continuously reflects the xn[]
+    //   buffer; it is STABLE from the `done` pulse until the next `start` clears it
+    //   (xn is only written during M_FNORM).  Existing TBs leave it UNCONNECTED, so
+    //   adding it changes no prior behaviour (named port maps; output may dangle).
+    output wire [MODEL_DIM*16-1:0]       h_state
 );
     `include "glm_fp.vh"
 
@@ -295,6 +305,17 @@ module glm_model_fp8 #(
 
     // normalized vector store (fed to the LM head)
     reg [15:0] xn [0:MODEL_DIM-1];
+
+    // ---- ADDITIVE hidden-out: packed view of xn (the final-norm / LM-head input).
+    //   Pure combinational re-pack of an already-computed buffer -- no new state,
+    //   no extra latency, no effect on the FSM or any existing port. ----
+    reg [MODEL_DIM*16-1:0] h_state_r;
+    integer hi;
+    always @* begin
+        for (hi = 0; hi < MODEL_DIM; hi = hi + 1)
+            h_state_r[16*hi +: 16] = xn[hi];
+    end
+    assign h_state = h_state_r;
 
     //========================================================================
     // LM HEAD : glm_matmul_pipe as a 1xLM_TN GEMV tile, K=MODEL_DIM reduction.
