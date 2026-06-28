@@ -169,8 +169,10 @@ module glm_matmul_fp8 #(
     reg  [KW-1:0]      k_cnt;
     reg  [KW-1:0]      k_target;
     reg  [2:0]         lane;          // GLOBAL issue lane 0..L-1 (shared by banks)
+    /* verilator lint_off UNUSEDSIGNAL */ // unread by design when NB==1 (single K-block)
     reg  [BKW-1:0]     kblk;          // current K-block 0..NB-1
     reg  [PSW-1:0]     kpos;          // position within current K-block 0..BLK-1
+    /* verilator lint_on UNUSEDSIGNAL */
     reg                streaming;
     reg                mac_draining;  // wait L cycles for last add to retire
     reg                tree_draining; // wait TREE_LAT for the reduce tree
@@ -185,7 +187,41 @@ module glm_matmul_fp8 #(
 
     wire               issue      = streaming & in_valid;
     wire               last_issue = issue & (k_cnt == k_target - 1'b1);
-    wire               blk_last   = (kpos == (BLK[PSW-1:0] - 1'b1)); // last beat of block
+
+    // ----------------------------------------------------------------------
+    // K-block bookkeeping (kblk/kpos): only meaningful when NB > 1.  For a
+    // single K-block (NB==1, KMAX<=BLK) every beat targets the one bank, so the
+    // counters and the per-beat blk_last test collapse to constant 0.
+    // ----------------------------------------------------------------------
+    generate
+    if (NB > 1) begin : GKBLK
+        wire blk_last = (kpos == (BLK[PSW-1:0] - 1'b1)); // last beat of block
+        always @(posedge clk) begin
+            if (rst) begin
+                kblk <= {BKW{1'b0}};
+                kpos <= {PSW{1'b0}};
+            end else begin
+                if (start) begin
+                    kblk <= {BKW{1'b0}};
+                    kpos <= {PSW{1'b0}};
+                end
+                if (issue) begin
+                    if (blk_last) begin
+                        kblk <= kblk + 1'b1;   // next beat starts the next K-block
+                        kpos <= {PSW{1'b0}};
+                    end else begin
+                        kpos <= kpos + 1'b1;
+                    end
+                end
+            end
+        end
+    end else begin : GKBLK
+        always @(posedge clk) begin           // NB==1: single K-block, counters tied 0
+            kblk <= {BKW{1'b0}};
+            kpos <= {PSW{1'b0}};
+        end
+    end
+    endgenerate
 
     /* verilator lint_off WIDTHTRUNC */
     localparam [2:0] LANE_LAST = (L - 1);
@@ -216,12 +252,17 @@ module glm_matmul_fp8 #(
         wire [31:0] prod_f = fp8_mul(a_q, w_q);
 
         for (gb = 0; gb < NB; gb = gb + 1) begin : BANK
-          localparam [BKW-1:0] BIDX = gb[BKW-1:0];
           // this bank accumulates only the beats whose K-block == gb.
-          wire issue_b = issue & (kblk == BIDX);
+          wire issue_b;
+          if (NB > 1) begin : GIB
+              localparam [BKW-1:0] BIDX = gb[BKW-1:0];
+              assign issue_b = issue & (kblk == BIDX);
+          end else begin : GIB
+              assign issue_b = issue;       // single bank: every beat targets it
+          end
 
-          // L sub-accumulators (sized to the fixed 8-leaf tree; ps[L..7] held +0).
-          reg  [31:0] ps [0:7];
+          // L sub-accumulators (one per interleave lane; right-sized to ps[0:L-1]).
+          reg  [31:0] ps [0:L-1];
           // writeback-lane shift register (L deep, matches add latency).
           reg  [2:0]  lane_pipe [0:L-1];
           wire        add_v;
@@ -249,42 +290,43 @@ module glm_matmul_fp8 #(
           integer pj2;
           always @(posedge clk) begin
               if (start) begin
-                  for (pj2 = 0; pj2 < 8; pj2 = pj2 + 1)
-                      ps[pj2] <= 32'h0000_0000;  // clear all 8 leaves (ps[L..7] stay +0)
+                  for (pj2 = 0; pj2 < L; pj2 = pj2 + 1)
+                      ps[pj2] <= 32'h0000_0000;  // clear all L lane accumulators
               end else if (add_v) begin
                   ps[wb_lane] <= add_y;          // wb_lane in 0..L-1
               end
           end
 
-          // ---- reduction: fixed 8-leaf / 3-level fp32_add_pipe tree ----
-          wire [31:0] lf0 = ps[0];
-          wire [31:0] lf1 = ps[1];
-          wire [31:0] lf2 = ps[2];
-          wire [31:0] lf3 = ps[3];
-          wire [31:0] lf4 = ps[4];
-          wire [31:0] lf5 = ps[5];
-          wire [31:0] lf6 = ps[6];
-          wire [31:0] lf7 = ps[7];
+          // ---- reduction: 5 live leaves (ps[0:L-1]) -> 3-level fp32_add_pipe tree.
+          // The +0 pad adders (b = zpad) preserve the original 8-leaf grouping
+          // bit-for-bit -- including the -0.0 -> +0.0 normalization that x + (+0)
+          // performs -- and the 3-level TREE_LAT.  The provably-+0 leaves ps[5..7]
+          // and their level-1 adder (lf6+lf7) are removed (constant-folded into
+          // zpad), saving one fp32_add_pipe and three leaf regs per bank.
+          wire [31:0] lf0  = ps[0];
+          wire [31:0] lf1  = ps[1];
+          wire [31:0] lf2  = ps[2];
+          wire [31:0] lf3  = ps[3];
+          wire [31:0] lf4  = ps[4];
+          wire [31:0] zpad = 32'h0000_0000;   // +0 pad (was ps[5..7], provably +0)
 
           /* verilator lint_off UNUSEDSIGNAL */
-          // level 1 (4 adders)
-          wire        l1a_v, l1b_v, l1c_v, l1d_v;
-          wire [31:0] l1a_y, l1b_y, l1c_y, l1d_y;
+          // level 1 (3 adders: 2 real + 1 +0-pad)
+          wire        l1a_v, l1b_v, l1c_v;
+          wire [31:0] l1a_y, l1b_y, l1c_y;
           fp32_add_pipe u_l1a (.clk(clk), .rst(rst), .valid_in(red_go),
               .a(lf0), .b(lf1), .valid_out(l1a_v), .result(l1a_y));
           fp32_add_pipe u_l1b (.clk(clk), .rst(rst), .valid_in(red_go),
               .a(lf2), .b(lf3), .valid_out(l1b_v), .result(l1b_y));
           fp32_add_pipe u_l1c (.clk(clk), .rst(rst), .valid_in(red_go),
-              .a(lf4), .b(lf5), .valid_out(l1c_v), .result(l1c_y));
-          fp32_add_pipe u_l1d (.clk(clk), .rst(rst), .valid_in(red_go),
-              .a(lf6), .b(lf7), .valid_out(l1d_v), .result(l1d_y));
-          // level 2 (2 adders)
+              .a(lf4), .b(zpad), .valid_out(l1c_v), .result(l1c_y));
+          // level 2 (2 adders: 1 real + 1 +0-pad)
           wire        l2a_v, l2b_v;
           wire [31:0] l2a_y, l2b_y;
           fp32_add_pipe u_l2a (.clk(clk), .rst(rst), .valid_in(l1a_v),
               .a(l1a_y), .b(l1b_y), .valid_out(l2a_v), .result(l2a_y));
           fp32_add_pipe u_l2b (.clk(clk), .rst(rst), .valid_in(l1c_v),
-              .a(l1c_y), .b(l1d_y), .valid_out(l2b_v), .result(l2b_y));
+              .a(l1c_y), .b(zpad), .valid_out(l2b_v), .result(l2b_y));
           // level 3 (1 adder)
           wire        l3_v;
           wire [31:0] l3_y;
@@ -344,8 +386,6 @@ module glm_matmul_fp8 #(
             k_cnt         <= {KW{1'b0}};
             k_target      <= {KW{1'b0}};
             lane          <= 3'd0;
-            kblk          <= {BKW{1'b0}};
-            kpos          <= {PSW{1'b0}};
             mac_drain     <= 8'd0;
             drain_cnt     <= 8'd0;
             ri            <= {MW{1'b0}};
@@ -364,8 +404,6 @@ module glm_matmul_fp8 #(
                 k_cnt         <= {KW{1'b0}};
                 k_target      <= k_len;
                 lane          <= 3'd0;
-                kblk          <= {BKW{1'b0}};
-                kpos          <= {PSW{1'b0}};
                 a_shift_q     <= a_shift;
                 w_scale_q     <= w_scale;
             end
@@ -374,12 +412,6 @@ module glm_matmul_fp8 #(
             if (issue) begin
                 k_cnt <= k_cnt + 1'b1;
                 lane  <= lane_nxt;
-                if (blk_last) begin
-                    kblk <= kblk + 1'b1;       // next beat starts the next K-block
-                    kpos <= {PSW{1'b0}};
-                end else begin
-                    kpos <= kpos + 1'b1;
-                end
                 if (last_issue) begin
                     streaming    <= 1'b0;
                     mac_draining <= 1'b1;

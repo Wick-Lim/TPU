@@ -368,8 +368,7 @@ module glm_model_fp8 #(
     localparam [3:0]
         M_IDLE   = 4'd0,
         M_EMBED  = 4'd1,    // load embed(token_id) -> xcur
-        M_LAYER  = 4'd2,    // run decoder_block_fp8 for current layer
-        M_LWAIT  = 4'd3,    // wait db_done; xcur <= y; advance layer
+        M_LWAIT  = 4'd3,    // run decoder_block_fp8; wait db_done; xcur <= y; advance
         M_FNORM  = 4'd4,    // final rmsnorm(xcur) -> xn
         M_LMTILE = 4'd5,    // stream K beats for current vtile
         M_LMWAIT = 4'd6,    // wait mm_ov; store LM_TN logits; next vtile
@@ -379,7 +378,7 @@ module glm_model_fp8 #(
 
     reg [LAYW:0]   lcur;           // current layer 0..L
     reg [TOKW:0]   am_i;           // argmax scan index
-    reg [31:0]     am_best;        // best logit value (fp32)
+    reg [15:0]     am_best;        // best logit value (bf16 raw)
     reg [TOKW-1:0] am_arg;
 
     always @(posedge clk) begin
@@ -410,7 +409,7 @@ module glm_model_fp8 #(
             em_loading  <= 1'b0;
             lcur        <= {(LAYW+1){1'b0}};
             am_i        <= {(TOKW+1){1'b0}};
-            am_best     <= 32'h0;
+            am_best     <= 16'h0;
             am_arg      <= {TOKW{1'b0}};
             for (ii=0; ii<MODEL_DIM; ii=ii+1) begin
                 xcur[ii] <= 16'h0; xn[ii] <= 16'h0;
@@ -451,17 +450,17 @@ module glm_model_fp8 #(
                         idx_fresh  <= (0 % 4 == 3);   // layer 0: reuse window
                         idx_win    <= {LAYW{1'b0}};
                         db_start   <= 1'b1;
-                        state      <= M_LAYER;
+                        state      <= M_LWAIT;
                     end else begin
                         em_ridx <= em_ridx + 1'b1;
                     end
                 end
             end
-            //---------------------------------------------------------------- run layer
-            M_LAYER: begin
-                // db_start was pulsed entering this state (or from M_LWAIT); wait.
-                state <= M_LWAIT;
-            end
+            //---------------------------------------------------------------- run layer / wait
+            // Entered the cycle AFTER db_start was pulsed (from M_EMBED or from this
+            // state's advance branch).  db_start is a 1-cycle pulse already deasserted,
+            // and the block has only just started, so db_done cannot be high on the
+            // first cycle here -- the old 1-cycle M_LAYER filler state was redundant.
             M_LWAIT: begin
                 if (db_done) begin
                     // x_{l+1} = decoder_block_fp8(x_l)
@@ -483,7 +482,7 @@ module glm_model_fp8 #(
                         idx_fresh <= ((lcur[1:0] + 2'd1) == 2'd3);
                         idx_win   <= (lcur[LAYW-1:0] + 1'b1) >> 2;
                         db_start  <= 1'b1;
-                        state     <= M_LAYER;
+                        state     <= M_LWAIT;
                     end
                 end
             end
@@ -544,7 +543,7 @@ module glm_model_fp8 #(
                     if (vtile == (NVTILE[VTW-1:0]-1'b1)) begin
                         // all vocab tiles done -> argmax scan
                         am_i    <= {(TOKW+1){1'b0}};
-                        am_best <= 32'hFF80_0000;   // -inf (fp32) as starting best
+                        am_best <= 16'hFF80;        // -inf (bf16) as starting best
                         am_arg  <= {TOKW{1'b0}};
                         state   <= M_ARGMAX;
                     end else begin
@@ -563,8 +562,8 @@ module glm_model_fp8 #(
             // strictly-greater keeps the first occurrence).  One element/cycle.
             M_ARGMAX: begin
                 if (am_i < VOCAB[TOKW:0]) begin
-                    if (fp32_gt(bf16_to_fp32(lbuf[am_i[TOKW-1:0]]), am_best)) begin
-                        am_best <= bf16_to_fp32(lbuf[am_i[TOKW-1:0]]);
+                    if (bf16_gt(lbuf[am_i[TOKW-1:0]], am_best)) begin
+                        am_best <= lbuf[am_i[TOKW-1:0]];
                         am_arg  <= am_i[TOKW-1:0];
                     end
                     am_i <= am_i + 1'b1;
@@ -606,23 +605,28 @@ module glm_model_fp8 #(
     end
 
     //========================================================================
-    // fp32 greater-than (strict).  Treats -0 == +0; ignores nan (the LM logits
-    // are finite normals).  Used for the argmax compare ONLY.
+    // bf16 greater-than (strict), DIRECT on the raw bf16 word: sign bit + 15-bit
+    // magnitude |.| = bits[14:0].  Treats -0 == +0; ignores nan (the LM logits
+    // are finite normals).  Used for the argmax compare ONLY.  This is bit-for-bit
+    // the old fp32_gt(bf16_to_fp32(a), bf16_to_fp32(b)): bf16_to_fp32 just appends
+    // 16 zero bits, so the 31-bit fp32 magnitude compare reduces exactly to this
+    // 15-bit bf16 magnitude compare (low 16 bits are equal zeros) -- identical
+    // argmax, with no fp32 widening and a 16-bit am_best.
     //========================================================================
-    function automatic fp32_gt(input [31:0] a, input [31:0] b);
+    function automatic bf16_gt(input [15:0] a, input [15:0] b);
         reg sa, sb;
-        reg [30:0] ma, mb;
+        reg [14:0] ma, mb;
         begin
-            sa = a[31]; sb = b[31];
-            ma = a[30:0]; mb = b[30:0];
+            sa = a[15]; sb = b[15];
+            ma = a[14:0]; mb = b[14:0];
             if (sa != sb) begin
                 // different signs: positive is greater, unless both are zero.
-                if ((ma == 31'b0) && (mb == 31'b0)) fp32_gt = 1'b0; // +0 vs -0
-                else fp32_gt = (sb == 1'b1);                        // a>=0 > b<0
+                if ((ma == 15'b0) && (mb == 15'b0)) bf16_gt = 1'b0; // +0 vs -0
+                else bf16_gt = (sb == 1'b1);                        // a>=0 > b<0
             end else if (sa == 1'b0) begin
-                fp32_gt = (ma > mb);                  // both positive
+                bf16_gt = (ma > mb);                  // both positive
             end else begin
-                fp32_gt = (ma < mb);                  // both negative: smaller mag bigger
+                bf16_gt = (ma < mb);                  // both negative: smaller mag bigger
             end
         end
     endfunction

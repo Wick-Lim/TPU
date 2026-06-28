@@ -116,6 +116,13 @@ module topk_select #(
     parameter integer K        = 8,
     parameter integer SCORE_W  = 32,
     parameter integer LANES_IN = 1,
+    // REUSE knobs: a consumer that only needs the selected INDICES (e.g. the DSA
+    // indexer ignores sel_score_o AND mask_o) sets these to 0.  When 0 the
+    // corresponding data writes are dropped, so synthesis constant-folds away the
+    // K*SCORE_W score regs / N mask regs for that instance.  DEFAULT 1 keeps the
+    // full behaviour (the MoE router and every standalone TB read both outputs).
+    parameter integer EMIT_SCORE = 1,
+    parameter integer EMIT_MASK  = 1,
     // IDXW is DERIVED ($clog2(N)); it is exposed as a parameter only so it can
     // size the output ports below.  Do NOT override it -- always leave default.
     parameter integer IDXW     = (N <= 1) ? 1 : $clog2(N)
@@ -158,11 +165,17 @@ module topk_select #(
         reg        sa, sb;
         reg [SCORE_W-2:0] ma, mb;          // magnitude (exp|mant), sign removed
         reg        a_nan, b_nan, a_zero, b_zero;
+        reg        g, eq;                  // ma>mb and ma==mb, computed ONCE
         begin
             sa = a[SCORE_W-1];
             sb = b[SCORE_W-1];
             ma = a[SCORE_W-2:0];
             mb = b[SCORE_W-2:0];
+            // AREA: one wide magnitude compare + one $eq, shared by both the
+            // non-negative branch (g) and the negative branch (!g && !eq ==
+            // ma<mb).  Avoids inferring a second 31-bit comparator per node.
+            g  = (ma > mb);
+            eq = (ma == mb);
             // NaN detect (fp32: exp all ones AND nonzero mantissa)
             a_nan = (a[SCORE_W-2 -: 8] == 8'hFF) && (a[SCORE_W-10:0] != 0);
             b_nan = (b[SCORE_W-2 -: 8] == 8'hFF) && (b[SCORE_W-10:0] != 0);
@@ -186,10 +199,11 @@ module topk_select #(
                 fp32_gt = (sa == 1'b0);
             end else if (sa == 1'b0) begin
                 // both non-negative: larger magnitude is greater.
-                fp32_gt = (ma > mb);
+                fp32_gt = g;
             end else begin
                 // both negative: SMALLER magnitude is greater (closer to 0).
-                fp32_gt = (ma < mb);
+                // ma<mb  ==  !(ma>mb) && (ma!=mb)  ==  !g && !eq.
+                fp32_gt = (!g && !eq);
             end
         end
     endfunction
@@ -346,9 +360,14 @@ module topk_select #(
                 S_EXTR: begin
                     // record the current global argmax into slot `pass`.
                     sel_idx_o  [pass*IDXW   +: IDXW]    <= argmax_idx;
-                    sel_score_o[pass*SCORE_W +: SCORE_W] <= argmax_score;
                     sel_valid_o[pass[KCW-1:0]]         <= 1'b1;
-                    mask_o[argmax_idx]                 <= 1'b1;
+                    // EMIT_SCORE/EMIT_MASK gate the only data-bearing writes to
+                    // sel_score_o / mask_o.  When 0 these regs are only ever
+                    // reset/cleared to 0, so they constant-fold to 0 and drop.
+                    if (EMIT_SCORE != 0)
+                        sel_score_o[pass*SCORE_W +: SCORE_W] <= argmax_score;
+                    if (EMIT_MASK != 0)
+                        mask_o[argmax_idx]             <= 1'b1;
                     // remove the winner so the next pass finds the next-best.
                     live[argmax_idx]                   <= 1'b0;
                     if (pass == LAST_PASS) begin

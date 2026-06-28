@@ -121,7 +121,6 @@ module glm_softmax #(
         S_MAX    = 4'd2,   // sequential fp32 max reduce over xbuf[]
         S_SHIFT  = 4'd3,   // x_i - m  (serial through add pipe) -> reuse xbuf[]
         S_EXP    = 4'd4,   // exp(shifted) one/cycle; capture -> ebuf[]; sum serially
-        S_SUMW   = 4'd5,   // drain final pending sum add(s)
         S_RSQ    = 4'd6,   // 1/sqrt(S)
         S_RECIP  = 4'd7,   // (1/sqrt(S))^2 = 1/S
         S_NORM   = 4'd8,   // e_i * (1/S) -> bf16 buffer (serial mul)
@@ -166,9 +165,14 @@ module glm_softmax #(
     function automatic fp32_gt(input [31:0] a, input [31:0] b);
         reg sa, sb;
         reg [30:0] ma, mb;
+        reg g, eq;
         begin
             sa = a[31]; sb = b[31];
             ma = a[30:0]; mb = b[30:0];
+            // single shared magnitude comparator: g=(ma>mb), eq=(ma==mb);
+            // ma<mb folds to (!g && !eq) -- identical result, one $gt + $eq only.
+            g  = (ma > mb);
+            eq = (ma == mb);
             // treat -0 and +0 as equal magnitude 0
             if (sa != sb) begin
                 // different signs: positive is greater, unless both are zero
@@ -176,10 +180,10 @@ module glm_softmax #(
                 else fp32_gt = (sb == 1'b1); // a positive, b negative -> a>b
             end else if (sa == 1'b0) begin
                 // both non-negative: larger bit pattern is larger
-                fp32_gt = (ma > mb);
+                fp32_gt = g;
             end else begin
-                // both negative: larger magnitude is smaller value
-                fp32_gt = (ma < mb);
+                // both negative: larger magnitude is smaller value (ma<mb)
+                fp32_gt = (!g && !eq);
             end
         end
     endfunction
@@ -366,11 +370,8 @@ module glm_softmax #(
                 end
             end
 
-            // (S_SUMW folded into S_EXP completion gate above)
-            S_SUMW: begin
-                busy <= 1'b1;
-                state <= S_RSQ;
-            end
+            // (S_SUMW removed: dead state -- S_EXP transitions directly to S_RSQ
+            //  and nothing assigns S_SUMW; the S_EXP completion gate covers it.)
 
             // -----------------------------------------------------------
             // 1/sqrt(S)  -- issue EXACTLY once (rsq_issued one-shot guard).

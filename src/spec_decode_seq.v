@@ -94,8 +94,8 @@ module spec_decode_seq #(
     output reg  [31:0]          accepts,       // drafts accepted
     output reg  [31:0]          rejects        // drafts rejected
 );
-    // K=1 -> exactly 2 committed tokens on an accept (verified + 1 bonus draft).
-    localparam integer MAX_COMMITS_PER_PASS = DRAFT_K + 1;
+    // K=1 -> exactly 2 committed tokens on an accept (verified + 1 bonus draft);
+    // the +1 bonus is added inline to total_tokens (see accept path below).
 
     // K-ready draft store (K=1 uses slot 0).  Flag marks a draft is held.
     reg [TOKW-1:0] pending_draft [0:DRAFT_K-1];
@@ -141,14 +141,16 @@ module spec_decode_seq #(
                 main_passes  <= main_passes + 32'd1;
                 accepted     <= accept;
 
+                // advance 1 token ALWAYS + 1 BONUS when the prior draft was
+                // accepted (K=1).  Single 32-bit adder instead of muxed adders.
+                total_tokens <= total_tokens + 32'd1 + {31'd0, accept};
+
                 if (accept) begin
                     // (2)(3) ACCEPT: commit the prior draft too (advance a 2nd)
-                    total_tokens   <= total_tokens + MAX_COMMITS_PER_PASS[31:0];
                     accepts        <= accepts + 32'd1;
                     second_pending <= 1'b1;
                     second_tok     <= pending_draft[0];
                 end else begin
-                    total_tokens <= total_tokens + 32'd1;
                     // (4) REJECT: prior draft present but mispredicted -> discard
                     if (do_verify)
                         rejects <= rejects + 32'd1;

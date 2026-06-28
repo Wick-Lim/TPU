@@ -381,7 +381,9 @@ module glm_decoder_block_fp8 #(
         T_RN2    = 5'd4,    // pre-ffn rmsnorm(h) -> nrm
         T_FFN_D  = 5'd5,    // dense swiglu(nrm) -> fbuf
         T_ROUTE  = 5'd6,    // moe_router_fp8(nrm) -> sel
-        T_EXP    = 5'd7,    // run routed/shared expert e
+        // T_EXP (5'd7) REMOVED: cur_gate_f is now latched at the em_start pulse
+        // (T_ROUTE / T_ACC next-expert branches), so the 1-cycle filler that only
+        // latched the gate before T_EXPW is gone -- saves 1 cycle/expert.
         T_EXPW   = 5'd8,    // wait expert done
         T_ACC    = 5'd9,    // scale+accumulate expert y into facc (1 elt/cycle)
         T_FCOMB  = 5'd10,   // finalize fbuf from facc (MoE, 1 elt/cycle)
@@ -405,6 +407,62 @@ module glm_decoder_block_fp8 #(
     // next routed-expert index (exp_i+1), used only when exp_i < TOPK-1 so it
     // never exceeds TOPK-1 (TKIW bits suffice to address sel_e).
     wire [TKIW-1:0] exp_nxt = exp_i[TKIW-1:0] + 1'b1;
+
+    //========================================================================
+    // SHARED fp32 add + bf16 narrow datapath (RESOURCE MERGE).  The four
+    // mutually-exclusive streaming states T_RADD1 / T_RADD2 / T_ACC / T_FCOMB
+    // each need at most ONE fp32 add and ONE fp32->bf16 narrow per cycle on a
+    // single element.  The per-state inline fp32_to_bf16(fp32_add(...)) copies
+    // block synthesis from sharing the adder/narrower; factor them into ONE
+    // shared adder + ONE shared narrower fed by state-muxed operands and a
+    // state-muxed element index.  Bit-identical to the original expressions.
+    //   T_RADD1 : hbuf <- bf16( x + attn )
+    //   T_RADD2 : y    <- bf16( h + ffn  )
+    //   T_ACC   : facc <- facc + gate*em_y      (stays fp32; no narrow)
+    //   T_FCOMB : fbuf <- bf16( facc )          (narrow only; no add)
+    //========================================================================
+    reg  [$clog2(MODEL_DIM)-1:0] sh_idx;     // state-muxed element index
+    reg  [31:0]                  sh_add_a;   // state-muxed fp32 addend A
+    reg  [31:0]                  sh_add_b;   // state-muxed fp32 addend B
+    reg                          sh_nsel;    // narrow src: 0=add result, 1=facc
+    wire [31:0] sh_add_s     = fp32_add(sh_add_a, sh_add_b);
+    wire [31:0] sh_narrow_in = sh_nsel ? facc[sh_idx] : sh_add_s;
+    wire [15:0] sh_narrow_bf = fp32_to_bf16(sh_narrow_in);
+    // em_y element as fp32 for the MoE accumulate.  POWER: in the SHARED expert
+    // (cur_gate_f==1.0) the routed-gate multiply is bypassed -- em_y is added
+    // straight into facc, holding the multiplier inputs stable.  1.0*x==x in
+    // fp32_mul (mantissa<<23, exponent unchanged, zero guard/sticky), so this is
+    // BIT-IDENTICAL while saving MODEL_DIM fp32 multiplies per layer.
+    wire [31:0] sh_emy_f = bf16_to_fp32(em_y[16*comb_i +: 16]);
+    always @* begin
+        sh_idx   = radd_i[$clog2(MODEL_DIM)-1:0];
+        sh_add_a = 32'h0;
+        sh_add_b = 32'h0;
+        sh_nsel  = 1'b0;
+        case (state)
+        T_RADD1: begin
+            sh_idx   = radd_i[$clog2(MODEL_DIM)-1:0];
+            sh_add_a = bf16_to_fp32(xbuf[sh_idx]);
+            sh_add_b = bf16_to_fp32(at_out[16*radd_i +: 16]);
+        end
+        T_RADD2: begin
+            sh_idx   = radd_i[$clog2(MODEL_DIM)-1:0];
+            sh_add_a = bf16_to_fp32(hbuf[sh_idx]);
+            sh_add_b = bf16_to_fp32(fbuf[sh_idx]);
+        end
+        T_ACC: begin
+            sh_idx   = comb_i[$clog2(MODEL_DIM)-1:0];
+            sh_add_a = facc[sh_idx];
+            sh_add_b = exp_is_shared ? sh_emy_f
+                                     : fp32_mul(cur_gate_f, sh_emy_f);
+        end
+        T_FCOMB: begin
+            sh_idx   = comb_i[$clog2(MODEL_DIM)-1:0];
+            sh_nsel  = 1'b1;
+        end
+        default: ;
+        endcase
+    end
 
     always @(posedge clk) begin
         if (rst) begin
@@ -492,10 +550,8 @@ module glm_decoder_block_fp8 #(
             end
             //---------------------------------------------------------------- residual add 1
             T_RADD1: begin
-                hbuf[radd_i[$clog2(MODEL_DIM)-1:0]] <=
-                    fp32_to_bf16(fp32_add(
-                        bf16_to_fp32(xbuf[radd_i[$clog2(MODEL_DIM)-1:0]]),
-                        bf16_to_fp32(at_out[16*radd_i +: 16])));
+                // h = x + attn  (shared fp32 add + bf16 narrow; see sh_* datapath)
+                hbuf[radd_i[$clog2(MODEL_DIM)-1:0]] <= sh_narrow_bf;
                 if (radd_i == MODEL_DIM[$clog2(MODEL_DIM+1)-1:0]-1'b1) begin
                     // launch pre-ffn rmsnorm over h
                     rn_src    <= 1'b1;
@@ -552,22 +608,15 @@ module glm_decoder_block_fp8 #(
                     for (ii=0; ii<MODEL_DIM; ii=ii+1) facc[ii] <= 32'h0;
                     exp_i         <= {$clog2(TOPK+2){1'b0}};
                     exp_is_shared <= 1'b0;
-                    // select first routed expert's weights and start swiglu
-                    fw_shared <= 1'b0;
-                    fw_eidx   <= rt_sel_idx[EIDXW*0 +: EIDXW];
-                    em_start  <= 1'b1;
-                    state     <= T_EXP;
+                    // select first routed expert's weights and start swiglu.
+                    // Latch its gate AT the em_start pulse (was the T_EXP filler):
+                    // first routed expert -> sel_w[0] (== rt_sel_weight[0] this cyc).
+                    fw_shared  <= 1'b0;
+                    fw_eidx    <= rt_sel_idx[EIDXW*0 +: EIDXW];
+                    cur_gate_f <= bf16_to_fp32(rt_sel_weight[16*0 +: 16]);
+                    em_start   <= 1'b1;
+                    state      <= T_EXPW;
                 end
-            end
-            //---------------------------------------------------------------- expert run
-            T_EXP: begin
-                // capture the gate to scale this expert's output by (routed) or
-                // 1.0 (shared).  Latched here so it is stable through T_EXPW.
-                if (exp_is_shared)
-                    cur_gate_f <= 32'h3F80_0000;     // 1.0 (shared, weight 1)
-                else
-                    cur_gate_f <= bf16_to_fp32(sel_w[exp_i[TKIW-1:0]]);
-                state  <= T_EXPW;
             end
             //---------------------------------------------------------------- expert wait
             T_EXPW: begin
@@ -581,29 +630,32 @@ module glm_decoder_block_fp8 #(
             //---------------------------------------------------------------- scale+accumulate (1 elt/cycle)
             T_ACC: begin
                 // facc[comb_i] += cur_gate_f * em_y[comb_i]   (one fp32 MAC/cycle)
-                facc[comb_i[$clog2(MODEL_DIM)-1:0]] <=
-                    fp32_add(facc[comb_i[$clog2(MODEL_DIM)-1:0]],
-                             fp32_mul(cur_gate_f,
-                                      bf16_to_fp32(em_y[16*comb_i +: 16])));
+                // via the SHARED fp32 adder (sh_add_s); the routed-gate multiply
+                // is bypassed for the shared expert (sh_add_b mux, see sh_* block).
+                facc[comb_i[$clog2(MODEL_DIM)-1:0]] <= sh_add_s;
                 if (comb_i == MODEL_DIM[$clog2(MODEL_DIM+1)-1:0]-1'b1) begin
                     // last element accumulated -> advance to next expert / finalize
                     if (exp_is_shared) begin
                         comb_i <= {$clog2(MODEL_DIM+1){1'b0}};
                         state  <= T_FCOMB;
                     end else if (exp_i == TOPK[$clog2(TOPK+2)-1:0]-1'b1) begin
-                        // routed experts done -> run shared expert (weight 1)
+                        // routed experts done -> run shared expert (weight 1).
+                        // Latch gate=1.0 AT the em_start pulse (was T_EXP filler).
                         exp_is_shared <= 1'b1;
                         fw_shared     <= 1'b1;
                         fw_eidx       <= {EIDXW{1'b0}};
+                        cur_gate_f    <= 32'h3F80_0000;  // 1.0 (shared, weight 1)
                         em_start      <= 1'b1;
-                        state         <= T_EXP;
+                        state         <= T_EXPW;
                     end else begin
-                        // next routed expert
-                        exp_i     <= exp_i + 1'b1;
-                        fw_shared <= 1'b0;
-                        fw_eidx   <= sel_e[exp_nxt]; // next expert id
-                        em_start  <= 1'b1;
-                        state     <= T_EXP;
+                        // next routed expert.  Latch its gate AT the em_start
+                        // pulse (was T_EXP filler): next routed -> sel_w[exp_nxt].
+                        exp_i      <= exp_i + 1'b1;
+                        fw_shared  <= 1'b0;
+                        fw_eidx    <= sel_e[exp_nxt]; // next expert id
+                        cur_gate_f <= bf16_to_fp32(sel_w[exp_nxt]);
+                        em_start   <= 1'b1;
+                        state      <= T_EXPW;
                     end
                 end else begin
                     comb_i <= comb_i + 1'b1;
@@ -612,8 +664,8 @@ module glm_decoder_block_fp8 #(
             //---------------------------------------------------------------- moe combine finalize (1 elt/cycle)
             T_FCOMB: begin
                 // narrow each fp32 accumulator to bf16 -> fbuf, one elt/cycle
-                fbuf[comb_i[$clog2(MODEL_DIM)-1:0]] <=
-                    fp32_to_bf16(facc[comb_i[$clog2(MODEL_DIM)-1:0]]);
+                // (shared fp32->bf16 narrower; see sh_* datapath)
+                fbuf[comb_i[$clog2(MODEL_DIM)-1:0]] <= sh_narrow_bf;
                 if (comb_i == MODEL_DIM[$clog2(MODEL_DIM+1)-1:0]-1'b1) begin
                     radd_i <= {$clog2(MODEL_DIM+1){1'b0}};
                     state  <= T_RADD2;
@@ -623,10 +675,8 @@ module glm_decoder_block_fp8 #(
             end
             //---------------------------------------------------------------- residual add 2
             T_RADD2: begin
-                y_out[16*radd_i +: 16] <=
-                    fp32_to_bf16(fp32_add(
-                        bf16_to_fp32(hbuf[radd_i[$clog2(MODEL_DIM)-1:0]]),
-                        bf16_to_fp32(fbuf[radd_i[$clog2(MODEL_DIM)-1:0]])));
+                // y = h + ffn  (shared fp32 add + bf16 narrow; see sh_* datapath)
+                y_out[16*radd_i +: 16] <= sh_narrow_bf;
                 if (radd_i == MODEL_DIM[$clog2(MODEL_DIM+1)-1:0]-1'b1)
                     state <= T_DONE;
                 else

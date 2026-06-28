@@ -451,7 +451,23 @@ module mla_attn_fp8 #(
             default: a_emax = 8'd0;
         endcase
     end
-    assign a_shift_comb = dyn_shift(a_emax);
+    // POWER: register the max-tree result on the PRE-START beat and feed the FP8
+    // matmul the REGISTERED a_shift, instead of routing the up-to-128-wide bf16-
+    // exponent max tree to the matmul combinationally every cycle.  The matmul
+    // latches a_shift only on its start pulse (mm_start == gv_st==GV_START), so the
+    // value must be valid AT GV_START; we therefore capture a_emax on the cycle that
+    // precedes GV_START (GV_IDLE+gv_go for tile-group 0, GV_WAIT+mm_out_valid for the
+    // later tile-groups).  The A-source vector is fully written and stable before the
+    // pass's gv_go pulse and does not change during the pass, so the captured value
+    // equals the combinational value at GV_START -> behaviour-identical.
+    reg  [7:0] a_emax_q;
+    wire       a_emax_cap = ((gv_st == GV_IDLE) && gv_go) ||
+                            ((gv_st == GV_WAIT) && mm_out_valid);
+    always @(posedge clk) begin
+        if (rst)            a_emax_q <= 8'd0;
+        else if (a_emax_cap) a_emax_q <= a_emax;
+    end
+    assign a_shift_comb = dyn_shift(a_emax_q);
 
     // combinational: assembled K lanes for the bf16 score engine.  First NOPE
     // come from knope_j[head], the rest ROPE from krope_j.  Only lane 0 means.

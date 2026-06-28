@@ -322,13 +322,14 @@ module mtp_head_fp8 #(
         end
     endfunction
 
-    reg [7:0] cemax_c; integer ce_i;
-    always @* begin
-        cemax_c = 8'd0;
-        for (ce_i = 0; ce_i < CK; ce_i = ce_i + 1)
-            if (cbuf[ce_i][14:7] > cemax_c) cemax_c = cbuf[ce_i][14:7];
-    end
-    wire signed [7:0] csh = dyn_shift(cemax_c);   // proj activation pow2 shift
+    // Running exponent-max over cbuf, updated as the concat is written during
+    // S_NORM (phases 0/1).  cbuf is fully populated before the projection
+    // streams, so cemax_r is bit-identical to a combinational max over cbuf,
+    // but this replaces the CK-deep (256-element) sequential fmax chain --
+    // the design's longest path -- with a single 8-bit compare per write.
+    // (max is associative -> identical result.)
+    reg [7:0] cemax_r;
+    wire signed [7:0] csh = dyn_shift(cemax_r);   // proj activation pow2 shift
 
     //========================================================================
     // ONE glm_decoder_block_fp8 (the verified FP8 GLM-5.2 layer) run ONCE on h'.
@@ -433,8 +434,7 @@ module mtp_head_fp8 #(
         S_NORM   = 4'd1,    // run rmsnorm pass (phase 0/1/2)
         S_PROJ   = 4'd2,    // stream K beats of combine projection (current ptile)
         S_PROJW  = 4'd3,    // wait pp_ov; store PROJ_TN h' elts; next ptile / block
-        S_DB     = 4'd4,    // start decoder block, wait one cycle
-        S_DBW    = 4'd5,    // wait db_done; xcur <= y; launch final norm
+        S_DBW    = 4'd5,    // db_start pulsed in S_PROJW; wait db_done; xcur<=y; final norm
         S_LMTILE = 4'd6,    // stream K beats for current vtile
         S_LMWAIT = 4'd7,    // wait mm_ov; store LM_TN logits; next vtile
         S_ARGMAX = 4'd8,    // scan lbuf for argmax (fp32 compare)
@@ -442,7 +442,7 @@ module mtp_head_fp8 #(
     reg [3:0] state;
 
     reg [TOKW:0]   am_i;           // argmax scan index
-    reg [31:0]     am_best;        // best logit value (fp32)
+    reg [15:0]     am_best;        // best logit value (bf16; direct magnitude compare)
     reg [TOKW-1:0] am_arg;
 
     always @(posedge clk) begin
@@ -474,8 +474,9 @@ module mtp_head_fp8 #(
             lk_present   <= {DIMW{1'b0}};
             mm_pres_valid<= 1'b0;
             am_i         <= {(TOKW+1){1'b0}};
-            am_best      <= 32'h0;
+            am_best      <= 16'h0;
             am_arg       <= {TOKW{1'b0}};
+            cemax_r      <= 8'd0;
             for (ii=0; ii<MODEL_DIM; ii=ii+1) begin
                 hbuf[ii] <= 16'h0; ebuf[ii] <= 16'h0;
                 hprime[ii] <= 16'h0; xcur[ii] <= 16'h0; xn[ii] <= 16'h0;
@@ -504,6 +505,7 @@ module mtp_head_fp8 #(
                         ebuf[ii] <= emb_t1[16*ii +: 16];
                     end
                     // launch RMSNorm(h_t) : phase 0 (reduce source = hbuf)
+                    cemax_r  <= 8'd0;        // fresh running exponent-max for cbuf
                     cn_phase <= 2'd0;
                     cn_start <= 1'b1;
                     state    <= S_NORM;
@@ -534,6 +536,10 @@ module mtp_head_fp8 #(
                         2'd1:    cbuf[MODEL_DIM[CKIW-1:0] + cn_widx[CKIW-1:0]]      <= cn_y_out;
                         default: xn[cn_widx[DIMW-1:0]]                              <= cn_y_out;
                     endcase
+                    // accumulate running exponent-max over the concat cbuf
+                    // (phases 0/1 only; phase 2 writes xn, not cbuf).
+                    if (!cn_phase[1] && (cn_y_out[14:7] > cemax_r))
+                        cemax_r <= cn_y_out[14:7];
                 end
                 if (cn_done) begin
                     if (cn_phase == 2'd0) begin
@@ -591,8 +597,9 @@ module mtp_head_fp8 #(
                         hprime[ptile*PROJ_TN + ii] <= pp_c[16*ii +: 16];
                     if (ptile == (NPTILE[PTW-1:0]-1'b1)) begin
                         // all output tiles done -> run the FP8 decoder block on h'
+                        // (db_start pulses here; go straight to the wait state)
                         db_start <= 1'b1;
-                        state    <= S_DB;
+                        state    <= S_DBW;
                     end else begin
                         ptile        <= ptile + 1'b1;
                         pp_klen      <= CK[PKW-1:0];
@@ -604,10 +611,6 @@ module mtp_head_fp8 #(
                 end
             end
             //---------------------------------------------------------------- decoder block
-            S_DB: begin
-                // db_start pulsed entering this state; wait for done.
-                state <= S_DBW;
-            end
             S_DBW: begin
                 if (db_done) begin
                     for (ii=0; ii<MODEL_DIM; ii=ii+1)
@@ -645,7 +648,7 @@ module mtp_head_fp8 #(
                         lbuf[vtile*LM_TN + ii] <= mm_c[16*ii +: 16];
                     if (vtile == (NVTILE[VTW-1:0]-1'b1)) begin
                         am_i    <= {(TOKW+1){1'b0}};
-                        am_best <= 32'hFF80_0000;   // -inf (fp32)
+                        am_best <= 16'hFF80;        // -inf (bf16)
                         am_arg  <= {TOKW{1'b0}};
                         state   <= S_ARGMAX;
                     end else begin
@@ -661,8 +664,8 @@ module mtp_head_fp8 #(
             //---------------------------------------------------------------- argmax
             S_ARGMAX: begin
                 if (am_i < VOCAB[TOKW:0]) begin
-                    if (fp32_gt(bf16_to_fp32(lbuf[am_i[TOKW-1:0]]), am_best)) begin
-                        am_best <= bf16_to_fp32(lbuf[am_i[TOKW-1:0]]);
+                    if (bf16_gt(lbuf[am_i[TOKW-1:0]], am_best)) begin
+                        am_best <= lbuf[am_i[TOKW-1:0]];
                         am_arg  <= am_i[TOKW-1:0];
                     end
                     am_i <= am_i + 1'b1;
@@ -707,22 +710,25 @@ module mtp_head_fp8 #(
     end
 
     //========================================================================
-    // fp32 greater-than (strict).  Treats -0 == +0; ignores nan (finite logits).
-    // Used for the argmax compare ONLY.
+    // bf16 greater-than (strict) on a direct sign + 15-bit |.| magnitude compare.
+    // Treats -0 == +0; ignores nan (finite logits).  Used for the argmax ONLY.
+    // bf16->fp32 is a pure low-zero-extend, so this ordering is byte-for-byte
+    // identical to the previous fp32 compare -- the comparator is just 31b->15b
+    // and am_best 32b->16b.
     //========================================================================
-    function automatic fp32_gt(input [31:0] a, input [31:0] b);
+    function automatic bf16_gt(input [15:0] a, input [15:0] b);
         reg sa, sb;
-        reg [30:0] ma, mb;
+        reg [14:0] ma, mb;
         begin
-            sa = a[31]; sb = b[31];
-            ma = a[30:0]; mb = b[30:0];
+            sa = a[15]; sb = b[15];
+            ma = a[14:0]; mb = b[14:0];
             if (sa != sb) begin
-                if ((ma == 31'b0) && (mb == 31'b0)) fp32_gt = 1'b0; // +0 vs -0
-                else fp32_gt = (sb == 1'b1);
+                if ((ma == 15'b0) && (mb == 15'b0)) bf16_gt = 1'b0; // +0 vs -0
+                else bf16_gt = (sb == 1'b1);
             end else if (sa == 1'b0) begin
-                fp32_gt = (ma > mb);
+                bf16_gt = (ma > mb);
             end else begin
-                fp32_gt = (ma < mb);
+                bf16_gt = (ma < mb);
             end
         end
     endfunction

@@ -319,8 +319,7 @@ module glm_fp8_soc #(
     //========================================================================
     localparam [2:0] H_IDLE   = 3'd0,
                      H_APPEND = 3'd1,   // append prompt latents 0..s_len-1
-                     H_RUN_S  = 3'd2,   // pulse the model start
-                     H_RUN_W  = 3'd3,   // wait model done
+                     H_RUN_W  = 3'd3,   // wait model done (mdl_start pulsed on entry)
                      H_DECAP  = 3'd4,   // append the decode token's latent
                      H_DONE   = 3'd5;
     reg [2:0]        hstate;
@@ -352,20 +351,20 @@ module glm_fp8_soc #(
                     if (start) begin
                         busy <= 1'b1;
                         ap_i <= {(IDXW+1){1'b0}};
-                        if (s_len == {(IDXW+1){1'b0}})
-                            hstate <= H_RUN_S;          // empty prompt -> straight to compute
-                        else
+                        if (s_len == {(IDXW+1){1'b0}}) begin
+                            mdl_start <= 1'b1;          // empty prompt -> launch compute now
+                            hstate    <= H_RUN_W;
+                        end else
                             hstate <= H_APPEND;
                     end
                 end
                 H_APPEND: begin
                     // pg_append_valid is high this cycle -> the pager writes row ap_i.
-                    if (ap_i == (s_len - 1'b1)) hstate <= H_RUN_S;
+                    if (ap_i == (s_len - 1'b1)) begin
+                        mdl_start <= 1'b1;             // last append beat -> launch compute now
+                        hstate    <= H_RUN_W;
+                    end
                     ap_i <= ap_i + 1'b1;
-                end
-                H_RUN_S: begin
-                    mdl_start <= 1'b1;                  // 1-cycle compute-die launch
-                    hstate    <= H_RUN_W;
                 end
                 H_RUN_W: begin
                     if (mdl_done) begin

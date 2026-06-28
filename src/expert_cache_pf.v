@@ -109,8 +109,13 @@ module expert_cache_pf #(
     //   during the wait so the cycles land in demand_stall_cycles.  When
     //   CACHE_HIT_LAT==0 the counter is never loaded -> every (hit_wait != 0)
     //   branch is dead and timing/counters are byte-for-byte the committed core.
-    reg  [31:0]       hit_wait;
-    localparam [31:0] HIT_LAT_C = CACHE_HIT_LAT[31:0];
+    // hit_wait only ever holds 0..CACHE_HIT_LAT, so size it to exactly that
+    // range (1 bit when CACHE_HIT_LAT==0).  This drops the 32-bit down-counter
+    // subtractor+compare to an HW_W-bit one (a single dead 1-bit reg in the
+    // default build); behaviour is unchanged (same values, same compares).
+    localparam integer HW_W = (CACHE_HIT_LAT <= 0) ? 1 : $clog2(CACHE_HIT_LAT+1);
+    reg  [HW_W-1:0]     hit_wait;
+    localparam [HW_W-1:0] HIT_LAT_C = CACHE_HIT_LAT[HW_W-1:0];
 
     // ---- demand queued behind an in-flight prefetch ----
     reg               dmd_pending;             // a demand miss waits for the Flash channel
@@ -199,7 +204,7 @@ module expert_cache_pf #(
     //   (hit_wait != 0) only ever holds when CACHE_HIT_LAT>0 -> with hit latency
     //   off this is identical to the committed accept condition.
     always @* begin
-        pf_ready = (state == S_IDLE) && !req_valid && (hit_wait == 32'd0);
+        pf_ready = (state == S_IDLE) && !req_valid && (hit_wait == {HW_W{1'b0}});
     end
 
     //------------------------------------------------------------------------
@@ -223,7 +228,7 @@ module expert_cache_pf #(
             pf_id_q             <= {ID_W{1'b0}};
             dmd_pending         <= 1'b0;
             dmd_pending_id      <= {ID_W{1'b0}};
-            hit_wait            <= 32'd0;
+            hit_wait            <= {HW_W{1'b0}};
             state               <= S_IDLE;
             for (k = 0; k < SLOTS; k = k + 1) begin
                 valid_arr[k] <= 1'b0;
@@ -242,17 +247,17 @@ module expert_cache_pf #(
             case (state)
                 //------------------------------------------------------------
                 S_IDLE: begin
-                    if (hit_wait != 32'd0) begin
+                    if (hit_wait != {HW_W{1'b0}}) begin
                         // ---- GDDR6 hit read in flight (CACHE_HIT_LAT>0 only) ----
                         // hit/resp_slot/LRU/counters were committed at the hit
                         // cycle; deliver resp_valid when the read finishes.  busy
                         // stays high -> these are counted as demand_stall_cycles.
-                        if (hit_wait == 32'd1) begin
+                        if (hit_wait == {{(HW_W-1){1'b0}},1'b1}) begin
                             resp_valid <= 1'b1;
                             busy       <= 1'b0;
-                            hit_wait   <= 32'd0;
+                            hit_wait   <= {HW_W{1'b0}};
                         end else begin
-                            hit_wait <= hit_wait - 32'd1;
+                            hit_wait <= hit_wait - 1'b1;
                         end
                     end else if (req_valid) begin
                         // ---- DEMAND first (identical to expert_cache_ctrl) ----
@@ -333,7 +338,7 @@ module expert_cache_pf #(
                         // a demand arriving on this exact cycle (or already queued)
                         // is deferred to S_DMD_REST to avoid a same-cycle directory
                         // write conflict with the install above.
-                        if (hit_wait != 32'd0) begin
+                        if (hit_wait != {HW_W{1'b0}}) begin
                             // a GDDR6 hit read is mid-flight (CACHE_HIT_LAT>0 only):
                             // finish the prefetch install but keep delivering that
                             // hit from S_IDLE (busy/hit_wait preserved).  The router
@@ -349,15 +354,15 @@ module expert_cache_pf #(
                         end else begin
                             state <= S_IDLE;
                         end
-                    end else if (hit_wait != 32'd0) begin
+                    end else if (hit_wait != {HW_W{1'b0}}) begin
                         // GDDR6 hit read draining concurrently with the prefetch
                         // (CACHE_HIT_LAT>0 only).  Count down; prefetch keeps going.
-                        if (hit_wait == 32'd1) begin
+                        if (hit_wait == {{(HW_W-1){1'b0}},1'b1}) begin
                             resp_valid <= 1'b1;
                             busy       <= 1'b0;
-                            hit_wait   <= 32'd0;
+                            hit_wait   <= {HW_W{1'b0}};
                         end else begin
-                            hit_wait <= hit_wait - 32'd1;
+                            hit_wait <= hit_wait - 1'b1;
                         end
                     end else begin
                         // prefetch still draining: serve demand traffic.

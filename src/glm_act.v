@@ -162,48 +162,53 @@ module glm_act #(
         reg        s;
         reg [7:0]  e;
         reg [23:0] m;            // implicit-1 significand
-        integer    sh;           // shift to align binary point
-        reg [31:0] mag;          // integer magnitude (pre-round)
+        integer    rsh;          // right-shift to align binary point (= -sh)
+        // shifted holds m>>rsh; only its low 8 bits (the integer part, |k|<=24)
+        // are used -- the high bits are the now-fractional remainder, waive lint.
+        /* verilator lint_off UNUSEDSIGNAL */
+        reg [23:0] shifted;      // m >> rsh (integer-part-aligned)
+        /* verilator lint_on UNUSEDSIGNAL */
+        reg [7:0]  mag;          // integer magnitude (pre-round): |round|<=24 -> 8b
         reg        frac_half;    // the bit just below the point
         reg        frac_rest;    // sticky OR below that
-        reg [31:0] r;
+        reg [7:0]  r;            // |k| <= 24 here -> 8 bits is ample
         begin
             s = f[31];
             e = f[30:23];
             m = {1'b1, f[22:0]};
             // value = (-1)^s * 1.m * 2^(e-127).  Integer part needs the binary
             // point at bit (e-127) of the 24-bit significand whose point sits
-            // just below bit 23.  sh = (e-127) - 23 positions of the MSB.
+            // just below bit 23.
             if (e < 8'd127) begin
                 // |f| < 1.0 -> rounds to 0 or +/-1 by the 0.5 test
                 // value's leading bit is below the units place; compare to 0.5
-                if (e == 8'd126) begin              // [0.5, 1.0): rounds to 1
-                    r = 32'd1;
-                end else begin                      // < 0.5 -> 0
-                    r = 32'd0;
-                end
+                if (e == 8'd126) r = 8'd1;          // [0.5, 1.0): rounds to 1
+                else             r = 8'd0;          // < 0.5 -> 0
+                frac_half = 1'b0;
+                frac_rest = 1'b0;
             end else begin
-                sh = ({24'b0, e} - 32'd127) - 32'd23; // signed via integer
-                if (sh >= 0) begin
-                    mag       = {8'b0, m} << sh;     // exact integer (no frac)
-                    frac_half = 1'b0;
+                // This unit only ever rounds z*log2e with |z| <= X_SAT=16, so
+                // |f| <= ~23.1 -> e in [127,131] -> the binary point is always
+                // BELOW bit 23, i.e. a pure RIGHT shift by rsh = 23-(e-127) in
+                // [19,23].  The left-shift (sh>=0, value>=2^23) case cannot occur
+                // for this bounded input and is omitted by construction, shrinking
+                // the 32-wide shifter to a 24-bit right-shifter and the magnitude
+                // to 8 bits (|round| <= 24).
+                rsh       = 32'd23 - ({24'b0, e} - 32'd127);
+                shifted   = m >> rsh;               // capture integer part
+                mag       = shifted[7:0];
+                frac_half = m[(rsh-1)];
+                if ((rsh-1) > 0)
+                    frac_rest = (m & ((24'd1 << (rsh-1)) - 24'd1)) != 24'd0;
+                else
                     frac_rest = 1'b0;
-                end else begin
-                    // shift right by (-sh); capture round/sticky
-                    mag       = {8'b0, m} >> (-sh);
-                    frac_half = m[(-sh-1)];
-                    if ((-sh-1) > 0)
-                        frac_rest = (m & (({23'b0,1'b1} << (-sh-1)) - 24'd1)) != 24'd0;
-                    else
-                        frac_rest = 1'b0;
-                end
                 // round-half-up on magnitude (ties away is fine: k feeds a
                 // range reduction, a +/-1 tie choice only shifts r by ln2 and
                 // is fully corrected by exp(r) -- result identical to ULP).
-                r = mag + (frac_half ? 32'd1 : 32'd0);
+                r = mag + (frac_half ? 8'd1 : 8'd0);
                 if (frac_rest) begin /* sticky already <0.5, no extra */ end
             end
-            fp32_round_to_int = s ? -$signed(r) : $signed(r);
+            fp32_round_to_int = s ? -$signed({24'b0, r}) : $signed({24'b0, r});
         end
     endfunction
 
@@ -295,18 +300,20 @@ module glm_act #(
     // S5 outputs: y = bf16( MODE_SILU ? s*xf : s ).
 
     // ---- pipeline registers (per lane) ----
-    reg [31:0] s1_xf  [0:LANES-1];   // clamped x (fp32)
+    // NOTE: the RAW-x forward chain (formerly s1_xf..s4_xf) now lives inside the
+    // `generate if (IS_SILU)` block near STAGE 5 -- it exists ONLY to carry x to
+    // the SiLU multiply, so it is gated out entirely in SIGMOID builds.
     reg [31:0] s1_r   [0:LANES-1];   // reduced r
-    reg signed [31:0] s1_k [0:LANES-1];
+    // k is the range-reduction exponent, clamped to [-K_MAX,K_MAX]=+/-64 and
+    // only k[10:0] is ever read by scale_pow2; a signed 9-bit reg (-256..255)
+    // holds it exactly -- the upper 23 bits were pure sign-extension.
+    reg signed [8:0] s1_k [0:LANES-1];
 
-    reg [31:0] s2_xf  [0:LANES-1];
-    reg signed [31:0] s2_k [0:LANES-1];
+    reg signed [8:0] s2_k [0:LANES-1];
     reg [31:0] s2_pr  [0:LANES-1];   // exp(r)
 
-    reg [31:0] s3_xf  [0:LANES-1];
     reg [31:0] s3_d   [0:LANES-1];   // 1 + exp(z)
 
-    reg [31:0] s4_xf  [0:LANES-1];
     reg [31:0] s4_s   [0:LANES-1];   // sigmoid
 
     // ---- valid pipeline (deterministic LAT) ----
@@ -327,9 +334,8 @@ module glm_act #(
     integer j;
 
     // ---- STAGE 1 next ----
-    reg [31:0]        n1_xf [0:LANES-1];
     reg [31:0]        n1_r  [0:LANES-1];
-    reg signed [31:0] n1_k  [0:LANES-1];
+    reg signed [8:0]  n1_k  [0:LANES-1];   // clamped to +/-64 -> 9 bits suffice
     reg [31:0] c1_xraw, c1_xcl, c1_z, c1_kf, c1_klt;
     reg signed [31:0] c1_k;
     always @* begin
@@ -350,9 +356,9 @@ module glm_act #(
             if (c1_k < -K_MAX) c1_k = -K_MAX;
             // r = z - k*ln2  (subtract == add negated); build k as fp32 first.
             c1_klt   = int_to_fp32(c1_k);
-            n1_xf[j] = c1_xraw;                  // forward RAW x for SiLU mul
+            // (RAW x for the SiLU multiply is re-derived in the g_silu block.)
             n1_r[j]  = fp32_add(c1_z, neg_fp32(fp32_mul(c1_klt, FP_LN2)));
-            n1_k[j]  = c1_k;
+            n1_k[j]  = c1_k[8:0];                // |c1_k|<=64 -> low 9 bits exact
         end
     end
 
@@ -369,7 +375,10 @@ module glm_act #(
     reg [31:0] c3_ex;
     always @* begin
         for (j = 0; j < LANES; j = j + 1) begin : ST3
-            c3_ex   = scale_pow2(s2_pr[j], s2_k[j]);   // exp(z) = 2^k*exp(r)
+            // s2_k is a 9-bit signed k; sign-extend to the 32-bit arg width
+            // (value-identical to the old 32-bit k that scale_pow2 expects).
+            c3_ex   = scale_pow2(s2_pr[j], {{23{s2_k[j][8]}}, s2_k[j]});
+
             n3_d[j] = fp32_add(FP_ONE, c3_ex);          // 1 + exp(z)
         end
     end
@@ -383,16 +392,59 @@ module glm_act #(
     end
 
     // ---- STAGE 5 next : SiLU multiply + narrow to bf16 ----
+    // The RAW-x forward chain (xf: stages 1..4) is needed ONLY to carry x to the
+    // SiLU multiply; in SIGMOID mode it is pure dead-code.  Gate the whole chain
+    // under `generate if (IS_SILU)` so the intent is structural/explicit (the
+    // optimizer already prunes it in SIGMOID builds -- this makes it so by design).
     reg [LANES*16-1:0] n5_y;
     reg [31:0] c5_val;
-    always @* begin
-        n5_y = {LANES*16{1'b0}};
-        for (j = 0; j < LANES; j = j + 1) begin : ST5
-            if (IS_SILU) c5_val = fp32_mul(s4_s[j], s4_xf[j]);  // x*sigmoid(x)
-            else         c5_val = s4_s[j];                       // sigmoid(x)
-            n5_y[16*j +: 16] = fp32_to_bf16(c5_val);
+    generate
+    if (IS_SILU) begin : g_silu
+        // RAW (sanitized) x forward pipeline, aligned 1:1 with the sigmoid
+        // stages so x4 reaches STAGE 5 on the same beat as the sigmoid result.
+        reg [31:0] x1  [0:LANES-1];
+        reg [31:0] x2  [0:LANES-1];
+        reg [31:0] x3  [0:LANES-1];
+        reg [31:0] x4  [0:LANES-1];   // x reaching S5 (multiplied by sigmoid)
+        reg [31:0] nx1 [0:LANES-1];   // stage-1 next (sanitized raw x)
+        integer    jx;
+        always @* begin
+            for (jx = 0; jx < LANES; jx = jx + 1)
+                nx1[jx] = sanitize_x(bf16_to_fp32(x_in[16*jx +: 16]));
+        end
+        always @(posedge clk) begin
+            if (rst) begin
+                for (jx = 0; jx < LANES; jx = jx + 1) begin
+                    x1[jx] <= 32'b0; x2[jx] <= 32'b0;
+                    x3[jx] <= 32'b0; x4[jx] <= 32'b0;
+                end
+            end else begin
+                for (jx = 0; jx < LANES; jx = jx + 1) begin
+                    x1[jx] <= nx1[jx];
+                    x2[jx] <= x1[jx];
+                    x3[jx] <= x2[jx];
+                    x4[jx] <= x3[jx];
+                end
+            end
+        end
+        always @* begin
+            n5_y = {LANES*16{1'b0}};
+            for (jx = 0; jx < LANES; jx = jx + 1) begin
+                c5_val = fp32_mul(s4_s[jx], x4[jx]);          // x * sigmoid(x)
+                n5_y[16*jx +: 16] = fp32_to_bf16(c5_val);
+            end
+        end
+    end else begin : g_sigmoid
+        integer jx;
+        always @* begin
+            n5_y = {LANES*16{1'b0}};
+            for (jx = 0; jx < LANES; jx = jx + 1) begin
+                c5_val = s4_s[jx];                            // sigmoid(x)
+                n5_y[16*jx +: 16] = fp32_to_bf16(c5_val);
+            end
         end
     end
+    endgenerate
 
     // ---- single clocked block: register every stage's next-state ----
     always @(posedge clk) begin
@@ -401,10 +453,10 @@ module glm_act #(
             y_out     <= {LANES*16{1'b0}};
             vpipe     <= {(LAT-1){1'b0}};
             for (j = 0; j < LANES; j = j + 1) begin
-                s1_xf[j] <= 32'b0; s1_r[j]  <= 32'b0; s1_k[j]  <= 32'sb0;
-                s2_xf[j] <= 32'b0; s2_k[j]  <= 32'sb0; s2_pr[j] <= 32'b0;
-                s3_xf[j] <= 32'b0; s3_d[j]  <= 32'b0;
-                s4_xf[j] <= 32'b0; s4_s[j]  <= 32'b0;
+                s1_r[j]  <= 32'b0; s1_k[j]  <= 9'sb0;
+                s2_k[j]  <= 9'sb0; s2_pr[j] <= 32'b0;
+                s3_d[j]  <= 32'b0;
+                s4_s[j]  <= 32'b0;
             end
         end else begin
             // valid shift register (feed-forward, deterministic LAT); out_valid
@@ -413,18 +465,14 @@ module glm_act #(
             out_valid <= vpipe[LAT-2];
             for (j = 0; j < LANES; j = j + 1) begin
                 // S1
-                s1_xf[j] <= n1_xf[j];
                 s1_r[j]  <= n1_r[j];
                 s1_k[j]  <= n1_k[j];
-                // S2 (forward xf,k ; compute pr)
-                s2_xf[j] <= s1_xf[j];
+                // S2 (forward k ; compute pr)
                 s2_k[j]  <= s1_k[j];
                 s2_pr[j] <= n2_pr[j];
-                // S3 (forward xf ; compute d)
-                s3_xf[j] <= s2_xf[j];
+                // S3 (compute d)
                 s3_d[j]  <= n3_d[j];
-                // S4 (forward xf ; compute sigmoid)
-                s4_xf[j] <= s3_xf[j];
+                // S4 (compute sigmoid)
                 s4_s[j]  <= n4_s[j];
             end
             // S5 output
@@ -446,11 +494,11 @@ module glm_act #(
     //------------------------------------------------------------------------
     function automatic [31:0] int_to_fp32(input signed [31:0] k);
         reg        s;
-        reg [31:0] a;            // magnitude
-        // mshift's high bits above [22:0] are intentionally dropped (we take the
-        // 23 mantissa bits) -- waive the unused-bits lint on the upper slice.
+        reg [7:0]  a;            // |k| <= K_MAX = 64 -> 7 significant bits (8b ample)
+        // mshift's bit 23 (the leading 1) is intentionally dropped (we keep the
+        // 23 mantissa bits below it) -- waive the unused-bits lint on that slice.
         /* verilator lint_off UNUSEDSIGNAL */
-        reg [31:0] mshift;       // a shifted to expose the fraction
+        reg [23:0] mshift;       // a left-justified to expose the fraction
         /* verilator lint_on UNUSEDSIGNAL */
         integer    msb, i;
         reg [7:0]  e;
@@ -459,15 +507,17 @@ module glm_act #(
             if (k == 0) int_to_fp32 = 32'b0;
             else begin
                 s = k[31];
-                a = s ? (~k + 1) : k;          // |k|
+                a = s ? (~k[7:0] + 8'd1) : k[7:0];  // |k| in 8 bits (|k|<=64<128)
+                // |k| <= 64 -> MSB index <= 6, so an 8-wide priority scan suffices.
                 msb = 0;
-                for (i = 0; i < 32; i = i + 1)
-                    if (a[i]) msb = i;          // highest set bit
+                for (i = 0; i < 8; i = i + 1)
+                    if (a[i]) msb = i;          // highest set bit (<= 6)
                 e = 8'd127 + msb[7:0];
-                // mantissa = fractional bits below the MSB, left-justified to 23
-                if (msb >= 23) mshift = a >> (msb - 23);
-                else           mshift = a << (23 - msb);
-                mant = mshift[22:0];
+                // mantissa = fractional bits below the MSB, left-justified to 23.
+                // msb <= 6 < 23 so this is ALWAYS a left shift; the msb>=23
+                // (|k|>=2^23) case cannot occur for |k|<=64 and is omitted.
+                mshift = {16'b0, a} << (23 - msb);
+                mant   = mshift[22:0];
                 int_to_fp32 = {s, e, mant};
             end
         end

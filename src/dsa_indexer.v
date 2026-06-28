@@ -124,9 +124,6 @@ module dsa_indexer #(
     //------------------------------------------------------------------------
     // derived sizes / constants
     //------------------------------------------------------------------------
-    /* verilator lint_off UNUSEDPARAM */
-    localparam integer MAC = `FP_MAC_LAT;                 // fp32_mac_pipe latency (doc)
-    /* verilator lint_on UNUSEDPARAM */
     localparam integer DIW = (IDX_DIM <= 1) ? 1 : $clog2(IDX_DIM); // dim counter
     // -inf : the strict lower bound topk_select treats as never-selectable, used
     // to pad the unused score slots (keys S..S_MAX-1) so selection sees only the
@@ -259,12 +256,14 @@ module dsa_indexer #(
                     for (qi = 0; qi < IDX_DIM; qi = qi + 1)
                         qbuf[qi] <= q_idx[16*qi +: 16];
                     s_reg <= s_len;
-                    // pre-fill all score slots with -inf (so j>=S can never win).
-                    for (t = 0; t < S_MAX; t = t + 1) score_mem[t] <= NEG_INF;
                     // DENSE no-op when S <= TOPK.
                     if (s_len <= TOPK[IDXW:0]) begin
                         state   <= S_DENSE;
                     end else begin
+                        // pre-fill all score slots with -inf (so j>=S can never
+                        // win).  Only the SPARSE path reads score_mem (via topk),
+                        // so the DENSE path never needs this prefill.
+                        for (t = 0; t < S_MAX; t = t + 1) score_mem[t] <= NEG_INF;
                         // begin scoring key 0
                         kcnt      <= {(IDXW+1){1'b0}};
                         acc       <= 32'b0;

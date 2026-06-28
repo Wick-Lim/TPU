@@ -130,8 +130,8 @@ module rmsnorm_unit #(
             sq[k] = fp32_mul(bf16_to_fp32(x_in[16*k +: 16]),
                              bf16_to_fp32(x_in[16*k +: 16]));
         end
-        tree_sum = 32'b0;
-        for (k = 0; k < LANES; k = k + 1)
+        tree_sum = sq[0];
+        for (k = 1; k < LANES; k = k + 1)
             tree_sum = fp32_add(tree_sum, sq[k]);
     end
 

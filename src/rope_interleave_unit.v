@@ -335,19 +335,51 @@ module rope_interleave_unit #(
     reg  [31:0]          y0_j, y1_j;
     reg  [LANES*32-1:0]  rot_beat;
 
+    //------------------------------------------------------------------------
+    // POWER: operand-isolate the deep fp32 trig+rotate cone on STALL cycles.
+    //   rot_beat is sampled into y_out ONLY when x_valid (S_RUN); on !x_valid
+    //   the freshly-computed result is discarded.  So we FREEZE the cone's
+    //   inputs (pos / beat-derived ROM select / x_in) to their last active
+    //   values whenever x_valid is low.  The combinational Taylor-trig +
+    //   rotation cone then stops re-evaluating during stalls -- no input
+    //   toggling, no dynamic power -- while every CAPTURED beat is byte-
+    //   identical to before (when x_valid is high the cone sees the live
+    //   pos_q/beat/x_in exactly as it did previously).
+    //------------------------------------------------------------------------
+    wire                cone_en = x_valid;       // result is captured this cycle
+    reg  [POSW-1:0]     pos_hold;
+    reg  [BAW:0]        beat_hold;
+    reg  [LANES*32-1:0] xin_hold;
+    always @(posedge clk) begin
+        if (rst) begin
+            pos_hold  <= {POSW{1'b0}};
+            beat_hold <= {(BAW+1){1'b0}};
+            xin_hold  <= {LANES*32{1'b0}};
+        end else if (cone_en) begin
+            pos_hold  <= pos_q;                  // latch the live inputs while active
+            beat_hold <= beat;
+            xin_hold  <= x_in;
+        end
+    end
+    wire [POSW-1:0]     pos_eff  = cone_en ? pos_q : pos_hold;
+    wire [BAW:0]        beat_eff = cone_en ? beat  : beat_hold;
+    wire [LANES*32-1:0] xin_eff  = cone_en ? x_in  : xin_hold;
+
     always @* begin
         rot_beat = {LANES*32{1'b0}};
         for (j = 0; j < LANES; j = j + 1) begin : LANE
-            // pair index this lane processes (beat*LANES + j); turn ROM lookup
-            phase_j = {{(PW-POSW){1'b0}}, pos_q}
-                      * turn_rom[32'(beat) * LANES + j];
+            // pair index this lane processes (beat*LANES + j); turn ROM lookup.
+            // Inputs are the frozen-on-stall cone operands (pos_eff/beat_eff/
+            // xin_eff): identical to pos_q/beat/x_in on captured (x_valid) beats.
+            phase_j = {{(PW-POSW){1'b0}}, pos_eff}
+                      * turn_rom[32'(beat_eff) * LANES + j];
             frac_j  = phase_j[BFR-1:0];                          // (pos*invf/2pi) mod 1
             cs_j    = cossin_turn(frac_j);
             cos_j   = cs_j[63:32];
             sin_j   = cs_j[31:0];
             // x_in lane packing: [32*j +:16]=x_even=x0, [32*j+16 +:16]=x_odd=x1
-            x0_j = bf16_to_fp32(x_in[32*j      +: 16]);
-            x1_j = bf16_to_fp32(x_in[32*j + 16 +: 16]);
+            x0_j = bf16_to_fp32(xin_eff[32*j      +: 16]);
+            x1_j = bf16_to_fp32(xin_eff[32*j + 16 +: 16]);
             // y0 = x0*cos - x1*sin ; y1 = x0*sin + x1*cos
             x0c = fp32_mul(x0_j, cos_j);
             x1s = fp32_mul(x1_j, sin_j);

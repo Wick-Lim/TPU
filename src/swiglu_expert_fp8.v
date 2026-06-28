@@ -119,18 +119,15 @@ module swiglu_expert_fp8 #(
     `include "glm_fp.vh"
 
     // ---------------- derived sizes ----------------
-    /* verilator lint_off UNUSEDPARAM */
-    localparam integer L         = `FP_ADD_LAT;       // fp8 matmul add drain (5)
-    localparam integer TREE_LAT  = 3 * `FP_ADD_LAT;   // fp8 matmul reduce tree (15)
-    localparam integer LAT_ACT   = 5;                 // glm_act fixed latency
-    localparam integer PASS_GU_LAT = HIDDEN + L + TREE_LAT + TN + 1; // one gate/up pass
-    localparam integer PASS_DN_LAT = INTER  + L + TREE_LAT + TN + 1; // one down  pass
-    localparam integer MERGE_LAT   = LAT_ACT + 1;     // silu + bf16-mul tail
-    /* verilator lint_on UNUSEDPARAM */
     localparam integer KW    = $clog2(KMAX+1);
     localparam integer NG_GU = (INTER  + TN - 1) / TN;   // gate/up: OUT=INTER
     localparam integer NG_D  = (HIDDEN + TN - 1) / TN;   // down   : OUT=HIDDEN
     localparam integer GW    = $clog2((INTER>HIDDEN?INTER:HIDDEN)/TN + 1);
+    // Partial-tile bound guards are needed ONLY for ragged tiles (OUT%TN!=0).
+    // When OUT divides evenly (default/typical sizes) the comparator+write-mask
+    // mux fold away at elaboration (DN_FULL/GU_FULL are constants).
+    localparam DN_FULL = (HIDDEN % TN == 0);   // down  output (HIDDEN) tiles even?
+    localparam GU_FULL = (INTER  % TN == 0);   // gate/up output (INTER) tiles even?
 
     // pass-select encodings (also drive w_sel)
     localparam [1:0] SEL_GATE = 2'd0, SEL_DOWN = 2'd2;
@@ -167,13 +164,29 @@ module swiglu_expert_fp8 #(
         end
     endfunction
 
-    // ---- x activation shift: combinational max over x_vec, latched at start ----
-    reg [7:0] xemax_c; integer xe_i;
-    always @* begin
-        xemax_c = 8'd0;
-        for (xe_i = 0; xe_i < HIDDEN; xe_i = xe_i + 1)
-            if (x_vec[16*xe_i + 7 +: 8] > xemax_c) xemax_c = x_vec[16*xe_i + 7 +: 8];
-    end
+    // ---- x activation shift: BALANCED-TREE max over x_vec exponent fields ----
+    // max is associative+commutative, so a depth-ceil(log2 HIDDEN) halving tree
+    // is BIT-IDENTICAL to the old serial fold (depth HIDDEN-1).  Built statically
+    // (heap-layout: node n has children 2n+1/2n+2; root = node 0), leaves padded
+    // up to a power of two with 0 (>=0, never beats a real exponent).
+    localparam integer EM_LV = (HIDDEN > 1) ? $clog2(HIDDEN) : 0; // tree depth
+    localparam integer EM_W  = 1 << EM_LV;                        // padded leaves
+    wire [8*(2*EM_W-1)-1:0] em_node;
+    genvar emg;
+    generate
+        // leaves occupy heap indices EM_W-1 .. 2*EM_W-2
+        for (emg = 0; emg < EM_W; emg = emg + 1) begin : g_emleaf
+            assign em_node[8*(EM_W-1+emg) +: 8] =
+                       (emg < HIDDEN) ? x_vec[16*emg + 7 +: 8] : 8'd0;
+        end
+        // internal nodes EM_W-2 .. 0 : pairwise max of the two children
+        for (emg = 0; emg < EM_W-1; emg = emg + 1) begin : g_emnode
+            wire [7:0] em_ca = em_node[8*(2*emg+1) +: 8];
+            wire [7:0] em_cb = em_node[8*(2*emg+2) +: 8];
+            assign em_node[8*emg +: 8] = (em_ca > em_cb) ? em_ca : em_cb;
+        end
+    endgenerate
+    wire [7:0] xemax_c = em_node[7:0];     // root (max exponent field)
     wire signed [7:0] xsh_comb = dyn_shift(xemax_c);
     reg  signed [7:0] xsh;            // latched at start
 
@@ -384,7 +397,7 @@ module swiglu_expert_fp8 #(
             S_DNW: begin
                 if (g_ov) begin
                     for (yi = 0; yi < TN; yi = yi + 1) begin
-                        if (grp*TN + yi < HIDDEN)
+                        if (DN_FULL || (grp*TN + yi < HIDDEN))
                             y_out[16*(grp*TN + yi) +: 16] <= g_c[16*yi +: 16];
                     end
                     if (grp == NG_D[GW-1:0] - 1'b1) begin
@@ -427,7 +440,7 @@ module swiglu_expert_fp8 #(
         n_h_emax = h_emax;
         for (mc = 0; mc < TN; mc = mc + 1) begin
             n_hval[mc] = bf16_mul(act_y[16*mc +: 16], up_hold[16*mc +: 16]);
-            if (grp_hold*TN + mc < INTER)
+            if (GU_FULL || (grp_hold*TN + mc < INTER))
                 if (n_hval[mc][14:7] > n_h_emax) n_h_emax = n_hval[mc][14:7];
         end
     end
@@ -437,7 +450,7 @@ module swiglu_expert_fp8 #(
         else if (start) h_emax <= 8'd0;
         else if (act_ov) begin
             for (mt = 0; mt < TN; mt = mt + 1)
-                if (grp_hold*TN + mt < INTER)
+                if (GU_FULL || (grp_hold*TN + mt < INTER))
                     hbuf[grp_hold*TN + mt] <= n_hval[mt];
             h_emax <= n_h_emax;
         end

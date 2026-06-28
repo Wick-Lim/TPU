@@ -130,13 +130,7 @@ module moe_router_fp8 #(
 );
     `include "glm_fp.vh"
 
-    // ---------------- derived latencies / sizes (documentation + control) ----
-    /* verilator lint_off UNUSEDPARAM */
-    localparam integer L          = `FP_ADD_LAT;        // fp8 matmul add drain (5)
-    localparam integer TREE_GEMM  = 3 * `FP_ADD_LAT;    // fp8 matmul reduce tree (15)
-    localparam integer GEMV_LAT   = HIDDEN + L + TREE_GEMM + 1 + 1; // +1 rescale (PE_M*PE_N=N_EXPERT walked) note: doc only
-    localparam integer LAT_ACT    = 5;                  // glm_act fixed latency (doc)
-    /* verilator lint_on UNUSEDPARAM */
+    // ---------------- derived sizes ----
     localparam integer KW         = $clog2(KMAX+1);
 
     // renorm add-tree depth: ceil(log2 TOPK) levels of fp32_add_pipe.  TOPK is a
@@ -173,13 +167,34 @@ module moe_router_fp8 #(
         end
     endfunction
 
-    // combinational max over the bf16 exponent fields of x_vec, latched at start.
-    reg [7:0] xemax_c; integer xe_i;
-    always @* begin
-        xemax_c = 8'd0;
-        for (xe_i = 0; xe_i < HIDDEN; xe_i = xe_i + 1)
-            if (x_vec[16*xe_i + 7 +: 8] > xemax_c) xemax_c = x_vec[16*xe_i + 7 +: 8];
-    end
+    // Balanced binary max-reduction tree over the HIDDEN bf16 exponent fields.
+    // Integer max is associative, so this is bit-identical to the serial
+    // xemax_c = max(0, all fields) reduction, but the comb depth drops from
+    // HIDDEN-1 to ceil(log2 HIDDEN) -- a large start-cycle fmax win.  Unused
+    // leaves pad with 0 (max-identity), matching the serial init of 0.
+    localparam integer EMLEV = (HIDDEN <= 1) ? 1 : $clog2(HIDDEN);
+    localparam integer EMPOW = (1 << EMLEV);
+    // split_var: the per-level tree array is strictly feed-forward, but verilator
+    // sees one array name written/read across levels and (falsely) flags a
+    // combinational loop (UNOPTFLAT); splitting resolves it with no logic change.
+    wire [7:0] emax_node [0:EMLEV][0:EMPOW-1] /*verilator split_var*/;
+    genvar em_l, em_i;
+    generate
+      for (em_i = 0; em_i < EMPOW; em_i = em_i + 1) begin : EMAX_LEAF
+        assign emax_node[0][em_i] = (em_i < HIDDEN) ? x_vec[16*em_i + 7 +: 8] : 8'd0;
+      end
+      for (em_l = 0; em_l < EMLEV; em_l = em_l + 1) begin : EMAX_LVL
+        for (em_i = 0; em_i < (EMPOW >> (em_l+1)); em_i = em_i + 1) begin : EMAX_NODE
+          assign emax_node[em_l+1][em_i] =
+              (emax_node[em_l][2*em_i] > emax_node[em_l][2*em_i+1])
+                ? emax_node[em_l][2*em_i] : emax_node[em_l][2*em_i+1];
+        end
+        for (em_i = (EMPOW >> (em_l+1)); em_i < EMPOW; em_i = em_i + 1) begin : EMAX_PAD
+          assign emax_node[em_l+1][em_i] = 8'd0;
+        end
+      end
+    endgenerate
+    wire [7:0] xemax_c = emax_node[EMLEV][0];
     wire signed [7:0] xsh_comb = dyn_shift(xemax_c);
     reg  signed [7:0] xsh;            // latched at start (feeds matmul a_shift)
 
@@ -249,8 +264,10 @@ module moe_router_fp8 #(
         .out_valid(act_ov), .y_out(act_y)
     );
 
-    // fp32 widened gates (topk scores + renorm operands).  Captured at act_ov.
-    reg [31:0] gate_f [0:N_EXPERT-1];
+    // bf16 gates captured at act_ov.  We store the 16-bit bf16 (not a widened
+    // fp32) and apply the EXACT bf16->fp32 widen at the topk feed point, saving
+    // 16*N_EXPERT flops with bit-identical topk ordering / win_gate.
+    reg [15:0] gate_bf [0:N_EXPERT-1];
 
     // ===================================================================
     //  (3) TOP-K : pick the TOPK largest gates -> indices + selected gates. -- bf16
@@ -281,8 +298,8 @@ module moe_router_fp8 #(
     // score-load address counter (which gate_f we hand topk this beat).
     // EIW+1 bits so it counts 0..N_EXPERT cleanly (one spare bit for the == N).
     reg [EIW:0] tk_addr;             // expert load index 0..N_EXPERT
-    // captured TOPK winners (indices + fp32 gates) at topk.done
-    reg [IDXW-1:0] win_idx [0:TOPK-1];
+    // captured TOPK winner gates (fp32) at topk.done; the winner indices are
+    // written straight into sel_idx (no win_idx[] pass-through copy).
     reg [31:0]     win_gate[0:TOPK-1];
 
     // ===================================================================
@@ -377,11 +394,9 @@ module moe_router_fp8 #(
             rs_reg         <= 32'b0;
             sel_idx        <= {TOPK*IDXW{1'b0}};
             sel_weight     <= {TOPK*16{1'b0}};
-            for (i = 0; i < N_EXPERT; i = i + 1) gate_f[i] <= 32'b0;
-            for (i = 0; i < TOPK; i = i + 1) begin
-                win_idx[i]  <= {IDXW{1'b0}};
+            for (i = 0; i < N_EXPERT; i = i + 1) gate_bf[i] <= 16'b0;
+            for (i = 0; i < TOPK; i = i + 1)
                 win_gate[i] <= 32'b0;
-            end
         end else begin
             // ---- defaults (deassert pulses) ----
             done           <= 1'b0;
@@ -432,7 +447,7 @@ module moe_router_fp8 #(
             S_ACT: begin
                 if (act_ov) begin
                     for (i = 0; i < N_EXPERT; i = i + 1)
-                        gate_f[i] <= bf16_to_fp32(act_y[16*i +: 16]);
+                        gate_bf[i] <= act_y[16*i +: 16];
                     tk_start <= 1'b1;                 // begin top-K
                     tk_addr  <= {(EIW+1){1'b0}};
                     state    <= S_TKL;
@@ -443,13 +458,13 @@ module moe_router_fp8 #(
             S_TKL: begin
                 if (tk_load_req) begin
                     tk_score_valid <= 1'b1;
-                    tk_score_in    <= gate_f[tk_addr[EIW-1:0]];
+                    tk_score_in    <= bf16_to_fp32(gate_bf[tk_addr[EIW-1:0]]);
                     tk_addr        <= tk_addr + 1'b1;
                 end
                 if (tk_done) begin
                     for (t = 0; t < TOPK; t = t + 1) begin
-                        win_idx[t]  <= tk_sel_idx[IDXW*t +: IDXW];
-                        win_gate[t] <= tk_sel_score[32*t +: 32];
+                        sel_idx[IDXW*t +: IDXW] <= tk_sel_idx[IDXW*t +: IDXW];
+                        win_gate[t]             <= tk_sel_score[32*t +: 32];
                     end
                     sum_go <= 1'b1;                   // launch renorm add-tree
                     state  <= S_SUM;
@@ -475,11 +490,9 @@ module moe_router_fp8 #(
 
             // ---- per selected gate: w_j = gate_j * (SCALE/s) -> bf16 ----
             S_MUL: begin
-                for (t = 0; t < TOPK; t = t + 1) begin
-                    sel_idx[IDXW*t +: IDXW] <= win_idx[t];
+                for (t = 0; t < TOPK; t = t + 1)
                     sel_weight[16*t +: 16]  <=
                         fp32_to_bf16(fp32_mul(win_gate[t], rs_reg));
-                end
                 state <= S_DONE;
             end
 
