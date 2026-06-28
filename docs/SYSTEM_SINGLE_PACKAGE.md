@@ -210,13 +210,15 @@ can't be statically placed — it's a **caching + scheduling** problem:
   `expert_cache_ctrl` at 34 GB cache: batch 1 / 8 / 32 → **26.5 % / 29.7 % / 50.5 %** hit rate
   (same router picks, only access order changes — isolating batching as the lever).
 - **Prefetch/predict**: speculate next experts (the next layer's router is cheap and runs ahead)
-  and DMA into GDDR6 during the current layer's compute → hide Flash *latency* — and, since
-  GDDR6 has higher access latency than HBM, prefetch matters *more* here (it hides that too).
+  and DMA into GDDR6 during the current layer's compute → hide the **big Flash fetch latency**.
   Built + measured as **`src/expert_cache_pf.v`** (a prefetch hint port + demand-priority
   background Flash fetch + a `demand_stall_cycles` counter; demand path bit-exact to
-  `expert_cache_ctrl` with prefetch off). On the decode trace under a compute-window model, the
-  demand stall is cut **59 % (compute window TC=12)** to **99 % (TC ≥ fetch latency)** — the
-  fetch is fully overlapped with compute when the window is long enough.
+  `expert_cache_ctrl` with prefetch off; a `CACHE_HIT_LAT` parameter models the GDDR6 read).
+  Honest result (compute-window model, FLASH_LAT=20, GDDR6 `CACHE_HIT_LAT=4`): prefetch
+  **trades the big Flash-miss stall (≈22 cyc) for the small GDDR6 read** — demand stall cut
+  **~81 %** (4400 → 818), not the ~99 % an idealized zero-latency cache (CACHE_HIT_LAT=0) shows.
+  The residual is the irreducible GDDR6 read floor (`+CACHE_HIT_LAT` per resident hit); a
+  second-level GDDR6→die read-ahead could hide that too (future work).
 - **Layout**: store co-activated experts contiguously / aligned for sequential Flash reads
   (bandwidth- not IOPS-bound, since each expert is a ~37 MB contiguous block).
 - **Speculative / MTP decoding**: GLM-5.2 ships an MTP head (built here as `mtp_head`) — verify
