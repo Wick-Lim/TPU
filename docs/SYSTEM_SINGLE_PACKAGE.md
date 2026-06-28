@@ -137,22 +137,48 @@ Two non-obvious findings the sim revealed:
 within a layer across the batch) the hit rate is ~28–50 % (batch 8) to ~47–66 % (batch 32)
 **even at a 5.5 GB cache** — cache size becomes nearly irrelevant.
 
-### 7.2 Throughput
+### 7.2 Combined throughput model (batching + prefetch)
 
-Flash ~50–100 GB/s, modest FP8 die (~1 TFLOP/s), routed bytes/token = (1 − hit) × 22 GB:
+With **prefetch** the Flash *latency* is hidden behind compute (§8: 99 % of stall removed when
+the compute window ≥ flash latency), so the machine runs at the Flash **bandwidth** wall. The
+master equation (per-token routed footprint = 600 experts; FP8 = 22 GB, INT4 = 11 GB):
 
-| Config | hit rate | routed Flash bytes/token | ~tokens/s |
-|---|---|---|---|
-| FP8 batch=1, 34 GB cache (realistic) | ~27 % | ~16 GB | **~3–6** |
-| FP8 batch=1, cache < 22 GB | ~0 % | ~22 GB | ~2–5 |
-| FP8 batch=32 | ~50 % | ~11 GB/token-equiv, ÷batch | **tens/s** |
-| **INT4** (re-quant) + batch | — | ×½ bytes | **~2× the above** |
-| + speculative/MTP ×K tokens/pass | — | ÷K weight passes | ~×K |
+> **aggregate tokens/s ≈ Flash_BW / [ (1 − h) × footprint ]**  ·  (then × K for speculative/MTP)
 
-So: **~3–6 tokens/s at FP8 batch=1** (the cache helps only modestly — ~27 % — because trained
-routing is balanced), **scaling to tens/s with batching** (the dominant lever), and further
-with INT4 + speculative/MTP. Interactive, not real-time-serving. Compute and the single die are
-*not* the limit (the die idles waiting on Flash).
+where **h** is the *batched* cache hit rate measured through the real RTL (§7.1, §8):
+batch 1 = 26.5 %, batch 8 = 29.7 %, batch 32 = 50.5 %. Each lever moves one term:
+
+| Lever | What it changes | Measured effect |
+|---|---|---|
+| **Prefetch** | latency-bound → **bandwidth-bound** | required to reach the wall; 99 % stall cut |
+| **Batching** | raises **h** → lowers (1 − h) | h 27 %→50 % (batch 1→32) ⇒ only **~1.5×** here |
+| **INT4** (re-quant) | halves the **footprint** | **~2×** |
+| **Speculative/MTP** | **÷K** weight passes (K tokens/pass) | **~×K** |
+| **Flash bandwidth** (hardware) | raises **Flash_BW** | linear |
+
+Aggregate tokens/s (Flash 50 / 100 GB/s, prefetch on):
+
+| Config | h | (1−h)×footprint | @50 GB/s | @100 GB/s |
+|---|---|---|---|---|
+| FP8 batch 1 (single-user) | 27 % | 16 GB | ~3 | ~6 |
+| FP8 batch 32 | 50 % | 11 GB | ~5 | ~9 |
+| INT4 batch 32 | 50 % | 5.5 GB | ~9 | ~18 |
+| INT4 batch 32 + MTP ×2 | — | — | **~18** | **~37** |
+
+**Honest nuance — batching is not a free Nx.** In this Flash-bandwidth-bound regime batching
+only helps through the hit rate, and trained-router entropy caps the reuse: batch 32 gives
+**~1.5× aggregate**, not the order-of-magnitude that *compute*-bound batched serving enjoys.
+And the aggregate is split across the B streams, so **per-user rate = aggregate ÷ B** — batching
+trades single-user latency for aggregate throughput. (Larger B keeps raising h toward "fetch each
+expert once per batch," but per-user latency keeps dropping.)
+
+**Bottom line:** **~3–6 tokens/s single-user FP8** (prefetch hides latency; the cache helps only
+modestly because trained routing is balanced). The real multipliers are **INT4 (×2)**,
+**speculative/MTP (×K)**, and raw **Flash bandwidth** — *not* batching, whose aggregate gain is
+modest here. So an INT4 + MTP×2 single package at ~100 GB/s in-package Flash lands around
+**~20–40 aggregate tokens/s**. Interactive, not datacenter-real-time. Compute and the single die
+are *not* the limit (the die idles on Flash); the wall is moving ~10–16 GB of routed-expert
+weights per token across the in-package Flash bus.
 
 ## 8. MoE expert-cache subsystem (the heart of it)
 
