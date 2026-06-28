@@ -156,29 +156,37 @@ batch 1 = 26.5 %, batch 8 = 29.7 %, batch 32 = 50.5 %. Each lever moves one term
 | **Speculative/MTP** | **÷K** weight passes (K tokens/pass) | **~×K** |
 | **Flash bandwidth** (hardware) | raises **Flash_BW** | linear |
 
-Aggregate tokens/s (Flash 50 / 100 GB/s, prefetch on):
+**This project runs FP8** — the published `zai-org/GLM-5.2-FP8` checkpoint, faithfully, no
+re-quantization. So the throughput levers are the **FP8-compatible** ones; INT4 is *off the
+faithful path* (it means re-quantizing the model ourselves and owning the quality risk) and is
+listed only as an escape hatch. Aggregate tokens/s on the FP8 path (Flash 50 / 100 GB/s,
+prefetch on):
 
-| Config | h | (1−h)×footprint | @50 GB/s | @100 GB/s |
+| Config (FP8 path) | h | (1−h)×22 GB | @50 GB/s | @100 GB/s |
 |---|---|---|---|---|
-| FP8 batch 1 (single-user) | 27 % | 16 GB | ~3 | ~6 |
-| FP8 batch 32 | 50 % | 11 GB | ~5 | ~9 |
-| INT4 batch 32 | 50 % | 5.5 GB | ~9 | ~18 |
-| INT4 batch 32 + MTP ×2 | — | — | **~18** | **~37** |
+| batch 1 (single-user) | 27 % | 16 GB | ~3 | ~6 |
+| batch 1 + **MTP ×2** | — | — | ~6 | ~12 |
+| batch 32 | 50 % | 11 GB | ~5 | ~9 |
+| **batch 32 + MTP ×2** | — | — | **~10** | **~18** |
+| *(off-path)* INT4 batch 32 + MTP ×2 | — | 5.5 GB | ~18 | ~37 |
 
-**Honest nuance — batching is not a free Nx.** In this Flash-bandwidth-bound regime batching
-only helps through the hit rate, and trained-router entropy caps the reuse: batch 32 gives
-**~1.5× aggregate**, not the order-of-magnitude that *compute*-bound batched serving enjoys.
-And the aggregate is split across the B streams, so **per-user rate = aggregate ÷ B** — batching
-trades single-user latency for aggregate throughput. (Larger B keeps raising h toward "fetch each
-expert once per batch," but per-user latency keeps dropping.)
+**The FP8 multiplier that matters is speculative / MTP decoding (×K).** GLM-5.2 ships an MTP head
+(`num_nextn_predict_layers=1`) and we built it (`mtp_head`): verifying K tokens per weight-load
+pass divides the Flash traffic ~K× **without leaving FP8**. With a longer draft (a small draft
+model or multi-token MTP) K can exceed 2.
 
-**Bottom line:** **~3–6 tokens/s single-user FP8** (prefetch hides latency; the cache helps only
-modestly because trained routing is balanced). The real multipliers are **INT4 (×2)**,
-**speculative/MTP (×K)**, and raw **Flash bandwidth** — *not* batching, whose aggregate gain is
-modest here. So an INT4 + MTP×2 single package at ~100 GB/s in-package Flash lands around
-**~20–40 aggregate tokens/s**. Interactive, not datacenter-real-time. Compute and the single die
-are *not* the limit (the die idles on Flash); the wall is moving ~10–16 GB of routed-expert
-weights per token across the in-package Flash bus.
+**Batching is not a free Nx** in this Flash-bandwidth-bound regime — it only helps through the
+hit rate, and trained-router entropy caps the reuse: batch 32 gives **~1.5× aggregate**, split
+across the B streams (**per-user = aggregate ÷ B**), i.e. it trades single-user latency for
+aggregate throughput.
+
+**Bottom line (FP8):** **~3–6 tokens/s single-user**, **~6–12 with MTP ×2**, and **~10–18
+aggregate** at batch 32 + MTP ×2 (~100 GB/s in-package Flash). Prefetch is required (hides
+latency → reach the bandwidth wall); MTP and raw Flash bandwidth are the real multipliers;
+batching is a modest, latency-costing aggregate boost. Interactive, not datacenter-real-time.
+Compute and the single die are *not* the limit (the die idles on Flash); the wall is moving
+~11–16 GB of routed-expert weights per token across the in-package Flash bus. (INT4 would ~2×
+everything but is a different, re-quantized model — outside the "run the published FP8" goal.)
 
 ## 8. MoE expert-cache subsystem (the heart of it)
 
