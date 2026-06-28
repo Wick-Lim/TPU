@@ -76,15 +76,23 @@ the activation×activation attention matmuls in bf16.
 
 ## Tang Nano 20K (Gowin GW2A-18) — why FP8
 
-Measured (Yosys `synth_gowin`) fit on the GW2A-18 (budget: ~20,736 LUT4, ~15,552 FF,
-~48 DSP, 46×18Kb BSRAM, + 8 MB on-board PSRAM):
+Measured fit on the GW2A-18 (budget: ~20,736 LUT4, ~15,552 FF, ~48 DSP, 46×18Kb BSRAM,
++ 8 MB on-board PSRAM):
 
-- **fp32 does NOT fit** — `mla_attn` alone ≈ **396 DSP-equiv** (8× the device), because
-  each fp32 multiply maps to ~4 DSP (a 24×24 mantissa multiply).
+- **fp32 does NOT fit** — `mla_attn` alone ≈ **396 DSP-equiv** (8× the device; each fp32
+  multiply maps to ~4 DSP — a 24×24 mantissa multiply).
 - **FP8 frees the scarce DSP** — its 4×4 mantissa multiply sips DSP and spends the
-  plentiful LUT instead (the opposite resource profile). On a DSP-constrained device
-  this is the enabling change; the precise decoder-block LUT fit is being measured with
-  the FP8 synth.
+  plentiful LUT instead (`glm_matmul_fp8` uses 18× 7-bit multipliers, ~0 DSP). The LUT cost
+  is then the **fp32 accumulators**, which scale with the PE-array size. Measured (4-LUT map):
+
+  | `glm_matmul_fp8` config | LUT4 | FF | GW2A-18 |
+  |---|---|---|---|
+  | PE 4×4, K=256 (default) | ~294,000 | ~90,000 | ❌ ~14× over |
+  | **PE 1×1, K=128 (time-multiplexed)** | **~10,100** | **~2,900** | ✅ **fits (49 % LUT, ~0 DSP)** |
+
+- So a **single time-multiplexed FP8 GEMM fits the Tang Nano 20K** (~half the LUTs) — enough
+  to prove the FP8 datapath on real silicon. A *full decoder block* (many GEMMs + the bf16
+  tail) does not fit; that needs heavy sequencing over one small GEMM or a larger FPGA.
 
 A *real flashable bitstream* additionally needs the open-source Gowin P&R
 (`nextpnr-himbaechel`/apicula) installed and the physical board; `synth_gowin` here
