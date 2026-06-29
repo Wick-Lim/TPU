@@ -96,11 +96,15 @@
 //   Stage layout (per lane, identical across lanes):
 //     S1  decode + clamp  : widen bf16->fp32, clamp to [-X_SAT,X_SAT], z=-x,
 //                           compute k = round(z*log2e), r = z - k*ln2.
-//     S2  poly            : exp(r) via degree-5 Horner (fp32).
+//     S2a poly (inner)     : inner 3 Horner levels of exp(r) -> partial p_lo.
+//     S2b poly (outer)     : outer 2 Horner levels -> exp(r) (fp32).
 //     S3  scale+denom     : ex = 2^k * exp(r) (exponent add); d = 1+ex.
 //     S4  recip           : t = rsqrt(d); s = t*t  (= sigmoid(x)).
 //     S5  finish          : MODE_SILU -> s = s * x ; round fp32->bf16 -> y.
-//   => LAT = 5 cycles, fixed, regardless of the data.  out_valid is in_valid
+//   The degree-5 Horner exp poly is split across S2a/S2b (3+2 levels) so no
+//   single stage carries more than 3 serial fp multiplies -- a latency-only
+//   repipeline for fmax; exp(r) is bit-identical to the old one-stage Horner.
+//   => LAT = 6 cycles, fixed, regardless of the data.  out_valid is in_valid
 //   delayed by LAT through a shift register, so the handshake is exact.
 //   THROUGHPUT = LANES elements/cycle (one beat in, one beat out, every cycle).
 //
@@ -215,16 +219,36 @@ module glm_act #(
     //------------------------------------------------------------------------
     // exp(r) for r in [-ln2/2, ln2/2] via degree-5 Horner (all fp32):
     //   p = 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120)))))
+    //
+    // REPIPELINED FOR FMAX: the 5 dependent fp32 mul+add Horner levels form the
+    // deepest single-stage combinational cone in the unit (5 serial 24x24 fp
+    // multiplies).  The evaluation is split across TWO registered pipeline
+    // stages so neither carries more than 3 serial multiplies:
+    //   exp_poly_lo : the inner 3 Horner levels (coeffs 1/120,1/24,1/6,1/2),
+    //                 producing the partial accumulator p_lo.
+    //   exp_poly_hi : the outer 2 Horner levels (coeffs 1,1), finishing exp(r).
+    // This is a LATENCY-ONLY change: the arithmetic sequence is byte-for-byte
+    // identical to the old single-call Horner, so exp(r) -- and every bf16
+    // output -- is bit-exact to before (only a pipeline register is inserted
+    // between the 3rd and 4th Horner level).
     //------------------------------------------------------------------------
-    function automatic [31:0] exp_poly(input [31:0] r);
+    // inner 3 Horner levels: p_lo = 1/2 + r*(1/6 + r*(1/24 + r*(1/120)))
+    function automatic [31:0] exp_poly_lo(input [31:0] r);
         reg [31:0] p;
         begin
             p = fp32_add(FP_1_24,  fp32_mul(r, FP_1_120));
             p = fp32_add(FP_1_6,   fp32_mul(r, p));
             p = fp32_add(FP_1_2,   fp32_mul(r, p));
+            exp_poly_lo = p;
+        end
+    endfunction
+    // outer 2 Horner levels: exp(r) = 1 + r*(1 + r*p_lo)
+    function automatic [31:0] exp_poly_hi(input [31:0] r, input [31:0] p_lo);
+        reg [31:0] p;
+        begin
+            p = fp32_add(FP_ONE,   fp32_mul(r, p_lo));
             p = fp32_add(FP_ONE,   fp32_mul(r, p));
-            p = fp32_add(FP_ONE,   fp32_mul(r, p));
-            exp_poly = p;
+            exp_poly_hi = p;
         end
     endfunction
 
@@ -309,6 +333,14 @@ module glm_act #(
     // holds it exactly -- the upper 23 bits were pure sign-extension.
     reg signed [8:0] s1_k [0:LANES-1];
 
+    // ---- S2a: inner half of the repipelined exp poly ----
+    // exp(r) is now evaluated across TWO stages (S2a -> S2b) so the 5-level
+    // Horner cone is split 3+2.  S2a holds the partial accumulator p_lo plus the
+    // forwarded r and k that the outer half (S2b) still needs.
+    reg [31:0] s2a_r  [0:LANES-1];   // forwarded r (outer Horner half consumes it)
+    reg [31:0] s2a_p  [0:LANES-1];   // partial exp poly (inner 3 Horner levels)
+    reg signed [8:0] s2a_k [0:LANES-1]; // forwarded k
+
     reg signed [8:0] s2_k [0:LANES-1];
     reg [31:0] s2_pr  [0:LANES-1];   // exp(r)
 
@@ -321,7 +353,10 @@ module glm_act #(
     // must land on the SAME cycle as y_out, so it is the 5th tap of a shift
     // register seeded by in_valid: vpipe[0]<=in_valid (aligned with s1), and
     // out_valid<=vpipe[LAT-2] (aligned with y_out, the 5th stage).
-    localparam integer LAT = 5;
+    // LAT is now 6: the exp poly was split into S2a/S2b for fmax, inserting one
+    // extra registered stage (S1,S2a,S2b,S3,S4 then y_out).  out_valid is still
+    // the final tap of the valid shift register, so the handshake stays exact.
+    localparam integer LAT = 6;
     reg [LAT-2:0] vpipe;          // LAT-1 internal taps; out_valid is the last
 
     // ===================================================================
@@ -362,11 +397,19 @@ module glm_act #(
         end
     end
 
-    // ---- STAGE 2 next : exp(r) ----
+    // ---- STAGE 2a next : inner 3 Horner levels of exp(r) ----
+    reg [31:0]        n2a_p [0:LANES-1];
+    always @* begin
+        for (j = 0; j < LANES; j = j + 1) begin : ST2A
+            n2a_p[j] = exp_poly_lo(s1_r[j]);
+        end
+    end
+
+    // ---- STAGE 2b next : outer 2 Horner levels -> exp(r) ----
     reg [31:0]        n2_pr [0:LANES-1];
     always @* begin
-        for (j = 0; j < LANES; j = j + 1) begin : ST2
-            n2_pr[j] = exp_poly(s1_r[j]);
+        for (j = 0; j < LANES; j = j + 1) begin : ST2B
+            n2_pr[j] = exp_poly_hi(s2a_r[j], s2a_p[j]);
         end
     end
 
@@ -401,11 +444,14 @@ module glm_act #(
     generate
     if (IS_SILU) begin : g_silu
         // RAW (sanitized) x forward pipeline, aligned 1:1 with the sigmoid
-        // stages so x4 reaches STAGE 5 on the same beat as the sigmoid result.
+        // stages so x5 reaches the final stage on the same beat as the sigmoid
+        // result.  The exp poly split (S2a/S2b) added one stage, so the chain is
+        // now 5 deep (x1..x5) instead of 4 -- still pure register insertion.
         reg [31:0] x1  [0:LANES-1];
         reg [31:0] x2  [0:LANES-1];
         reg [31:0] x3  [0:LANES-1];
-        reg [31:0] x4  [0:LANES-1];   // x reaching S5 (multiplied by sigmoid)
+        reg [31:0] x4  [0:LANES-1];
+        reg [31:0] x5  [0:LANES-1];   // x reaching the final stage (x * sigmoid)
         reg [31:0] nx1 [0:LANES-1];   // stage-1 next (sanitized raw x)
         integer    jx;
         always @* begin
@@ -416,7 +462,7 @@ module glm_act #(
             if (rst) begin
                 for (jx = 0; jx < LANES; jx = jx + 1) begin
                     x1[jx] <= 32'b0; x2[jx] <= 32'b0;
-                    x3[jx] <= 32'b0; x4[jx] <= 32'b0;
+                    x3[jx] <= 32'b0; x4[jx] <= 32'b0; x5[jx] <= 32'b0;
                 end
             end else begin
                 for (jx = 0; jx < LANES; jx = jx + 1) begin
@@ -424,13 +470,14 @@ module glm_act #(
                     x2[jx] <= x1[jx];
                     x3[jx] <= x2[jx];
                     x4[jx] <= x3[jx];
+                    x5[jx] <= x4[jx];
                 end
             end
         end
         always @* begin
             n5_y = {LANES*16{1'b0}};
             for (jx = 0; jx < LANES; jx = jx + 1) begin
-                c5_val = fp32_mul(s4_s[jx], x4[jx]);          // x * sigmoid(x)
+                c5_val = fp32_mul(s4_s[jx], x5[jx]);          // x * sigmoid(x)
                 n5_y[16*jx +: 16] = fp32_to_bf16(c5_val);
             end
         end
@@ -454,6 +501,7 @@ module glm_act #(
             vpipe     <= {(LAT-1){1'b0}};
             for (j = 0; j < LANES; j = j + 1) begin
                 s1_r[j]  <= 32'b0; s1_k[j]  <= 9'sb0;
+                s2a_r[j] <= 32'b0; s2a_p[j] <= 32'b0; s2a_k[j] <= 9'sb0;
                 s2_k[j]  <= 9'sb0; s2_pr[j] <= 32'b0;
                 s3_d[j]  <= 32'b0;
                 s4_s[j]  <= 32'b0;
@@ -467,8 +515,12 @@ module glm_act #(
                 // S1
                 s1_r[j]  <= n1_r[j];
                 s1_k[j]  <= n1_k[j];
-                // S2 (forward k ; compute pr)
-                s2_k[j]  <= s1_k[j];
+                // S2a (inner exp poly half ; forward r and k)
+                s2a_r[j] <= s1_r[j];
+                s2a_p[j] <= n2a_p[j];
+                s2a_k[j] <= s1_k[j];
+                // S2b (forward k ; finish exp poly -> pr)
+                s2_k[j]  <= s2a_k[j];
                 s2_pr[j] <= n2_pr[j];
                 // S3 (compute d)
                 s3_d[j]  <= n3_d[j];

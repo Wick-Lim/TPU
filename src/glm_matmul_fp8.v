@@ -161,6 +161,7 @@ module glm_matmul_fp8 #(
     // K-block fan-out: NB = ceil(KMAX/BLK) accumulator banks per PE.
     localparam integer NB  = (KMAX + BLK - 1) / BLK;
     localparam integer BKW = $clog2(NB + 1);          // current-block index width
+    localparam integer IXW = (NB > 1) ? $clog2(NB) : 1; // bank array index width (0..NB-1)
     localparam integer PSW = (BLK > 1) ? $clog2(BLK) : 1; // within-block position width
 
     // ----------------------------------------------------------------------
@@ -175,11 +176,22 @@ module glm_matmul_fp8 #(
     /* verilator lint_on UNUSEDSIGNAL */
     reg                streaming;
     reg                mac_draining;  // wait L cycles for last add to retire
-    reg                tree_draining; // wait TREE_LAT for the reduce tree
+    reg                reducing;      // feed the SHARED reduction tree, bank by bank
     reg                rescaling;     // time-shared dequant pass
     reg  [7:0]         mac_drain;
-    reg  [7:0]         drain_cnt;
-    reg                red_go;        // 1-cycle pulse: launch every PE's add-tree
+    reg  [7:0]         red_cnt;       // reduce-phase cycle counter (feed + drain)
+    // SHARED reduction tree feed: one PE-wide tree per PE, time-multiplexed across
+    // the NB banks.  During the reduce phase we present bank red_fidx's leaves to
+    // every PE's tree for one cycle each (red_cnt = 0..NB-1); the pipelined tree
+    // streams the NB block-partials out TREE_LAT later, one per cycle.  This is
+    // BIT-EXACT to the old per-bank trees (identical leaf grouping / operands /
+    // order) -- only the adder hardware is shared in time.
+    wire               red_feed_v = reducing & (red_cnt < NB[7:0]); // feeding a bank
+    wire [IXW-1:0]     red_fidx   = red_cnt[IXW-1:0];               // bank fed this cycle
+    // (valid,bank) shift pipe aligned to the tree latency: when the tail is valid
+    // the corresponding bank's block-partial is leaving every PE's tree.
+    reg                red_v_pipe [0:TREE_LAT-1];
+    reg  [IXW-1:0]     red_i_pipe [0:TREE_LAT-1];
 
     // latched per-tile scales
     reg  [ 8*PE_M-1:0]                   a_shift_q;
@@ -228,8 +240,10 @@ module glm_matmul_fp8 #(
     /* verilator lint_on WIDTHTRUNC */
     wire [2:0] lane_nxt = (lane == LANE_LAST) ? 3'd0 : (lane + 3'd1);
 
-    // per-PE, per-bank final fp32 block partial (latched into acc at tree done)
-    wire [31:0] pe_sum [0:NB-1][0:PE_M-1][0:PE_N-1];
+    // per-PE final fp32 block partial streaming out of the shared reduction tree
+    // (latched into acc[bank] as each bank's result emerges), plus the NB latched
+    // block partials per PE consumed by the dequant pass.
+    wire [31:0] pe_l3y [0:PE_M-1][0:PE_N-1];
     reg  [31:0] acc    [0:NB-1][0:PE_M-1][0:PE_N-1];
 
     // ----------------------------------------------------------------------
@@ -250,6 +264,11 @@ module glm_matmul_fp8 #(
         wire [ 7:0] a_q   = fp32_to_fp8e4m3(a_fs);
         // THE 4x4 MANTISSA MULTIPLY -> EXACT fp32 product (LUT, not DSP).
         wire [31:0] prod_f = fp8_mul(a_q, w_q);
+
+        // per-bank live reduction leaves (ps[0:L-1]; ps[L..7] are provably +0 and
+        // were already constant-folded into the +0 pads).  Exposed at PE scope so
+        // the ONE shared tree below can be muxed across banks.
+        wire [31:0] leaf [0:NB-1][0:4];
 
         for (gb = 0; gb < NB; gb = gb + 1) begin : BANK
           // this bank accumulates only the beats whose K-block == gb.
@@ -297,45 +316,53 @@ module glm_matmul_fp8 #(
               end
           end
 
-          // ---- reduction: 5 live leaves (ps[0:L-1]) -> 3-level fp32_add_pipe tree.
-          // The +0 pad adders (b = zpad) preserve the original 8-leaf grouping
-          // bit-for-bit -- including the -0.0 -> +0.0 normalization that x + (+0)
-          // performs -- and the 3-level TREE_LAT.  The provably-+0 leaves ps[5..7]
-          // and their level-1 adder (lf6+lf7) are removed (constant-folded into
-          // zpad), saving one fp32_add_pipe and three leaf regs per bank.
-          wire [31:0] lf0  = ps[0];
-          wire [31:0] lf1  = ps[1];
-          wire [31:0] lf2  = ps[2];
-          wire [31:0] lf3  = ps[3];
-          wire [31:0] lf4  = ps[4];
-          wire [31:0] zpad = 32'h0000_0000;   // +0 pad (was ps[5..7], provably +0)
+          // expose this bank's 5 live leaves to the PE-wide shared tree.
+          assign leaf[gb][0] = ps[0];
+          assign leaf[gb][1] = ps[1];
+          assign leaf[gb][2] = ps[2];
+          assign leaf[gb][3] = ps[3];
+          assign leaf[gb][4] = ps[4];
+        end // BANK
 
-          /* verilator lint_off UNUSEDSIGNAL */
-          // level 1 (3 adders: 2 real + 1 +0-pad)
-          wire        l1a_v, l1b_v, l1c_v;
-          wire [31:0] l1a_y, l1b_y, l1c_y;
-          fp32_add_pipe u_l1a (.clk(clk), .rst(rst), .valid_in(red_go),
-              .a(lf0), .b(lf1), .valid_out(l1a_v), .result(l1a_y));
-          fp32_add_pipe u_l1b (.clk(clk), .rst(rst), .valid_in(red_go),
-              .a(lf2), .b(lf3), .valid_out(l1b_v), .result(l1b_y));
-          fp32_add_pipe u_l1c (.clk(clk), .rst(rst), .valid_in(red_go),
-              .a(lf4), .b(zpad), .valid_out(l1c_v), .result(l1c_y));
-          // level 2 (2 adders: 1 real + 1 +0-pad)
-          wire        l2a_v, l2b_v;
-          wire [31:0] l2a_y, l2b_y;
-          fp32_add_pipe u_l2a (.clk(clk), .rst(rst), .valid_in(l1a_v),
-              .a(l1a_y), .b(l1b_y), .valid_out(l2a_v), .result(l2a_y));
-          fp32_add_pipe u_l2b (.clk(clk), .rst(rst), .valid_in(l1c_v),
-              .a(l1c_y), .b(zpad), .valid_out(l2b_v), .result(l2b_y));
-          // level 3 (1 adder)
-          wire        l3_v;
-          wire [31:0] l3_y;
-          fp32_add_pipe u_l3 (.clk(clk), .rst(rst), .valid_in(l2a_v),
-              .a(l2a_y), .b(l2b_y), .valid_out(l3_v), .result(l3_y));
-          /* verilator lint_on UNUSEDSIGNAL */
+        // ---- ONE shared reduction tree per PE, time-multiplexed across banks ----
+        // 5 live leaves (of bank red_fidx) -> 3-level fp32_add_pipe tree.  The +0
+        // pad adders (b = zpad) preserve the original 8-leaf grouping bit-for-bit
+        // -- including the -0.0 -> +0.0 normalization that x + (+0) performs -- and
+        // the 3-level TREE_LAT.  Identical leaves / grouping / order as the old
+        // per-bank trees, so the result is BIT-EXACT; only the adders are shared in
+        // time (NB banks streamed through one tree, one bank per cycle).
+        wire [31:0] lf0  = leaf[red_fidx][0];
+        wire [31:0] lf1  = leaf[red_fidx][1];
+        wire [31:0] lf2  = leaf[red_fidx][2];
+        wire [31:0] lf3  = leaf[red_fidx][3];
+        wire [31:0] lf4  = leaf[red_fidx][4];
+        wire [31:0] zpad = 32'h0000_0000;   // +0 pad (was ps[5..7], provably +0)
 
-          assign pe_sum[gb][gi][gj] = l3_y;
-        end
+        /* verilator lint_off UNUSEDSIGNAL */
+        // level 1 (3 adders: 2 real + 1 +0-pad)
+        wire        l1a_v, l1b_v, l1c_v;
+        wire [31:0] l1a_y, l1b_y, l1c_y;
+        fp32_add_pipe u_l1a (.clk(clk), .rst(rst), .valid_in(red_feed_v),
+            .a(lf0), .b(lf1), .valid_out(l1a_v), .result(l1a_y));
+        fp32_add_pipe u_l1b (.clk(clk), .rst(rst), .valid_in(red_feed_v),
+            .a(lf2), .b(lf3), .valid_out(l1b_v), .result(l1b_y));
+        fp32_add_pipe u_l1c (.clk(clk), .rst(rst), .valid_in(red_feed_v),
+            .a(lf4), .b(zpad), .valid_out(l1c_v), .result(l1c_y));
+        // level 2 (2 adders: 1 real + 1 +0-pad)
+        wire        l2a_v, l2b_v;
+        wire [31:0] l2a_y, l2b_y;
+        fp32_add_pipe u_l2a (.clk(clk), .rst(rst), .valid_in(l1a_v),
+            .a(l1a_y), .b(l1b_y), .valid_out(l2a_v), .result(l2a_y));
+        fp32_add_pipe u_l2b (.clk(clk), .rst(rst), .valid_in(l1c_v),
+            .a(l1c_y), .b(zpad), .valid_out(l2b_v), .result(l2b_y));
+        // level 3 (1 adder)
+        wire        l3_v;
+        wire [31:0] l3_y;
+        fp32_add_pipe u_l3 (.clk(clk), .rst(rst), .valid_in(l2a_v),
+            .a(l2a_y), .b(l2b_y), .valid_out(l3_v), .result(l3_y));
+        /* verilator lint_on UNUSEDSIGNAL */
+
+        assign pe_l3y[gi][gj] = l3_y;
       end
     end
     endgenerate
@@ -350,62 +377,174 @@ module glm_matmul_fp8 #(
     reg [MW-1:0] ri;
     reg [NW-1:0] rj;
     reg [OW:0]   rcnt;
-    wire [31:0]  slot32 = {{(32-(OW+1)){1'b0}}, rcnt};   // linear output slot index
 
-    // outer-accumulate the NB scaled block partials for the current element.
-    reg  [31:0] deq_comb;
-    integer     bb, widx;
-    always @* begin
-        deq_comb = 32'h0000_0000;
-        for (bb = 0; bb < NB; bb = bb + 1) begin
-            widx = bb*PE_N + {{(32-NW){1'b0}}, rj};   // linear (K-block, col) scale index
-            deq_comb = fp32_add(
-                           deq_comb,
-                           fp32_mul(acc[bb][ri][rj],
-                                    bf16_to_fp32(w_scale_q[16*widx +: 16])));
+    // PIPELINED dequant (was one deep combinational cone per element; now a
+    // feed-forward pipeline streaming ONE element/cycle).  RESULT-PRESERVING:
+    // the per-element math is the IDENTICAL left-fold
+    //     deq = ((0 + acc[0]*w[0]) + acc[1]*w[1]) + ...
+    // reusing the bit-exact fp32_mul_pipe / fp32_add_pipe (== fp32_mul / fp32_add;
+    // fp32_add is commutative so mac order is irrelevant).  Only LATENCY changes,
+    // shortening the reg-to-reg path from {mul + NB adds + scale + round} to a
+    // single FP stage.  DEQ_LAT = FP_MUL_LAT + NB*FP_ADD_LAT (the fold depth); the
+    // shallow 2^-a_shift exponent-add and bf16 round stay combinational at the tail.
+    localparam integer DEQ_LAT = `FP_MUL_LAT + NB*`FP_ADD_LAT;
+
+    // output side-band pipe: carry (valid, output-slot, a_shift) alongside the
+    // dequant datapath so the result lands at the right c_out slot DEQ_LAT later.
+    reg          dq_v_pipe    [0:DEQ_LAT-1];
+    reg  [OW:0]  dq_slot_pipe [0:DEQ_LAT-1];
+    reg  [7:0]   dq_ash_pipe  [0:DEQ_LAT-1];
+
+    // feed: present element (ri,rj) for one cycle while walking 0..NOUT-1.
+    wire         resc_feed_v = rescaling & (rcnt < NOUT[OW:0]);
+
+    // --- stage A: NB parallel products acc[bb][ri][rj] * w_scale[rj][bj] (LAT=ML) ---
+    wire [31:0]  dq_prod  [0:NB-1];
+    wire         dq_prodv [0:NB-1];
+    // --- stage B: left-fold of {0, prod0, prod1, ...} (each add LAT=AL) ---
+    wire [31:0]  dq_s     [0:NB-1];   // dq_s[k] = (((0+p0)+p1)+...+pk)
+    /* verilator lint_off UNUSEDSIGNAL */ // fold valid_out: superseded by dq_v_pipe
+    wire         dq_sv    [0:NB-1];
+    /* verilator lint_on UNUSEDSIGNAL */
+    genvar gd;
+    generate
+    for (gd = 0; gd < NB; gd = gd + 1) begin : DQ
+        // bank selects (procedural: variable-base part-selects on w_scale_q, like
+        // the original combinational deq, kept out of continuous assigns).
+        reg [31:0] acc_sel, wf_sel;
+        integer    dq_widx;
+        always @* begin
+            acc_sel = acc[gd][ri][rj];
+            dq_widx = gd*PE_N + {{(32-NW){1'b0}}, rj};   // linear (K-block, col)
+            wf_sel  = bf16_to_fp32(w_scale_q[16*dq_widx +: 16]);
+        end
+        fp32_mul_pipe u_dqmul (
+            .clk(clk), .rst(rst), .valid_in(resc_feed_v),
+            .a(acc_sel), .b(wf_sel),
+            .valid_out(dq_prodv[gd]), .result(dq_prod[gd])
+        );
+        // align product k to the running sum it folds into: delay by k*FP_ADD_LAT.
+        wire [31:0] pmd;  wire pmdv;
+        if (gd == 0) begin : DLY0
+            assign pmd = dq_prod[0];  assign pmdv = dq_prodv[0];
+        end else begin : DLYK
+            localparam integer DD = gd*`FP_ADD_LAT;
+            reg [31:0] pd [0:DD-1];
+            reg        vd [0:DD-1];
+            integer di;
+            always @(posedge clk) begin
+                pd[0] <= dq_prod[gd];  vd[0] <= dq_prodv[gd];
+                for (di = 1; di < DD; di = di + 1) begin
+                    pd[di] <= pd[di-1];  vd[di] <= vd[di-1];
+                end
+            end
+            assign pmd = pd[DD-1];  assign pmdv = vd[DD-1];
+        end
+        // s_k = fp32_add(s_{k-1}, p_k)  (s_{-1} = +0) -- SAME order as the fold.
+        if (gd == 0) begin : FOLD0
+            fp32_add_pipe u_dqadd (
+                .clk(clk), .rst(rst), .valid_in(pmdv),
+                .a(32'h0000_0000), .b(pmd),
+                .valid_out(dq_sv[gd]), .result(dq_s[gd])
+            );
+        end else begin : FOLDK
+            // pmdv (product k delayed by k*AL) asserts on the SAME cycles as
+            // dq_sv[gd-1]; use it as the stage valid so it is never dangling.
+            fp32_add_pipe u_dqadd (
+                .clk(clk), .rst(rst), .valid_in(pmdv),
+                .a(dq_s[gd-1]), .b(pmd),
+                .valid_out(dq_sv[gd]), .result(dq_s[gd])
+            );
         end
     end
-    wire signed [7:0] ash_b   = $signed(a_shift_q[8*ri +: 8]);
-    // undo the activation pow2 prescale: * 2^(-a_shift)
-    wire [31:0]       deq_un  = fp32_scale_pow2(deq_comb, -{{2{ash_b[7]}}, ash_b});
-    wire [15:0]       c_bf    = fp32_to_bf16(deq_un);
+    endgenerate
+
+    // tail (combinational, shallow): undo 2^-a_shift, round to bf16.
+    wire signed [7:0] ash_o  = $signed(dq_ash_pipe[DEQ_LAT-1]);
+    wire [31:0]       deq_un = fp32_scale_pow2(dq_s[NB-1], -{{2{ash_o[7]}}, ash_o});
+    wire [15:0]       c_bf   = fp32_to_bf16(deq_un);
+    // 32-bit-widened output slot for the c_out part-select base.
+    wire [31:0]       dq_slot_o = {{(31-OW){1'b0}}, dq_slot_pipe[DEQ_LAT-1]};
 
     // ----------------------------------------------------------------------
     // Control FSM
     // ----------------------------------------------------------------------
-    integer ci, cj, cb;
+    localparam [IXW-1:0] LASTBANK = IXW'(NB-1);   // index of the final K-block bank
+    integer ci, cj, rp;
     always @(posedge clk) begin
         if (rst) begin
             busy          <= 1'b0;
             streaming     <= 1'b0;
             mac_draining  <= 1'b0;
-            tree_draining <= 1'b0;
+            reducing      <= 1'b0;
             rescaling     <= 1'b0;
             out_valid     <= 1'b0;
-            red_go        <= 1'b0;
             k_cnt         <= {KW{1'b0}};
             k_target      <= {KW{1'b0}};
             lane          <= 3'd0;
             mac_drain     <= 8'd0;
-            drain_cnt     <= 8'd0;
+            red_cnt       <= 8'd0;
             ri            <= {MW{1'b0}};
             rj            <= {NW{1'b0}};
             rcnt          <= {(OW+1){1'b0}};
+            for (rp = 0; rp < TREE_LAT; rp = rp + 1) begin
+                red_v_pipe[rp] <= 1'b0;
+                red_i_pipe[rp] <= {IXW{1'b0}};
+            end
+            for (rp = 0; rp < DEQ_LAT; rp = rp + 1) dq_v_pipe[rp] <= 1'b0;
         end else begin
             out_valid <= 1'b0;
-            red_go    <= 1'b0;
+
+            // ---- shared-tree (valid,bank) latency pipe: shift every cycle ----
+            red_v_pipe[0] <= red_feed_v;
+            red_i_pipe[0] <= red_fidx;
+            for (rp = 1; rp < TREE_LAT; rp = rp + 1) begin
+                red_v_pipe[rp] <= red_v_pipe[rp-1];
+                red_i_pipe[rp] <= red_i_pipe[rp-1];
+            end
+
+            // ---- dequant (valid,slot,a_shift) side-band pipe: shift every cycle ----
+            dq_v_pipe[0]    <= resc_feed_v;
+            dq_slot_pipe[0] <= rcnt;
+            dq_ash_pipe[0]  <= a_shift_q[8*ri +: 8];
+            for (rp = 1; rp < DEQ_LAT; rp = rp + 1) begin
+                dq_v_pipe[rp]    <= dq_v_pipe[rp-1];
+                dq_slot_pipe[rp] <= dq_slot_pipe[rp-1];
+                dq_ash_pipe[rp]  <= dq_ash_pipe[rp-1];
+            end
+
+            // ---- latch each bank's block-partial as it leaves the shared tree ----
+            if (red_v_pipe[TREE_LAT-1]) begin
+                for (ci = 0; ci < PE_M; ci = ci + 1)
+                    for (cj = 0; cj < PE_N; cj = cj + 1)
+                        acc[red_i_pipe[TREE_LAT-1]][ci][cj] <= pe_l3y[ci][cj];
+            end
+
+            // ---- write each dequantized element as it leaves the dequant pipe;
+            //      the LAST slot (NOUT-1) completes the tile. ----
+            if (dq_v_pipe[DEQ_LAT-1]) begin
+                c_out[16*dq_slot_o +: 16] <= c_bf;
+                if (dq_slot_pipe[DEQ_LAT-1] == NOUT[OW:0] - 1'b1) begin
+                    busy      <= 1'b0;
+                    out_valid <= 1'b1;
+                end
+            end
 
             if (start) begin
                 busy          <= 1'b1;
                 streaming     <= 1'b1;
                 mac_draining  <= 1'b0;
-                tree_draining <= 1'b0;
+                reducing      <= 1'b0;
                 rescaling     <= 1'b0;
                 k_cnt         <= {KW{1'b0}};
                 k_target      <= k_len;
                 lane          <= 3'd0;
                 a_shift_q     <= a_shift;
                 w_scale_q     <= w_scale;
+                for (rp = 0; rp < TREE_LAT; rp = rp + 1)
+                    red_v_pipe[rp] <= 1'b0;   // drop any stale reduce-pipe entries
+                for (rp = 0; rp < DEQ_LAT; rp = rp + 1)
+                    dq_v_pipe[rp]  <= 1'b0;   // drop any stale dequant-pipe entries
             end
 
             // ---- K streaming (route each beat to its K-block bank) ----
@@ -419,44 +558,40 @@ module glm_matmul_fp8 #(
                 end
             end
 
-            // ---- wait for the last add to retire, then fire the reduce tree ----
+            // ---- wait for the last add to retire, then begin the reduce phase ----
             if (mac_draining) begin
                 if (mac_drain == 8'd0) begin
-                    mac_draining  <= 1'b0;
-                    red_go        <= 1'b1;
-                    tree_draining <= 1'b1;
-                    drain_cnt     <= TREE_LAT[7:0];
+                    mac_draining <= 1'b0;
+                    reducing     <= 1'b1;
+                    red_cnt      <= 8'd0;   // feed bank 0..NB-1 over the next NB cycles
                 end else begin
                     mac_drain <= mac_drain - 8'd1;
                 end
             end
 
-            // ---- wait for the reduce tree, then latch acc + start rescale ----
-            if (tree_draining) begin
-                if (drain_cnt == 8'd0) begin
-                    tree_draining <= 1'b0;
-                    rescaling     <= 1'b1;
-                    ri            <= {MW{1'b0}};
-                    rj            <= {NW{1'b0}};
-                    rcnt          <= {(OW+1){1'b0}};
-                    for (cb = 0; cb < NB; cb = cb + 1)
-                        for (ci = 0; ci < PE_M; ci = ci + 1)
-                            for (cj = 0; cj < PE_N; cj = cj + 1)
-                                acc[cb][ci][cj] <= pe_sum[cb][ci][cj];
-                end else begin
-                    drain_cnt <= drain_cnt - 8'd1;
+            // ---- reduce phase: feed NB banks through the shared tree, then wait
+            //      for the last bank's block-partial to land, then start rescale.
+            //      The acc latch above writes each bank as it emerges; rescaling
+            //      begins the cycle the LAST bank (NB-1) is latched. ----
+            if (reducing) begin
+                red_cnt <= red_cnt + 8'd1;
+                if (red_v_pipe[TREE_LAT-1] &&
+                    (red_i_pipe[TREE_LAT-1] == LASTBANK)) begin
+                    reducing  <= 1'b0;
+                    rescaling <= 1'b1;
+                    ri        <= {MW{1'b0}};
+                    rj        <= {NW{1'b0}};
+                    rcnt      <= {(OW+1){1'b0}};
                 end
             end
 
-            // ---- time-shared dequant rescale: one element per cycle ----
-            // rcnt walks 0..NOUT-1 in (ri*PE_N+rj) order, so it IS the linear slot.
+            // ---- dequant rescale FEED: present one element per cycle ----
+            // rcnt walks 0..NOUT-1 in (ri*PE_N+rj) order, so it IS the linear slot;
+            // the pipelined datapath writes c_out DEQ_LAT later (block above).  We
+            // keep rescaling asserted until the final slot has been written; the
+            // feed itself stops once rcnt reaches NOUT (resc_feed_v gates on that).
             if (rescaling) begin
-                c_out[16*slot32 +: 16] <= c_bf;
-                if (rcnt == NOUT[OW:0] - 1'b1) begin
-                    rescaling <= 1'b0;
-                    busy      <= 1'b0;
-                    out_valid <= 1'b1;
-                end else begin
+                if (rcnt < NOUT[OW:0]) begin
                     rcnt <= rcnt + 1'b1;
                     if (rj == PE_N[NW-1:0] - 1'b1) begin
                         rj <= {NW{1'b0}};
@@ -465,6 +600,10 @@ module glm_matmul_fp8 #(
                         rj <= rj + 1'b1;
                     end
                 end
+                // tile completes when the last slot leaves the dequant pipe.
+                if (dq_v_pipe[DEQ_LAT-1] &&
+                    (dq_slot_pipe[DEQ_LAT-1] == NOUT[OW:0] - 1'b1))
+                    rescaling <= 1'b0;
             end
         end
     end

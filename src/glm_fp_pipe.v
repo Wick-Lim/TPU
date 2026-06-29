@@ -250,6 +250,32 @@ module fp32_add_pipe (
     /* verilator lint_on UNUSEDPARAM */
     `include "glm_fp.vh"
 
+    // ---- log-depth leading-zero count (replaces the stage-2 walk loop) -------
+    // clz32(x): number of leading zeros of a 32-bit value (0..32), as the
+    // classic 5-level (log2(32)) priority encode -- each `if` halves the search
+    // window, so the depth is 5 compare/shift slices, NOT a 27-iteration ripple.
+    // Stage 2 calls it on the TOP-aligned add magnitude {mag[26:0],5'b0}; because
+    // mag[26:0] is nonzero there, the result is 26 - msb(mag[26:0]), which is
+    // EXACTLY the value the old walk loop produced (lz = shifts to bring the
+    // first 1 below bit 27 up to bit 26).  Pure restructure -> 0 ULP, same LAT.
+    function automatic [5:0] clz32(input [31:0] x);
+        reg [31:0] v;
+        reg [5:0]  n;
+        begin
+            v = x; n = 6'd0;
+            if (v == 32'b0) begin
+                n = 6'd32;
+            end else begin
+                if (v[31:16] == 16'b0) begin n = n + 6'd16; v = v << 16; end
+                if (v[31:24] ==  8'b0) begin n = n + 6'd8;  v = v << 8;  end
+                if (v[31:28] ==  4'b0) begin n = n + 6'd4;  v = v << 4;  end
+                if (v[31:30] ==  2'b0) begin n = n + 6'd2;  v = v << 2;  end
+                if (v[31]    ==  1'b0) begin n = n + 6'd1;               end
+            end
+            clz32 = n;
+        end
+    endfunction
+
     // ---------------- Stage 0 : classify + align ----------------
     reg               s0_special;
     reg [31:0]        s0_special_val;
@@ -372,9 +398,7 @@ module fp32_add_pipe (
     reg signed [10:0] s2_exp_pre;          // exponent BEFORE the normalize delta
 
     always @* begin
-        reg [10:0] lz;
-        reg [27:0] walk;          // walking copy used ONLY to count leading zeros
-        integer    lzi;
+        reg [5:0] lz;             // leading-zero count of mag[26:0], range 0..26
         s2_special     = r1_special;
         s2_special_val = r1_special_val;
         s2_iszero      = 1'b0;
@@ -382,24 +406,19 @@ module fp32_add_pipe (
         s2_mag         = r1_mag;   // pass the UNSHIFTED magnitude to stage 3
         s2_nshift      = 7'sd0;
         s2_exp_pre     = $signed({3'b0, r1_exp_big});
-        lz             = 11'd0;
-        walk           = r1_mag;
-        lzi            = 0;
+        lz             = 6'd0;
         if (!r1_special) begin
             if (r1_mag == 0) begin
                 s2_iszero = 1'b1;
             end else if (r1_mag[27]) begin
                 s2_nshift = -7'sd1;             // right shift by 1, exp+1
             end else begin
-                // count leading zeros above bit 26 (bounded priority encode).
-                // Mirror glm_fp.vh exactly: walk a copy left while its bit 26 is
-                // 0, incrementing the count; stage 3 applies the single shift.
-                for (lzi = 0; lzi < 27; lzi = lzi + 1)
-                    if (walk[26] == 1'b0 && (lzi[10:0] == lz)) begin
-                        walk = walk << 1;
-                        lz   = lz + 11'd1;
-                    end
-                s2_nshift = $signed(lz[6:0]);   // 0..26 fits in 7 signed bits
+                // count leading zeros above bit 26 in log-depth (was a 27-deep
+                // walk-and-count ripple).  Top-align mag[26:0] into a 32-bit word
+                // and clz32 it: lz = 26 - msb(mag[26:0]) == the old walk count.
+                // mag[26:0] is nonzero in this branch so lz is in 0..26.
+                lz        = clz32({r1_mag[26:0], 5'b0});
+                s2_nshift = $signed({1'b0, lz});  // 0..26 fits in 7 signed bits
             end
         end
     end
