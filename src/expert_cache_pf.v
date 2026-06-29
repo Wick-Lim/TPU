@@ -54,6 +54,25 @@ module expert_cache_pf #(
     // on the GDDR6 read).  CACHE_HIT_LAT==0 => the wait state is skipped entirely
     // and behaviour is BIT-IDENTICAL to the committed (no-hit-latency) module.
     parameter integer CACHE_HIT_LAT = 0,
+    // ---- REPLACEMENT POLICY selector ---------------------------------------
+    //   REPL_POLICY = 0 : EXACT move-to-front LRU (DEFAULT == the committed
+    //       policy).  Every demand decision, victim choice, counter and timing
+    //       is byte-for-byte the committed module: all the frequency machinery
+    //       below is gated off by this compile-time constant and constant-folds
+    //       away (yosys drops it; iverilog never selects it).
+    //             = 1 : FREQUENCY-AWARE (LFU + LRU tie-break + periodic aging).
+    //       A small SATURATING per-slot access-frequency counter (freq[]).  On a
+    //       capacity miss evict the LEAST-frequently-used resident slot; break
+    //       ties by LRU recency (evict the staler of two equally-cold slots).
+    //       Every AGE_PERIOD demands, HALVE all counters (aging) so a burst of
+    //       early popularity cannot lock an expert in forever -- aging also makes
+    //       the policy degrade gracefully back toward LRU when no clear winner
+    //       exists, which is what protects the small-cache / fresh-insert case.
+    //       Invalid (empty) slots are always filled before any eviction, exactly
+    //       as in LRU, so the cold-fill phase is policy-independent.
+    parameter integer REPL_POLICY = 0,
+    parameter integer FREQ_W      = 4,      // freq counter width (saturates at 2^FREQ_W-1)
+    parameter integer AGE_PERIOD  = 8192,   // halve every freq counter every AGE_PERIOD demands
     // Derived widths (do NOT override) -- guard the degenerate ==1 cases.
     parameter integer ID_W   = (N_EXPERT <= 1) ? 1 : $clog2(N_EXPERT),
     parameter integer SLOT_W = (SLOTS    <= 1) ? 1 : $clog2(SLOTS)
@@ -94,6 +113,19 @@ module expert_cache_pf #(
     reg  [SLOT_W-1:0] rank      [0:SLOTS-1];   // recency position (0=MRU)
     reg               pf_flag   [0:SLOTS-1];   // slot was installed by a prefetch,
                                                // not yet demanded (for pf_hit)
+
+    // ---- frequency-aware directory state (REPL_POLICY=1 only) --------------
+    //   freq[s]  : saturating access-frequency of the expert resident in slot s.
+    //   acc_ctr  : demands processed since the last aging tick.
+    //   With REPL_POLICY=0 every write below is gated off by the constant, so
+    //   freq[]/acc_ctr fold to constant 0, drive nothing, and synthesise away.
+    localparam [FREQ_W-1:0] FREQ_MAXV  = {FREQ_W{1'b1}};            // counter ceiling
+    localparam [FREQ_W-1:0] INIT_FREQ  = {{(FREQ_W-1){1'b0}},1'b1}; // freq=1 on install
+    localparam integer      AGE_W      = (AGE_PERIOD <= 2) ? 1 : $clog2(AGE_PERIOD);
+    localparam [AGE_W-1:0]  AGE_LAST   = AGE_W'(AGE_PERIOD-1);     // tick when acc_ctr hits this
+    reg  [FREQ_W-1:0] freq      [0:SLOTS-1];
+    reg  [AGE_W-1:0]  acc_ctr;
+    integer ka;
 
     // ---- demand-miss bookkeeping (identical role to expert_cache_ctrl) ----
     reg  [SLOT_W-1:0] victim_q;                // latched victim slot (demand miss)
@@ -195,7 +227,34 @@ module expert_cache_pf #(
                 lru_slot = k[SLOT_W-1:0];
     end
 
-    wire [SLOT_W-1:0] victim_slot = have_invalid ? invalid_slot : lru_slot;
+    //------------------------------------------------------------------------
+    // COMBINATIONAL FREQ-AWARE VICTIM (REPL_POLICY=1): the resident slot with the
+    // LOWEST freq counter, tie-broken by LRU recency (the larger rank == staler).
+    // A strictly-lower freq always wins; among equal-freq slots the LRU-most one
+    // is chosen, so a just-installed (MRU, rank 0) slot is never the tie-break
+    // victim -- this is what stops the classic "evict the entry you just loaded".
+    //------------------------------------------------------------------------
+    reg  [SLOT_W-1:0] freq_slot;
+    reg  [FREQ_W-1:0] freq_min;
+    reg  [SLOT_W-1:0] freq_min_rank;
+    always @* begin
+        freq_slot     = {SLOT_W{1'b0}};
+        freq_min      = {FREQ_W{1'b1}};   // +inf
+        freq_min_rank = {SLOT_W{1'b0}};
+        for (k = 0; k < SLOTS; k = k + 1)
+            if (valid_arr[k] &&
+                ((freq[k] < freq_min) ||
+                 ((freq[k] == freq_min) && (rank[k] > freq_min_rank)))) begin
+                freq_min      = freq[k];
+                freq_min_rank = rank[k];
+                freq_slot     = k[SLOT_W-1:0];
+            end
+    end
+
+    // policy mux: empties first (policy-independent), else LRU or freq-aware.
+    wire [SLOT_W-1:0] victim_slot =
+        have_invalid ? invalid_slot :
+        ((REPL_POLICY != 0) ? freq_slot : lru_slot);
 
     //------------------------------------------------------------------------
     // COMBINATIONAL prefetch accept (DEMAND-FIRST): only from idle, only when
@@ -206,6 +265,34 @@ module expert_cache_pf #(
     always @* begin
         pf_ready = (state == S_IDLE) && !req_valid && (hit_wait == {HW_W{1'b0}});
     end
+
+    //------------------------------------------------------------------------
+    // FREQUENCY UPDATE (REPL_POLICY=1 only).  Called from the sequential FSM on
+    // each demand event (so all freq[]/acc_ctr writes have a single driver -- the
+    // FSM always block).  Order matters: the aging tick is applied FIRST, then the
+    // per-slot touch overrides slot `s`, so the touched slot keeps its fresh value
+    // while every other slot is halved on an aging cycle.  is_install -> reset to
+    // INIT_FREQ (a fresh load); else saturating-increment (a hit / reuse).
+    //   Gated by the REPL_POLICY constant -> a no-op that folds away when ==0.
+    //------------------------------------------------------------------------
+    task automatic freq_touch(input [SLOT_W-1:0] s, input is_install);
+        begin
+            if (REPL_POLICY != 0) begin
+                if (acc_ctr == AGE_LAST) begin
+                    acc_ctr <= {AGE_W{1'b0}};
+                    for (ka = 0; ka < SLOTS; ka = ka + 1)
+                        freq[ka] <= freq[ka] >> 1;       // age: halve all counters
+                end else begin
+                    acc_ctr <= acc_ctr + 1'b1;
+                end
+                if (is_install)
+                    freq[s] <= INIT_FREQ;                // fresh load
+                else
+                    freq[s] <= (freq[s] == FREQ_MAXV) ? FREQ_MAXV
+                                                      : freq[s] + 1'b1;   // saturating
+            end
+        end
+    endtask
 
     //------------------------------------------------------------------------
     // SEQUENTIAL FSM + directory update
@@ -230,11 +317,13 @@ module expert_cache_pf #(
             dmd_pending_id      <= {ID_W{1'b0}};
             hit_wait            <= {HW_W{1'b0}};
             state               <= S_IDLE;
+            acc_ctr             <= {AGE_W{1'b0}};
             for (k = 0; k < SLOTS; k = k + 1) begin
                 valid_arr[k] <= 1'b0;
                 tag_arr[k]   <= {ID_W{1'b0}};
                 rank[k]      <= k[SLOT_W-1:0];
                 pf_flag[k]   <= 1'b0;
+                freq[k]      <= {FREQ_W{1'b0}};
             end
         end else begin
             resp_valid <= 1'b0;   // default: response is a 1-cycle pulse
@@ -273,6 +362,7 @@ module expert_cache_pf #(
                                 if (rank[k] < rank[lookup_slot])
                                     rank[k] <= rank[k] + 1'b1;
                             rank[lookup_slot] <= {SLOT_W{1'b0}};
+                            freq_touch(lookup_slot, 1'b0);   // demand hit: bump freq
                             if (CACHE_HIT_LAT == 0) begin
                                 resp_valid <= 1'b1;   // committed timing (no wait)
                             end else begin
@@ -312,6 +402,7 @@ module expert_cache_pf #(
                             if (rank[k] < rank[victim_q])
                                 rank[k] <= rank[k] + 1'b1;
                         rank[victim_q] <= {SLOT_W{1'b0}};
+                        freq_touch(victim_q, 1'b1);    // demand miss install: freq=INIT
                         resp_valid <= 1'b1;
                         hit        <= 1'b0;
                         resp_slot  <= victim_q;
@@ -334,6 +425,7 @@ module expert_cache_pf #(
                                 if (rank[k] < rank[victim_slot])
                                     rank[k] <= rank[k] + 1'b1;
                             rank[victim_slot] <= {SLOT_W{1'b0}};
+                            freq_touch(victim_slot, 1'b1);   // prefetch install: freq=INIT
                         end
                         // a demand arriving on this exact cycle (or already queued)
                         // is deferred to S_DMD_REST to avoid a same-cycle directory
@@ -382,6 +474,7 @@ module expert_cache_pf #(
                                     if (rank[k] < rank[lookup_slot])
                                         rank[k] <= rank[k] + 1'b1;
                                 rank[lookup_slot] <= {SLOT_W{1'b0}};
+                                freq_touch(lookup_slot, 1'b0);   // demand hit: bump freq
                                 if (CACHE_HIT_LAT == 0) begin
                                     resp_valid <= 1'b1;
                                 end else begin
@@ -413,6 +506,7 @@ module expert_cache_pf #(
                             if (rank[k] < rank[lookup_slot])
                                 rank[k] <= rank[k] + 1'b1;
                         rank[lookup_slot] <= {SLOT_W{1'b0}};
+                        freq_touch(lookup_slot, 1'b0);   // demand hit: bump freq
                         dmd_pending <= 1'b0;
                         if (CACHE_HIT_LAT == 0) begin
                             resp_valid <= 1'b1;   // committed timing (no wait)
