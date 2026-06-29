@@ -41,7 +41,7 @@ Legend: 🟢 RTL-doable in this repo · 🟡 system/architecture (design + vendo
 | # | Item | Type | Plan | Est. impact |
 |---|---|---|---|---|
 | 3.1 | **Predictor-driven deep prefetch loop** | 🟢 | Use `expert_predictor` confidence to prefetch ahead of the demand cache (L+2..) so Flash stays saturated and the die stalls less; double/triple-buffer experts. | sustains P1/P2 (keeps Flash busy) |
-| 3.2 | **Idle-die clock gating** | 🟢 | The die idles ~75 % waiting on Flash; clock-gate the compute lanes during fetch stalls. Pure power win (no tok/s change). | **~10–20 %** lower idle energy |
+| 3.2 | **Idle-die clock gating** (`clk_en_ctrl`) | 🟢 | The die idles ~75 % waiting on Flash; gate the compute lanes during fetch stalls + boot. **✅ DONE: work-driven clock-ENABLE controller (synthesis infers the ICG cell), same-cycle wake + hysteresis, formally-safe (never gates an advancing cluster, 13 064 checks). Measured gated-cycle fraction 73.75 % at the 25 %-duty Flash-bound die** (≈ the idle fraction minus a 4-cycle wake margin). | **~74 %** of compute idle-dynamic power gated |
 
 ## P4 — Energy-specific (J/token)
 
