@@ -12,3 +12,7 @@ hazard_waveform.vcd
 
 # Generated routing trace (regenerate with tools/route_trace.py --dump)
 tools/*.hex
+
+# python bytecode cache
+__pycache__/
+*.pyc
