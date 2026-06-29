@@ -213,6 +213,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/ddr5_xbar_sim test/ddr5_xbar_tb.v src/ddr5_xbar.v
 	@printf '[%s] ' "ddr5_xbar"; $(VVP) $(BUILD_DIR)/ddr5_xbar_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: ddr5_xbar"; exit 1; }
+	@# flash_xbar: N-channel banked Flash read fabric -- deep per-channel outstanding queue hides NAND latency (~QDEPTH x), banking ~N x.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/flash_xbar_sim test/flash_xbar_tb.v src/flash_xbar.v
+	@printf '[%s] ' "flash_xbar"; $(VVP) $(BUILD_DIR)/flash_xbar_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: flash_xbar"; exit 1; }
 	@# weight_loader: checkpoint FP8+block-scale memory image -> glm_matmul_fp8 pull stream (loader-fed == direct-fed).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/weight_loader_sim test/weight_loader_tb.v src/weight_loader.v src/glm_matmul_fp8.v src/glm_fp_pipe.v
 	@printf '[%s] ' "weight_loader"; $(VVP) $(BUILD_DIR)/weight_loader_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
@@ -321,6 +325,7 @@ endef
 
 formal:
 	$(call run_bmc,ddr5_xbar,,,12)
+	$(call run_bmc,flash_xbar,,,12)
 	$(call run_bmc,boot_loader,,,16)
 	$(call run_bmc,spec_decode_seq,,,20)
 	$(call run_bmc,kv_cache_pager,,,16)
