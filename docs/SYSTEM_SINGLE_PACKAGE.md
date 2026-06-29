@@ -246,6 +246,13 @@ side FP8's 4×4-mantissa multiply (measured: `glm_matmul_fp8` uses 18× 7-bit mu
 fp32's 24×24) keeps the die's dynamic power and DSP/area down. Net: a few tens of W — needs a
 heatsink/fan (a small box, not a thin USB stick), powerable over USB-C PD (~60–100 W).
 
+> **Honest energy caveat (research-backed).** Prefetch + caching hide Flash *latency* but **cannot
+> remove its energy-per-bit penalty** — NAND read energy is **~24–26× DRAM**, and for offloaded
+> decode the per-token energy can be **up to ~12× an HBM-resident baseline**. So **Flash offload is
+> a *capacity/throughput* tool, not an energy win** — the lever is to **minimize byte traffic**
+> (expert caching + batching to reuse fetched experts), not the Flash bus itself. (Sources via the
+> deep-research pass; this corrects any "Flash = low power" reading.)
+
 ## 11. Cost — memory BOM [EST, 2025–26, volatile]
 
 | Chip | $/GB | Qty | Cost |
