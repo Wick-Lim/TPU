@@ -205,6 +205,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/ddr5_xbar_sim test/ddr5_xbar_tb.v src/ddr5_xbar.v
 	@printf '[%s] ' "ddr5_xbar"; $(VVP) $(BUILD_DIR)/ddr5_xbar_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: ddr5_xbar"; exit 1; }
+	@# weight_loader: checkpoint FP8+block-scale memory image -> glm_matmul_fp8 pull stream (loader-fed == direct-fed).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/weight_loader_sim test/weight_loader_tb.v src/weight_loader.v src/glm_matmul_fp8.v src/glm_fp_pipe.v
+	@printf '[%s] ' "weight_loader"; $(VVP) $(BUILD_DIR)/weight_loader_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: weight_loader"; exit 1; }
 	@# swiglu_expert: SwiGLU FFN expert (gate/up/down GEMM + silu*up), dense + MoE modes.
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_sim test/swiglu_expert_tb.v src/swiglu_expert.v src/glm_matmul_pipe.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "swiglu_expert"; $(VVP) $(BUILD_DIR)/swiglu_expert_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
