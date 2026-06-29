@@ -3,9 +3,11 @@
 A synthesizable Verilog accelerator whose single deliverable goal is to **run one
 real model well: [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8)** —
 the published FP8 checkpoint of GLM-5.2 (`GlmMoeDsaForCausalLM`). The full GLM-5.2
-operator datapath is built and verified at a small-but-faithful slice, the complete
-forward pass produces correct next tokens, and the datapath is being re-targeted to
-**native FP8 E4M3** to match the published checkpoint and to fit real silicon.
+operator datapath is built in **native FP8 E4M3** and verified at a small-but-faithful slice —
+the complete forward pass produces the correct next token — and it is wrapped by the
+single-module memory/streaming system (multi-channel DDR5 + Flash expert cache, weight loader,
+boot loader, multi-clock CDC) that runs the real 753B model, with the memory-system controllers
+bounded-model-checked (`make formal`).
 
 Underneath sits a classic **5-stage scalar TPU core** (the original *TPU v2.0*, see
 [`SPEC.md`](SPEC.md)) used as the control/integration substrate; this README leads
@@ -56,21 +58,47 @@ token**.
 | Integration | `glm_decoder_block` (one full layer, 10/10), **`glm_model` (full forward pass, 5/5, next-token argmax matches golden)** |
 | Output | `sampler`, `mtp_head` (t+2 speculative) |
 
-### FP8 E4M3 datapath — IN PROGRESS
+### FP8 E4M3 datapath — COMPLETE
 
-Re-targeting every **weight** matmul to native FP8 E4M3 (4×4 mantissa multiply → fp32
-accumulate → per-[128,128]-block scale → bf16), keeping norms/softmax/rope/residual and
-the activation×activation attention matmuls in bf16.
+Every **weight** matmul is native FP8 E4M3 (4×4 mantissa multiply → block accumulate →
+per-[128,128]-block scale → bf16), with norms/softmax/rope/residual and the activation×activation
+attention matmuls in bf16 (matching the checkpoint's `modules_to_not_convert`). The **full FP8
+forward pass runs and predicts the correct next token**.
 
 | Unit | What is FP8 | Verification |
 |---|---|---|
 | `fp8_e4m3.vh` | E4M3 decode / encode-RNE+saturate / 4×4 mantissa multiply | **exhaustive** — ALL 66069 (256 decodes + all 256×256 multiply pairs vs fp64) |
-| `glm_matmul_fp8.v` | block-scaled FP8 GEMM ([128,128], dynamic act) | 224 tests, worst err/tol 0.43 |
+| `glm_matmul_fp8.v` | block-scaled FP8 GEMM ([128,128], dynamic act); **BFP fixed-point accumulator** (bit-exact at ACC_FRAC=18, −87.6% cells vs fp32-accumulate) | 224 tests, worst err/tol 0.43 |
 | `swiglu_expert_fp8.v` | gate/up/down GEMMs FP8, bf16 silu tail | 1024 tests, dense + MoE |
 | `mla_attn_fp8.v` | 7 weight projections FP8, bf16 attention/rope/norm/softmax/dsa | 7 tests, worst rel-err 0.39% |
 | `moe_router_fp8.v` | gate GEMV FP8, bf16 sigmoid/topk/renorm | 185 tests, top-K indices exact |
-| `glm_decoder_block_fp8.v` | assembles the FP8 leaf units | *building* |
-| `glm_model_fp8.v` | full FP8 forward pass | *next* |
+| `glm_decoder_block_fp8.v` | one full FP8 decoder layer | 9 tests, dense + MoE |
+| **`glm_model_fp8.v`** | **full FP8 forward pass** | **3 tests, next-token argmax matches the fp8 golden (4/31/20)** |
+| `mtp_head_fp8.v` | FP8 multi-token-prediction (t+2) head | 6 tests |
+
+### Single-module system (the real-753B memory/streaming hardware) — BUILT
+
+The RTL that runs the real model from Flash through a fast tier into the FP8 die (see
+[`docs/SYSTEM_SINGLE_PACKAGE.md`](docs/SYSTEM_SINGLE_PACKAGE.md), [`docs/PPA_FP8.md`](docs/PPA_FP8.md),
+[`docs/FORMAL.md`](docs/FORMAL.md)). 64 GB multi-channel DDR5 + 1 TB Flash, e.g. a USB-C box.
+
+| Unit | Role | Verification |
+|---|---|---|
+| `expert_cache_pf.v` | DDR5 routed-expert cache: LRU + freq policy + prefetch + hit-latency | 623 tests; **BMC-proven** (hit→slot, no-dup, uniqueness, liveness) |
+| `expert_predictor.v` | confidence-thresholded expert prefetch predictor | 20 tests (GLM trace) |
+| `kv_cache_pager.v` | MLA latent-KV ring + DSA-gather + Flash overflow | 73 tests; **BMC-proven** (in-bounds, gather correct) |
+| `ddr5_xbar.v` | N-channel banked DDR5 read fabric (~N× aggregate BW) | 3073 tests (7.93× @8ch); **BMC-proven** (no-spurious/no-overflow/tag) |
+| `weight_loader.v` | checkpoint FP8 + block-scale → matmul pull DMA | 240 tests (loader-fed == direct-fed, bit-exact) |
+| `boot_loader.v` | power-up Flash→DDR5 model-load sequencer | 9240 tests; **BMC-proven** (done-gate) |
+| `spec_decode_seq/_top.v` | MTP speculative-decode loop | 621 / 19 tests (spec == greedy); **BMC-proven** (monotonic) |
+| **`glm_fp8_soc.v`** | top: compute + cache + pager + Flash arbiter | 3 tests (token == standalone) |
+| **`glm_fp8_system.v`** | production top: compute + **ddr5_xbar + weight_loader** in the datapath | 3 tests (token == standalone) |
+| **`glm_fp8_system_cdc.v`** | 2-clock wrapper (host/USB ↔ compute via `cdc_async_fifo`) | 31 tests (token == standalone across async clocks) |
+
+Verified by `make unittests` (55 units) + `make formal` (5 controllers, z3 BMC) + `make cache-study`.
+
+**Out of scope** (vendor IP / physical): the DDR5/Flash/USB-C PHYs (TB-stubbed), the tokenizer
+(software), and full-scale synthesis + place-and-route + tapeout.
 
 ---
 
