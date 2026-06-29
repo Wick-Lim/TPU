@@ -163,6 +163,11 @@ module ddr5_xbar #(
     reg                gnt_valid;
     reg [CH_IDX_W-1:0] gnt;
     integer ai; integer idx;
+    // rotate-mask priority-encoder working regs (replaces the iterative scan)
+    reg [N_CH-1:0]     rot;        // fifo_ne rotated into rr-relative order
+    reg [CH_IDX_W-1:0] sel;        // first set position WITHIN rot (rr-relative)
+    reg                found;      // any FIFO non-empty
+    reg [CH_IDX_W:0]   gnt_idx;    // sel+rr before the single modulo fold
 
     wire [N_CH-1:0] fifo_ne;     // FIFO non-empty
     wire [N_CH-1:0] deq_fire;    // arbiter drains this channel this cycle
@@ -177,17 +182,40 @@ module ddr5_xbar #(
     endgenerate
 
     // ---- combinational round-robin grant (reads REGISTERED occupancy) ----
+    // Result-preserving rewrite of the old iterative modulo-scan.  Instead of a
+    // serial priority chain that recomputes (ai+rr) mod N and a dynamic
+    // fifo_ne[idx] barrel-mux at EVERY stage, do it in three shallow phases:
+    //   (1) ROTATE fifo_ne into rr-relative order ONCE  -> one parallel barrel
+    //       rotate (rot[j] = fifo_ne[(j+rr) mod N]); rot[0] is channel rr.
+    //   (2) PRIORITY-ENCODE the static vector rot (lowest set j wins) -> the
+    //       serial chain now carries only a 1-bit test + sel mux per stage, with
+    //       NO add/sub/shiftx in the loop body.
+    //   (3) FOLD the winning position back to an absolute channel ONCE:
+    //       gnt = (sel + rr) mod N  (a single add + conditional subtract).
+    // The lowest-j winner equals the lowest-ai winner of the old scan (ai=0 maps
+    // to channel rr), so gnt_valid / gnt / resp_* are bit-identical every cycle.
     always @* begin
-        gnt_valid = 1'b0;
-        gnt       = {CH_IDX_W{1'b0}};
+        // (1) parallel barrel-rotate fifo_ne by rr (one mux layer, not a chain)
+        rot = {N_CH{1'b0}};
         for (ai = 0; ai < N_CH; ai = ai + 1) begin
             idx = ai + {{(32-CH_IDX_W){1'b0}}, rr};
             if (idx >= N_CH) idx = idx - N_CH;
-            if (!gnt_valid && fifo_ne[idx[CH_IDX_W-1:0]]) begin
-                gnt_valid = 1'b1;
-                gnt       = idx[CH_IDX_W-1:0];
+            rot[ai] = fifo_ne[idx[CH_IDX_W-1:0]];
+        end
+        // (2) priority-encode rot: lowest set position wins (last write = lowest)
+        found = 1'b0;
+        sel   = {CH_IDX_W{1'b0}};
+        for (ai = N_CH-1; ai >= 0; ai = ai - 1) begin
+            if (rot[ai[CH_IDX_W-1:0]]) begin
+                found = 1'b1;
+                sel   = ai[CH_IDX_W-1:0];
             end
         end
+        // (3) single modulo fold back to the absolute channel index
+        gnt_idx = {1'b0, sel} + {1'b0, rr};
+        if (gnt_idx >= N_CH[CH_IDX_W:0]) gnt_idx = gnt_idx - N_CH[CH_IDX_W:0];
+        gnt_valid = found;
+        gnt       = gnt_idx[CH_IDX_W-1:0];
         // drive requester response port from the granted FIFO head
         resp_valid = gnt_valid;
         resp_data  = fifo[gnt][head[gnt]][DATA_W-1:0];

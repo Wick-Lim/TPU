@@ -261,8 +261,11 @@ module glm_matmul_fp8 #(
     localparam integer BKW = $clog2(NB + 1);          // current-block index width
     localparam integer PSW = (BLK > 1) ? $clog2(BLK) : 1; // within-block position width
 
-    // term pipeline depth (fp32->fixed register stage) + settle margin.
-    localparam integer ACC_DRAIN = 3;
+    // term pipeline depth (now 2 stages: fp8-product reg + fp32->fixed reg)
+    // + settle margin.  Bumped 3->4 when the product-register split was added
+    // so the LAST beat still drains fully into the banks before the dequant
+    // pass reads them (latency-only; out_valid handshake absorbs it).
+    localparam integer ACC_DRAIN = 4;
 
     // ----------------------------------------------------------------------
     // Control regs
@@ -342,9 +345,28 @@ module glm_matmul_fp8 #(
         wire [ 7:0] a_q   = fp32_to_fp8e4m3(a_fs);
         // THE 4x4 MANTISSA MULTIPLY -> EXACT fp32 product (LUT, not DSP).
         wire [31:0] prod_f = fp8_mul(a_q, w_q);
-        // convert the exact product to fixed-point, then register one stage to
-        // keep the front-end combinational path off the accumulate path.
-        wire signed [ACC_W-1:0] termx = fp32_to_fixed(prod_f);
+        // STAGE 1 (fmax split): register the EXACT fp8 product right after
+        // fp8_mul -- this cuts the deep per-beat activation-quantize cone
+        // (fp32_scale_pow2 -> fp32_to_fp8e4m3 -> fp8_mul) off from the
+        // fixed-point convert.  Pure repipeline: the same product flows on,
+        // one beat later; the integer accumulation is order-independent, so
+        // the per-block sum (and every downstream golden) is BIT-EXACT.
+        reg  [31:0]    prod_r;
+        reg            pv_r;
+        reg  [BKW-1:0] pbank_r;
+        always @(posedge clk) begin
+            if (rst) begin
+                pv_r <= 1'b0;
+            end else begin
+                pv_r    <= issue;      // a product for this beat
+                prod_r  <= prod_f;
+                pbank_r <= kblk;       // K-block this beat belongs to
+            end
+        end
+        // STAGE 2: convert the REGISTERED product to fixed-point, then register
+        // that, keeping fp32_to_fixed (and the front-end cone) off the
+        // accumulate path.  fp32_to_fixed of an fp8xfp8 product is exact.
+        wire signed [ACC_W-1:0] termx = fp32_to_fixed(prod_r);
         reg  signed [ACC_W-1:0] term_r;
         reg                     tv_r;
         reg  [BKW-1:0]          bank_r;
@@ -352,9 +374,9 @@ module glm_matmul_fp8 #(
             if (rst) begin
                 tv_r <= 1'b0;
             end else begin
-                tv_r   <= issue;       // a product for this beat
+                tv_r   <= pv_r;        // a product for this beat (1 beat later)
                 term_r <= termx;
-                bank_r <= kblk;        // K-block this beat belongs to
+                bank_r <= pbank_r;     // K-block this beat belongs to
             end
         end
 
