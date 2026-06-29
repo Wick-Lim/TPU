@@ -51,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi soc unittests cache-study sim wave lint synth ppa clean
+.PHONY: all build test hazard axi soc unittests cache-study formal sim wave lint synth ppa clean
 
 all: test hazard unittests lint synth
 
@@ -295,6 +295,33 @@ cache-study:
 	@printf '[%s] ' "cache-policy(LRU vs FREQ)"; $(VVP) $(BUILD_DIR)/expert_cache_pf_policy | grep -E 'ALL [0-9]+ TESTS PASSED|hit-rate|POLICY' \
 	    || { echo "FAILED: expert_cache_pf_policy"; exit 1; }
 	@echo "cache-study: batching + prefetch + replacement-policy sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
+
+# Formal (bounded model checking) of the memory-system controllers via yosys write_smt2 +
+# yosys-smtbmc -s z3.  Each harness test/formal/<dut>_fv.v instantiates the committed controller
+# read-only and asserts safety properties.  The mandatory `async2sync; chformal -lower` lowers
+# yosys $check cells so the asserts are NOT silently dropped (a vacuous-pass trap); the assert
+# count > 0 guard re-checks non-vacuity per model.  See docs/FORMAL.md.  Bounds kept modest for a
+# routine run; deeper bounds (e.g. expert_cache_pf K=55) are in docs/FORMAL.md.
+FV_DIR := scratchpad
+define run_bmc   # $(1)=dut name  $(2)=extra read deps  $(3)=extra yosys (e.g. chparam)  $(4)=bound K
+	@yosys -p "read_verilog -sv -formal -I src src/$(1).v $(2) test/formal/$(1)_fv.v; $(3) \
+	          prep -top $(1)_fv -flatten; memory_map; async2sync; chformal -lower; \
+	          write_smt2 -wires $(FV_DIR)/$(1)_fv.smt2" > $(FV_DIR)/$(1)_fv_build.log 2>&1 \
+	    || { echo "FAILED(build): $(1)"; cat $(FV_DIR)/$(1)_fv_build.log; exit 1; }
+	@test `grep -ic assert $(FV_DIR)/$(1)_fv.smt2` -gt 0 \
+	    || { echo "FAILED(vacuous: 0 assertions in smt2): $(1)"; exit 1; }
+	@yosys-smtbmc -s z3 -t $(4) $(FV_DIR)/$(1)_fv.smt2 > $(FV_DIR)/$(1)_fv_bmc.log 2>&1 \
+	    && printf '[formal %-16s] PASSED  K=%s  (%s asserts)\n' "$(1)" "$(4)" "`grep -ic assert $(FV_DIR)/$(1)_fv.smt2`" \
+	    || { echo "FAILED(BMC counterexample): $(1)"; tail -20 $(FV_DIR)/$(1)_fv_bmc.log; exit 1; }
+endef
+
+formal:
+	$(call run_bmc,ddr5_xbar,,,12)
+	$(call run_bmc,boot_loader,,,16)
+	$(call run_bmc,spec_decode_seq,,,20)
+	$(call run_bmc,kv_cache_pager,,,16)
+	$(call run_bmc,expert_cache_pf,src/expert_cache_ctrl.v,chparam -set PF_ENABLE 0 expert_cache_pf_fv;,20)
+	@echo "formal: all 5 controllers BMC-proven (no counterexample); see docs/FORMAL.md for bounds + coverage"
 
 wave: $(SIM_BIN)
 	$(VVP) $(SIM_BIN)
