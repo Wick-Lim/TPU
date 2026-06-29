@@ -76,6 +76,12 @@ the activation×activation attention matmuls in bf16.
 
 ## Tang Nano 20K (Gowin GW2A-18) — why FP8
 
+> **This is an intermediate physical sanity-test, not the deliverable.** The Tang Nano
+> physically cannot run GLM-5.2 (it fits only ~1 time-multiplexed small FP8 GEMM); it just
+> proves the FP8 arithmetic maps to real silicon fabric on a $30 board. The actual target is a
+> custom ASIC / large FPGA running the full 753B model with the DDR5+Flash system — the fit
+> below must **not** drive design decisions (that would cage the design to one tiny GEMM).
+
 Measured fit on the GW2A-18 (budget: ~20,736 LUT4, ~15,552 FF, ~48 DSP, 46×18Kb BSRAM,
 + 8 MB on-board PSRAM):
 
