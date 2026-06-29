@@ -30,55 +30,65 @@
 //   out[pi][pj] = 2^-a_shift[pi] *
 //                 SUM over K-blocks bj of ( w_scale[pj][bj] *
 //                    SUM_{k in Kblock bj} fp8(A[pi][k]*2^a_shift) * fp8(W[k][pj]) )
-//   i.e. the fp8 products are INNER-accumulated in fp32 within each 128-wide
-//   K-block; each block partial is multiplied by that block's weight scale; the
-//   scaled block partials are OUTER-accumulated across K-blocks; finally the
-//   per-token 2^-a_shift is undone (an exact exponent add) and the result is
-//   rounded to bf16.  For K <= BLK there is exactly ONE K-block, so this reduces
-//   to a single per-column weight scale.
+//   i.e. the fp8 products are INNER-accumulated within each 128-wide K-block;
+//   each block partial is multiplied by that block's weight scale; the scaled
+//   block partials are OUTER-accumulated across K-blocks; finally the per-token
+//   2^-a_shift is undone (an exact exponent add) and the result is rounded to
+//   bf16.  For K <= BLK there is exactly ONE K-block, so this reduces to a
+//   single per-column weight scale.
 //
 // THE HARDWARE WIN (why FP8 over the fp32 baseline):
 //   The per-term product is  fp8_mul(act_e4m3, wgt_e4m3)  --- a 4-bit x 4-bit
 //   MANTISSA multiply (src/fp8_e4m3.vh), which synthesizes to the plentiful
 //   Gowin GW2A-18 LUT, NOT to the scarce 24x24 DSP the fp32 datapath burns.
-//   The KEY INVARIANT: the MULTIPLIER is fp8-width (sips DSP); ACCUMULATION
-//   reuses the EXISTING, golden, pipelined fp32 adder (fp32_add_pipe).  The only
-//   24x24 fp32 multiplies left in the whole unit are the time-shared dequant
-//   multipliers (block_partial * w_scale): O(NB) of them (NB = #K-blocks),
-//   walked once over the NOUT outputs at the very end -- independent of K-DEPTH
-//   within a block and of PE_M*PE_N.
+//   The only 24x24 fp32 multiplies left in the whole unit are the time-shared
+//   dequant multipliers (block_partial * w_scale): O(NB) of them, walked once
+//   over the NOUT outputs at the very end.
 //
 //----------------------------------------------------------------------------
-// ACCUMULATOR CHOICE:  FP32 (reuse fp32_add_pipe), NOT wide fixed-point.
-//   fp8_mul returns an EXACT fp32 product (8-bit significand, exp in [109,144]);
-//   feeding it straight into the proven fp32_add_pipe means NO new rounding logic
-//   to verify --- accumulation is the already-golden fp32 add, giving the full
-//   fp8-product dynamic range (~2^-18..448^2) for free.
+// ACCUMULATOR CHOICE:  BLOCK FIXED-POINT (BFP), NOT a full-fp32 adder tree.
+//   The OLD datapath accumulated each fp8 product in a FULL fp32 adder
+//   (fp32_add_pipe, 24-bit mantissa, renormalize+round EVERY add), L-way
+//   interleaved per K-block plus a per-bank fp32 reduction tree.  Those fp32
+//   adders dominated the cell count (research: 'Ultra-Low Accumulation Precision
+//   Inference with BFP', openreview Dzamphz35c; arXiv 2502.01070 / DeepSeek-V3
+//   Hopper FP8 GEMM -- block-float accumulation, no per-add normalize).
+//
+//   KEY NUMERIC FACT exploited here: every E4M3 value is an exact integer
+//   multiple of 2^-9 (normal (8+m)*2^(e-10), subnormal m*2^-9), so every fp8x
+//   fp8 PRODUCT is an exact integer multiple of 2^-18, and is therefore EXACTLY
+//   representable as a fixed-point integer with ACC_FRAC=18 fractional bits.
+//   We accumulate the products of one 128-wide K-block into a NARROW signed
+//   fixed-point register (ACC_W bits, weight 2^-ACC_FRAC per LSB) with a plain
+//   integer add -- NO per-add mantissa normalize, NO rounding, NO interleave,
+//   NO reduction tree.  The within-block sum is thus EXACT (<= the fp32 path's
+//   error -- the fp32 path rounded every add).  At block end the fixed-point
+//   accumulator is converted to fp32 ONCE (RNE) and handed to the SAME proven
+//   dequant pass (block_partial * w_scale, fold, undo 2^-a_shift, bf16 round).
+//
+//   ACC_W / ACC_FRAC are PARAMETERS so the accumulator width is tunable.  With
+//   ACC_FRAC=18 and ACC_W>=44 the within-block accumulation is BIT-EXACT for
+//   any K<=BLK (max |block sum| < 128*448^2 < 2^43); narrowing ACC_FRAC trades
+//   precision for area (the BFP/Hopper regime).  Default is the exact width.
 //
 //----------------------------------------------------------------------------
-// PER-K-BLOCK L-WAY INTERLEAVED FP32 ACCUMULATION
-//   The stream cannot be back-pressured (one K-beat per cycle), and the L-deep
-//   fp32_add_pipe has L beats in flight at any K-block boundary, so we cannot
-//   "drain + reset" a single accumulator between blocks.  Instead each PE owns
-//   NB independent accumulator BANKS (NB = ceil(KMAX/BLK)); beat k feeds ONLY
-//   the bank for its K-block (kblk = k / BLK).  Each bank is the SAME L-way
-//   interleaved fp32_add_pipe accumulator as the baseline: L sub-accumulators
-//   ps[0..L-1], the term for a bank-local beat folds into lane (issue mod L),
-//   lane j re-issued exactly L cycles after its prior issue (its add result has
-//   just returned -- same-edge C-forwarding, never a stale c operand).  A GLOBAL
-//   lane counter is shared by all banks: a bank's beats are contiguous, so its
-//   re-issue gap is exactly L regardless of the starting lane.  After K beats,
-//   bank b's L partials are summed by a fixed 8-leaf / 3-level fp32_add_pipe
-//   tree into block_partial[b]; all banks' trees fire together.
+// PER-K-BLOCK FIXED-POINT ACCUMULATION (banked)
+//   Each PE owns NB independent fixed-point accumulator BANKS (NB=ceil(KMAX/BLK)).
+//   The fp8 product of beat k is converted to fixed-point combinationally, then
+//   registered one stage; the next cycle it is integer-added into the bank for
+//   its K-block (kblk = k/BLK).  A single-cycle integer accumulate has no
+//   pipeline hazard (the running sum is available every cycle), so NO L-way
+//   interleave and NO drain/reduce tree are needed -- a short fixed drain after
+//   the last beat lets the 1-stage term pipeline settle, then the dequant pass
+//   reads the banks.
 //
-// LATENCY (deterministic):  from first K-beat accepted to out_valid =
-//     K (stream) + L (add drain) + TREE_LAT (3*FP_ADD_LAT) + PE_M*PE_N (the
-//     time-shared dequant rescale) + 1.   Unchanged by NB (banks run in parallel
-//     during streaming; all trees reduce concurrently).
+// LATENCY (deterministic):  K (stream) + ACC_DRAIN (term-pipe settle) +
+//   DEQ_LAT (the time-shared dequant pipeline) + NOUT walk.  Lower than the old
+//   tree-based path.
 //
 // CONVENTIONS: synchronous ACTIVE-HIGH reset; NO latch; NO combinational loop
-//   (all accumulator feedback rides through the fp32_add_pipe registers; fp8_mul,
-//   the pow2 scaling and the dequant combine are feed-forward combinational).
+//   (the accumulator feedback rides the integer-add register; fp8_mul, the pow2
+//   scaling, the fixed-point convert and the dequant combine are feed-forward).
 //----------------------------------------------------------------------------
 // HANDSHAKE  (mirrors glm_matmul_pipe; activation interface identical)
 //   start      : 1-cycle pulse; latches k_len, a_shift, w_scale; clears banks.
@@ -95,7 +105,15 @@ module glm_matmul_fp8 #(
     parameter integer PE_M = 4,       // array rows (== tile M)
     parameter integer PE_N = 4,       // array cols (== tile N)
     parameter integer KMAX = 256,     // max supported K (counter width)
-    parameter integer BLK  = 128      // weight block size along K (and N) -- [128,128]
+    parameter integer BLK  = 128,     // weight block size along K (and N) -- [128,128]
+    // ---- fixed-point (BFP) accumulator geometry (tunable) ----
+    // ACC_FRAC : fractional bits below the binary point (LSB weight 2^-ACC_FRAC).
+    //            =18 makes every fp8xfp8 product EXACT (products are multiples of
+    //            2^-18); smaller trades precision for area (BFP/Hopper regime).
+    // ACC_W    : total signed accumulator width.  Must cover the max block sum:
+    //            |sum| < BLK*448^2 < 2^43, so >= ACC_FRAC + 26 keeps it exact.
+    parameter integer ACC_FRAC = 18,
+    parameter integer ACC_W    = 48
 ) (
     input  wire                       clk,
     input  wire                       rst,        // sync, active-high
@@ -146,11 +164,91 @@ module glm_matmul_fp8 #(
         end
     endfunction
 
-    // Accumulator interleave depth == the fp32 ADD latency (so each lane is
-    // re-issued exactly when its previous add result returns).
-    localparam integer L = `FP_ADD_LAT;            // fp32_add_pipe latency
-    // Fixed 8-leaf / 3-level reduction tree (covers any L <= 8; FP_ADD_LAT=5).
-    localparam integer TREE_LAT = 3 * `FP_ADD_LAT; // 3 levels of fp32_add_pipe
+    //----------------------------------------------------------------------
+    // fp32_to_fixed : exact-or-truncating convert of an fp32 fp8-product into a
+    //   signed fixed-point integer with weight 2^-ACC_FRAC per LSB.  The fp8xfp8
+    //   product is always either +/-0 or a NORMAL fp32 (biased exp in [109,144],
+    //   no inf/nan, never fp32-subnormal), and is an exact multiple of 2^-18.
+    //   With ACC_FRAC=18 the right-shift branch (small-exponent products) drops
+    //   only PROVABLY-ZERO low mantissa bits, so the convert is BIT-EXACT.  Pure
+    //   shift/mux LUT -- no multiplier, no rounding.
+    //----------------------------------------------------------------------
+    function automatic signed [ACC_W-1:0] fp32_to_fixed(input [31:0] f);
+        reg             s;
+        reg [7:0]       e;
+        reg [ACC_W-1:0] m_ext, mag;
+        integer         sh;
+        begin
+            s     = f[31];
+            e     = f[30:23];
+            m_ext = {{(ACC_W-24){1'b0}}, 1'b1, f[22:0]};   // 24-bit significand, 0-ext
+            if (e == 8'h00) begin
+                fp32_to_fixed = {ACC_W{1'b0}};             // zero / FTZ
+            end else begin
+                sh = {{24{1'b0}}, e} - 150 + ACC_FRAC;     // value*2^ACC_FRAC = m*2^sh
+                if (sh >= 0) mag = m_ext << sh;
+                else         mag = m_ext >> (-sh);         // exact: low m bits are 0
+                fp32_to_fixed = s ? -$signed(mag) : $signed(mag);
+            end
+        end
+    endfunction
+
+    //----------------------------------------------------------------------
+    // fixed_to_fp32 : convert a signed fixed-point block accumulator (weight
+    //   2^-ACC_FRAC per LSB) to fp32 with round-to-nearest-even -- the SINGLE
+    //   rounding of the whole within-block accumulation.  Pure LUT (priority
+    //   encode + barrel shift + RNE); no multiplier.  Our magnitudes never
+    //   overflow fp32 nor underflow to FTZ, but the range guards are kept.
+    //----------------------------------------------------------------------
+    function automatic [31:0] fixed_to_fp32(input signed [ACC_W-1:0] x);
+        reg [ACC_W-1:0]   mag;
+        /* verilator lint_off UNUSEDSIGNAL */ // only the low 24 bits of the shift feed mant
+        reg [ACC_W-1:0]   shifted;
+        /* verilator lint_on UNUSEDSIGNAL */
+        reg               s, guard, sticky, round_up;
+        reg [23:0]        mant;
+        reg [24:0]        mant_r;
+        integer           p, i, e_b;
+        begin
+            if (x == {ACC_W{1'b0}}) begin
+                fixed_to_fp32 = 32'b0;
+            end else begin
+                s   = x[ACC_W-1];
+                mag = s ? (~x + {{(ACC_W-1){1'b0}}, 1'b1}) : x;
+                // highest set bit position p (mag != 0 here).
+                p = 0;
+                for (i = 0; i < ACC_W; i = i + 1)
+                    if (mag[i]) p = i;
+                // value = mag * 2^-ACC_FRAC ; unbiased exp = p - ACC_FRAC.
+                e_b    = (p - ACC_FRAC) + 127;
+                guard  = 1'b0;
+                sticky = 1'b0;
+                if (p >= 23) begin
+                    shifted = mag >> (p - 23);
+                    mant    = shifted[23:0];
+                    if (p >= 24) guard = mag[(p-24)];
+                    // sticky = OR of all bits strictly below the guard bit.
+                    for (i = 0; i < ACC_W; i = i + 1)
+                        if ((i <= (p - 25)) && mag[i]) sticky = 1'b1;
+                end else begin
+                    shifted = mag << (23 - p);             // p < 23: exact, no GRS
+                    mant    = shifted[23:0];
+                end
+                round_up = guard & (sticky | mant[0]);
+                mant_r   = {1'b0, mant} + {24'b0, round_up};
+                if (mant_r[24]) begin
+                    mant_r = mant_r >> 1;
+                    e_b    = e_b + 1;
+                end
+                if (e_b >= 255)
+                    fixed_to_fp32 = {s, 8'hFF, 23'b0};     // (won't occur) overflow
+                else if (e_b <= 0)
+                    fixed_to_fp32 = {s, 31'b0};            // (won't occur) FTZ
+                else
+                    fixed_to_fp32 = {s, e_b[7:0], mant_r[22:0]};
+            end
+        end
+    endfunction
 
     localparam integer KW   = $clog2(KMAX+1);
     localparam integer NOUT = PE_M * PE_N;
@@ -161,37 +259,24 @@ module glm_matmul_fp8 #(
     // K-block fan-out: NB = ceil(KMAX/BLK) accumulator banks per PE.
     localparam integer NB  = (KMAX + BLK - 1) / BLK;
     localparam integer BKW = $clog2(NB + 1);          // current-block index width
-    localparam integer IXW = (NB > 1) ? $clog2(NB) : 1; // bank array index width (0..NB-1)
     localparam integer PSW = (BLK > 1) ? $clog2(BLK) : 1; // within-block position width
+
+    // term pipeline depth (fp32->fixed register stage) + settle margin.
+    localparam integer ACC_DRAIN = 3;
 
     // ----------------------------------------------------------------------
     // Control regs
     // ----------------------------------------------------------------------
     reg  [KW-1:0]      k_cnt;
     reg  [KW-1:0]      k_target;
-    reg  [2:0]         lane;          // GLOBAL issue lane 0..L-1 (shared by banks)
     /* verilator lint_off UNUSEDSIGNAL */ // unread by design when NB==1 (single K-block)
     reg  [BKW-1:0]     kblk;          // current K-block 0..NB-1
     reg  [PSW-1:0]     kpos;          // position within current K-block 0..BLK-1
     /* verilator lint_on UNUSEDSIGNAL */
     reg                streaming;
-    reg                mac_draining;  // wait L cycles for last add to retire
-    reg                reducing;      // feed the SHARED reduction tree, bank by bank
+    reg                draining;      // let the 1-stage term pipe settle into banks
     reg                rescaling;     // time-shared dequant pass
-    reg  [7:0]         mac_drain;
-    reg  [7:0]         red_cnt;       // reduce-phase cycle counter (feed + drain)
-    // SHARED reduction tree feed: one PE-wide tree per PE, time-multiplexed across
-    // the NB banks.  During the reduce phase we present bank red_fidx's leaves to
-    // every PE's tree for one cycle each (red_cnt = 0..NB-1); the pipelined tree
-    // streams the NB block-partials out TREE_LAT later, one per cycle.  This is
-    // BIT-EXACT to the old per-bank trees (identical leaf grouping / operands /
-    // order) -- only the adder hardware is shared in time.
-    wire               red_feed_v = reducing & (red_cnt < NB[7:0]); // feeding a bank
-    wire [IXW-1:0]     red_fidx   = red_cnt[IXW-1:0];               // bank fed this cycle
-    // (valid,bank) shift pipe aligned to the tree latency: when the tail is valid
-    // the corresponding bank's block-partial is leaving every PE's tree.
-    reg                red_v_pipe [0:TREE_LAT-1];
-    reg  [IXW-1:0]     red_i_pipe [0:TREE_LAT-1];
+    reg  [7:0]         drain_cnt;
 
     // latched per-tile scales
     reg  [ 8*PE_M-1:0]                   a_shift_q;
@@ -235,19 +320,12 @@ module glm_matmul_fp8 #(
     end
     endgenerate
 
-    /* verilator lint_off WIDTHTRUNC */
-    localparam [2:0] LANE_LAST = (L - 1);
-    /* verilator lint_on WIDTHTRUNC */
-    wire [2:0] lane_nxt = (lane == LANE_LAST) ? 3'd0 : (lane + 3'd1);
-
-    // per-PE final fp32 block partial streaming out of the shared reduction tree
-    // (latched into acc[bank] as each bank's result emerges), plus the NB latched
-    // block partials per PE consumed by the dequant pass.
-    wire [31:0] pe_l3y [0:PE_M-1][0:PE_N-1];
-    reg  [31:0] acc    [0:NB-1][0:PE_M-1][0:PE_N-1];
+    // per-PE/per-bank fixed-point block accumulators (written by the BANK
+    // generate below with constant genvar indices; read by the dequant pass).
+    reg signed [ACC_W-1:0] accx [0:NB-1][0:PE_M-1][0:PE_N-1];
 
     // ----------------------------------------------------------------------
-    // Per-PE FP8-mul + NB-way banked, L-way interleaved FP32 accumulate.
+    // Per-PE FP8-mul + NB-way banked fixed-point integer accumulate.
     // ----------------------------------------------------------------------
     genvar gi, gj, gb;
     generate
@@ -264,105 +342,36 @@ module glm_matmul_fp8 #(
         wire [ 7:0] a_q   = fp32_to_fp8e4m3(a_fs);
         // THE 4x4 MANTISSA MULTIPLY -> EXACT fp32 product (LUT, not DSP).
         wire [31:0] prod_f = fp8_mul(a_q, w_q);
-
-        // per-bank live reduction leaves (ps[0:L-1]; ps[L..7] are provably +0 and
-        // were already constant-folded into the +0 pads).  Exposed at PE scope so
-        // the ONE shared tree below can be muxed across banks.
-        wire [31:0] leaf [0:NB-1][0:4];
+        // convert the exact product to fixed-point, then register one stage to
+        // keep the front-end combinational path off the accumulate path.
+        wire signed [ACC_W-1:0] termx = fp32_to_fixed(prod_f);
+        reg  signed [ACC_W-1:0] term_r;
+        reg                     tv_r;
+        reg  [BKW-1:0]          bank_r;
+        always @(posedge clk) begin
+            if (rst) begin
+                tv_r <= 1'b0;
+            end else begin
+                tv_r   <= issue;       // a product for this beat
+                term_r <= termx;
+                bank_r <= kblk;        // K-block this beat belongs to
+            end
+        end
 
         for (gb = 0; gb < NB; gb = gb + 1) begin : BANK
-          // this bank accumulates only the beats whose K-block == gb.
-          wire issue_b;
+          // this bank integer-accumulates only the beats whose K-block == gb.
+          wire sel_b;
           if (NB > 1) begin : GIB
               localparam [BKW-1:0] BIDX = gb[BKW-1:0];
-              assign issue_b = issue & (kblk == BIDX);
+              assign sel_b = tv_r & (bank_r == BIDX);
           end else begin : GIB
-              assign issue_b = issue;       // single bank: every beat targets it
+              assign sel_b = tv_r;          // single bank: every beat targets it
           end
-
-          // L sub-accumulators (one per interleave lane; right-sized to ps[0:L-1]).
-          reg  [31:0] ps [0:L-1];
-          // writeback-lane shift register (L deep, matches add latency).
-          reg  [2:0]  lane_pipe [0:L-1];
-          wire        add_v;
-          wire [31:0] add_y;
-          wire [2:0]  wb_lane = lane_pipe[L-1];
-
-          // same-edge C forwarding (lane re-issued the cycle its result returns).
-          wire        fwd  = add_v && (wb_lane == lane);
-          wire [31:0] c_in = fwd ? add_y : ps[lane];
-
-          // accumulate: result = prod_f + c_in   (LAT = L), gated to this bank.
-          fp32_add_pipe u_acc (
-              .clk(clk), .rst(rst), .valid_in(issue_b),
-              .a(prod_f), .b(c_in),
-              .valid_out(add_v), .result(add_y)
-          );
-
-          integer li;
           always @(posedge clk) begin
-              lane_pipe[0] <= lane;          // global lane, delayed L cycles
-              for (li = 1; li < L; li = li + 1)
-                  lane_pipe[li] <= lane_pipe[li-1];
+              if (start)      accx[gb][gi][gj] <= {ACC_W{1'b0}};   // clear bank
+              else if (sel_b) accx[gb][gi][gj] <= accx[gb][gi][gj] + term_r;
           end
-
-          integer pj2;
-          always @(posedge clk) begin
-              if (start) begin
-                  for (pj2 = 0; pj2 < L; pj2 = pj2 + 1)
-                      ps[pj2] <= 32'h0000_0000;  // clear all L lane accumulators
-              end else if (add_v) begin
-                  ps[wb_lane] <= add_y;          // wb_lane in 0..L-1
-              end
-          end
-
-          // expose this bank's 5 live leaves to the PE-wide shared tree.
-          assign leaf[gb][0] = ps[0];
-          assign leaf[gb][1] = ps[1];
-          assign leaf[gb][2] = ps[2];
-          assign leaf[gb][3] = ps[3];
-          assign leaf[gb][4] = ps[4];
         end // BANK
-
-        // ---- ONE shared reduction tree per PE, time-multiplexed across banks ----
-        // 5 live leaves (of bank red_fidx) -> 3-level fp32_add_pipe tree.  The +0
-        // pad adders (b = zpad) preserve the original 8-leaf grouping bit-for-bit
-        // -- including the -0.0 -> +0.0 normalization that x + (+0) performs -- and
-        // the 3-level TREE_LAT.  Identical leaves / grouping / order as the old
-        // per-bank trees, so the result is BIT-EXACT; only the adders are shared in
-        // time (NB banks streamed through one tree, one bank per cycle).
-        wire [31:0] lf0  = leaf[red_fidx][0];
-        wire [31:0] lf1  = leaf[red_fidx][1];
-        wire [31:0] lf2  = leaf[red_fidx][2];
-        wire [31:0] lf3  = leaf[red_fidx][3];
-        wire [31:0] lf4  = leaf[red_fidx][4];
-        wire [31:0] zpad = 32'h0000_0000;   // +0 pad (was ps[5..7], provably +0)
-
-        /* verilator lint_off UNUSEDSIGNAL */
-        // level 1 (3 adders: 2 real + 1 +0-pad)
-        wire        l1a_v, l1b_v, l1c_v;
-        wire [31:0] l1a_y, l1b_y, l1c_y;
-        fp32_add_pipe u_l1a (.clk(clk), .rst(rst), .valid_in(red_feed_v),
-            .a(lf0), .b(lf1), .valid_out(l1a_v), .result(l1a_y));
-        fp32_add_pipe u_l1b (.clk(clk), .rst(rst), .valid_in(red_feed_v),
-            .a(lf2), .b(lf3), .valid_out(l1b_v), .result(l1b_y));
-        fp32_add_pipe u_l1c (.clk(clk), .rst(rst), .valid_in(red_feed_v),
-            .a(lf4), .b(zpad), .valid_out(l1c_v), .result(l1c_y));
-        // level 2 (2 adders: 1 real + 1 +0-pad)
-        wire        l2a_v, l2b_v;
-        wire [31:0] l2a_y, l2b_y;
-        fp32_add_pipe u_l2a (.clk(clk), .rst(rst), .valid_in(l1a_v),
-            .a(l1a_y), .b(l1b_y), .valid_out(l2a_v), .result(l2a_y));
-        fp32_add_pipe u_l2b (.clk(clk), .rst(rst), .valid_in(l1c_v),
-            .a(l1c_y), .b(zpad), .valid_out(l2b_v), .result(l2b_y));
-        // level 3 (1 adder)
-        wire        l3_v;
-        wire [31:0] l3_y;
-        fp32_add_pipe u_l3 (.clk(clk), .rst(rst), .valid_in(l2a_v),
-            .a(l2a_y), .b(l2b_y), .valid_out(l3_v), .result(l3_y));
-        /* verilator lint_on UNUSEDSIGNAL */
-
-        assign pe_l3y[gi][gj] = l3_y;
       end
     end
     endgenerate
@@ -370,23 +379,20 @@ module glm_matmul_fp8 #(
     // ----------------------------------------------------------------------
     // Time-shared dequant rescale: walk the NOUT output elements (one per
     // cycle).  For element (ri,rj):
-    //   c = bf16( 2^-a_shift[ri] * SUM_bj ( acc[bj][ri][rj] * w_scale[rj][bj] ) )
-    // The per-block weight scales are the only 24x24 fp32 multiplies in the unit;
+    //   c = bf16( 2^-a_shift[ri] * SUM_bj ( fixed_to_fp32(accx[bj][ri][rj]) * w_scale[rj][bj] ) )
+    // The fixed-point block accumulators are converted to fp32 ONCE here (RNE);
+    // the per-block weight scales are the only 24x24 fp32 multiplies in the unit;
     // the 2^-a_shift undo is an exact exponent add (LUT).
     // ----------------------------------------------------------------------
     reg [MW-1:0] ri;
     reg [NW-1:0] rj;
     reg [OW:0]   rcnt;
 
-    // PIPELINED dequant (was one deep combinational cone per element; now a
-    // feed-forward pipeline streaming ONE element/cycle).  RESULT-PRESERVING:
-    // the per-element math is the IDENTICAL left-fold
-    //     deq = ((0 + acc[0]*w[0]) + acc[1]*w[1]) + ...
-    // reusing the bit-exact fp32_mul_pipe / fp32_add_pipe (== fp32_mul / fp32_add;
-    // fp32_add is commutative so mac order is irrelevant).  Only LATENCY changes,
-    // shortening the reg-to-reg path from {mul + NB adds + scale + round} to a
-    // single FP stage.  DEQ_LAT = FP_MUL_LAT + NB*FP_ADD_LAT (the fold depth); the
-    // shallow 2^-a_shift exponent-add and bf16 round stay combinational at the tail.
+    // PIPELINED dequant streaming ONE element/cycle.  The per-element math is the
+    // left-fold  deq = ((0 + acc[0]*w[0]) + acc[1]*w[1]) + ...  reusing the
+    // bit-exact fp32_mul_pipe / fp32_add_pipe.  DEQ_LAT = FP_MUL_LAT + NB*FP_ADD_LAT
+    // (the fold depth); the shallow 2^-a_shift exponent-add and bf16 round stay
+    // combinational at the tail.
     localparam integer DEQ_LAT = `FP_MUL_LAT + NB*`FP_ADD_LAT;
 
     // output side-band pipe: carry (valid, output-slot, a_shift) alongside the
@@ -398,7 +404,7 @@ module glm_matmul_fp8 #(
     // feed: present element (ri,rj) for one cycle while walking 0..NOUT-1.
     wire         resc_feed_v = rescaling & (rcnt < NOUT[OW:0]);
 
-    // --- stage A: NB parallel products acc[bb][ri][rj] * w_scale[rj][bj] (LAT=ML) ---
+    // --- stage A: NB parallel products fixed_to_fp32(accx[bb][ri][rj]) * w_scale[rj][bj] ---
     wire [31:0]  dq_prod  [0:NB-1];
     wire         dq_prodv [0:NB-1];
     // --- stage B: left-fold of {0, prod0, prod1, ...} (each add LAT=AL) ---
@@ -410,11 +416,12 @@ module glm_matmul_fp8 #(
     generate
     for (gd = 0; gd < NB; gd = gd + 1) begin : DQ
         // bank selects (procedural: variable-base part-selects on w_scale_q, like
-        // the original combinational deq, kept out of continuous assigns).
+        // the original combinational deq, kept out of continuous assigns).  The
+        // fixed-point bank is converted to fp32 ONCE here (the single rounding).
         reg [31:0] acc_sel, wf_sel;
         integer    dq_widx;
         always @* begin
-            acc_sel = acc[gd][ri][rj];
+            acc_sel = fixed_to_fp32(accx[gd][ri][rj]);
             dq_widx = gd*PE_N + {{(32-NW){1'b0}}, rj};   // linear (K-block, col)
             wf_sel  = bf16_to_fp32(w_scale_q[16*dq_widx +: 16]);
         end
@@ -469,39 +476,23 @@ module glm_matmul_fp8 #(
     // ----------------------------------------------------------------------
     // Control FSM
     // ----------------------------------------------------------------------
-    localparam [IXW-1:0] LASTBANK = IXW'(NB-1);   // index of the final K-block bank
-    integer ci, cj, rp;
+    integer rp;
     always @(posedge clk) begin
         if (rst) begin
             busy          <= 1'b0;
             streaming     <= 1'b0;
-            mac_draining  <= 1'b0;
-            reducing      <= 1'b0;
+            draining      <= 1'b0;
             rescaling     <= 1'b0;
             out_valid     <= 1'b0;
             k_cnt         <= {KW{1'b0}};
             k_target      <= {KW{1'b0}};
-            lane          <= 3'd0;
-            mac_drain     <= 8'd0;
-            red_cnt       <= 8'd0;
+            drain_cnt     <= 8'd0;
             ri            <= {MW{1'b0}};
             rj            <= {NW{1'b0}};
             rcnt          <= {(OW+1){1'b0}};
-            for (rp = 0; rp < TREE_LAT; rp = rp + 1) begin
-                red_v_pipe[rp] <= 1'b0;
-                red_i_pipe[rp] <= {IXW{1'b0}};
-            end
             for (rp = 0; rp < DEQ_LAT; rp = rp + 1) dq_v_pipe[rp] <= 1'b0;
         end else begin
             out_valid <= 1'b0;
-
-            // ---- shared-tree (valid,bank) latency pipe: shift every cycle ----
-            red_v_pipe[0] <= red_feed_v;
-            red_i_pipe[0] <= red_fidx;
-            for (rp = 1; rp < TREE_LAT; rp = rp + 1) begin
-                red_v_pipe[rp] <= red_v_pipe[rp-1];
-                red_i_pipe[rp] <= red_i_pipe[rp-1];
-            end
 
             // ---- dequant (valid,slot,a_shift) side-band pipe: shift every cycle ----
             dq_v_pipe[0]    <= resc_feed_v;
@@ -511,13 +502,6 @@ module glm_matmul_fp8 #(
                 dq_v_pipe[rp]    <= dq_v_pipe[rp-1];
                 dq_slot_pipe[rp] <= dq_slot_pipe[rp-1];
                 dq_ash_pipe[rp]  <= dq_ash_pipe[rp-1];
-            end
-
-            // ---- latch each bank's block-partial as it leaves the shared tree ----
-            if (red_v_pipe[TREE_LAT-1]) begin
-                for (ci = 0; ci < PE_M; ci = ci + 1)
-                    for (cj = 0; cj < PE_N; cj = cj + 1)
-                        acc[red_i_pipe[TREE_LAT-1]][ci][cj] <= pe_l3y[ci][cj];
             end
 
             // ---- write each dequantized element as it leaves the dequant pipe;
@@ -533,16 +517,12 @@ module glm_matmul_fp8 #(
             if (start) begin
                 busy          <= 1'b1;
                 streaming     <= 1'b1;
-                mac_draining  <= 1'b0;
-                reducing      <= 1'b0;
+                draining      <= 1'b0;
                 rescaling     <= 1'b0;
                 k_cnt         <= {KW{1'b0}};
                 k_target      <= k_len;
-                lane          <= 3'd0;
                 a_shift_q     <= a_shift;
                 w_scale_q     <= w_scale;
-                for (rp = 0; rp < TREE_LAT; rp = rp + 1)
-                    red_v_pipe[rp] <= 1'b0;   // drop any stale reduce-pipe entries
                 for (rp = 0; rp < DEQ_LAT; rp = rp + 1)
                     dq_v_pipe[rp]  <= 1'b0;   // drop any stale dequant-pipe entries
             end
@@ -550,46 +530,31 @@ module glm_matmul_fp8 #(
             // ---- K streaming (route each beat to its K-block bank) ----
             if (issue) begin
                 k_cnt <= k_cnt + 1'b1;
-                lane  <= lane_nxt;
                 if (last_issue) begin
-                    streaming    <= 1'b0;
-                    mac_draining <= 1'b1;
-                    mac_drain    <= L[7:0];
+                    streaming <= 1'b0;
+                    draining  <= 1'b1;
+                    drain_cnt <= ACC_DRAIN[7:0];
                 end
             end
 
-            // ---- wait for the last add to retire, then begin the reduce phase ----
-            if (mac_draining) begin
-                if (mac_drain == 8'd0) begin
-                    mac_draining <= 1'b0;
-                    reducing     <= 1'b1;
-                    red_cnt      <= 8'd0;   // feed bank 0..NB-1 over the next NB cycles
-                end else begin
-                    mac_drain <= mac_drain - 8'd1;
-                end
-            end
-
-            // ---- reduce phase: feed NB banks through the shared tree, then wait
-            //      for the last bank's block-partial to land, then start rescale.
-            //      The acc latch above writes each bank as it emerges; rescaling
-            //      begins the cycle the LAST bank (NB-1) is latched. ----
-            if (reducing) begin
-                red_cnt <= red_cnt + 8'd1;
-                if (red_v_pipe[TREE_LAT-1] &&
-                    (red_i_pipe[TREE_LAT-1] == LASTBANK)) begin
-                    reducing  <= 1'b0;
+            // ---- let the 1-stage term pipeline settle into the banks, then
+            //      begin the dequant rescale. ----
+            if (draining) begin
+                if (drain_cnt == 8'd0) begin
+                    draining  <= 1'b0;
                     rescaling <= 1'b1;
                     ri        <= {MW{1'b0}};
                     rj        <= {NW{1'b0}};
                     rcnt      <= {(OW+1){1'b0}};
+                end else begin
+                    drain_cnt <= drain_cnt - 8'd1;
                 end
             end
 
             // ---- dequant rescale FEED: present one element per cycle ----
             // rcnt walks 0..NOUT-1 in (ri*PE_N+rj) order, so it IS the linear slot;
             // the pipelined datapath writes c_out DEQ_LAT later (block above).  We
-            // keep rescaling asserted until the final slot has been written; the
-            // feed itself stops once rcnt reaches NOUT (resc_feed_v gates on that).
+            // keep rescaling asserted until the final slot has been written.
             if (rescaling) begin
                 if (rcnt < NOUT[OW:0]) begin
                     rcnt <= rcnt + 1'b1;
