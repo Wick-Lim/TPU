@@ -307,7 +307,11 @@ cache-study:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/weight_decomp test/weight_decomp_tb.v src/weight_decomp.v
 	@printf '[%s] ' "weight_decomp"; $(VVP) $(BUILD_DIR)/weight_decomp | grep -E 'ALL [0-9]+ TESTS PASSED|RATIO' \
 	    || { echo "FAILED: weight_decomp"; exit 1; }
-	@echo "cache-study: batching + prefetch + replacement-policy + weight-decomp sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
+	@# expert_prefetch_top: predictor-driven deep prefetch -- MEASURED no-op at real cache size (see docs/IMPROVEMENT_PLAN.md 2.3).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/expert_prefetch_top test/expert_prefetch_top_tb.v src/expert_prefetch_top.v src/expert_predictor.v src/expert_cache_pf.v src/expert_cache_ctrl.v
+	@printf '[%s] ' "expert_prefetch_top"; $(VVP) $(BUILD_DIR)/expert_prefetch_top | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: expert_prefetch_top"; exit 1; }
+	@echo "cache-study: batching + prefetch + policy + decomp + predictor-prefetch sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
 
 # Formal (bounded model checking) of the memory-system controllers via yosys write_smt2 +
 # yosys-smtbmc -s z3.  Each harness test/formal/<dut>_fv.v instantiates the committed controller
