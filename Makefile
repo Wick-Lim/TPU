@@ -51,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi soc unittests cache-study formal sim wave lint synth ppa clean
+.PHONY: all build test hazard axi soc unittests cache-study formal bitacc sim wave lint synth ppa clean
 
 all: test hazard unittests lint synth formal
 
@@ -351,6 +351,21 @@ formal:
 	$(call run_bmc,kv_cache_pager,,,16)
 	$(call run_bmc,expert_cache_pf,src/expert_cache_ctrl.v,chparam -set PF_ENABLE 0 expert_cache_pf_fv;,20)
 	@echo "formal: all 5 controllers BMC-proven (no counterexample); see docs/FORMAL.md for bounds + coverage"
+
+# Real-checkpoint bit-accuracy: prove glm_matmul_fp8 computes the GLM-5.2-FP8 FP8 contract exactly
+# as the real inference engine (argmax-preserving vs fp32-accumulate + float64 ground truth), and
+# that the HF safetensors -> RTL bridge round-trips.  See docs/BIT_ACCURACY.md (+ the full-model GPU procedure).
+bitacc:
+	@python3 tools/glm_fp8_ref.py | grep -qE 'SELFTEST PASS' || { echo "FAILED: glm_fp8_ref"; exit 1; }
+	@printf '[%s] ' "glm_fp8_ref"; echo "SELFTEST PASS"
+	@python3 tools/ckpt_pack.py | grep -qE 'SELFTEST PASS' || { echo "FAILED: ckpt_pack"; exit 1; }
+	@printf '[%s] ' "ckpt_pack(HF safetensors->RTL)"; echo "round-trip PASS"
+	@python3 test/bit_accuracy_gen.py >/dev/null
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/bit_accuracy test/bit_accuracy_tb.v src/glm_matmul_fp8.v src/glm_fp_pipe.v
+	@printf '[%s] ' "bit_accuracy(RTL==real-contract)"; $(VVP) $(BUILD_DIR)/bit_accuracy | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: bit_accuracy"; exit 1; }
+	@python3 test/bit_accuracy_check.py | grep -E 'ARGMAX-PRESERVED' || { echo "FAILED: bit_accuracy_check"; exit 1; }
+	@echo "bitacc: glm_matmul_fp8 == real GLM-5.2-FP8 FP8 contract, argmax preserved (see docs/BIT_ACCURACY.md)"
 
 wave: $(SIM_BIN)
 	$(VVP) $(SIM_BIN)
