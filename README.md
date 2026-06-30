@@ -13,7 +13,14 @@ Underneath sits a classic **5-stage scalar TPU core** (the original *TPU v2.0*, 
 [`SPEC.md`](SPEC.md)) used as the control/integration substrate; this README leads
 with the GLM-5.2 accelerator, which is the active work.
 
+**Branches:** `prototype` (frozen at `fee8501`) = the **research prototype** — the full FP8
+datapath + memory system + ultra-perf batching stack, bit-exact and mechanism-proven at a
+small-but-faithful slice. `main` = the **product** track, taking it from verified-prototype-RTL to
+a shippable accelerator that runs the real checkpoint reliably. See
+[`docs/PRODUCT_ROADMAP.md`](docs/PRODUCT_ROADMAP.md).
+
 The normative documents:
+- **[`docs/PRODUCT_ROADMAP.md`](docs/PRODUCT_ROADMAP.md)** — the product (not research) development direction: the #1 gate (real-checkpoint full-model fidelity), then robustness/vendor-IP/physical/software/manufacturing phases, and the FPGA-card-vs-ASIC product fork.
 - **[`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md)** — the GLM-5.2 accelerator architecture: exact config, MLA + DSA + MoE detail, the fp64-golden methodology, the memory/streaming system, and the RTL build order.
 - **[`docs/SYSTEM_SINGLE_PACKAGE.md`](docs/SYSTEM_SINGLE_PACKAGE.md)** — a single-module system design to run the real 753B GLM-5.2-FP8 (FP8 compute die + 64 GB DDR5 + 1 TB Flash, e.g. a USB-C external accelerator): memory tiering, MoE expert caching/streaming, the bottleneck/perf/cost model, and how the committed RTL is the compute die.
 - **[`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md)** — the perf/power improvement roadmap targeting the Flash bottleneck, with each lever's measured result (what helped, what was a measured no-op).
