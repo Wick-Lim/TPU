@@ -157,6 +157,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_fp8_sim test/swiglu_expert_fp8_tb.v src/swiglu_expert_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "swiglu_expert_fp8"; $(VVP) $(BUILD_DIR)/swiglu_expert_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: swiglu_expert_fp8"; exit 1; }
+	@# swiglu_expert_fp8 PE_M batch: B rows per ONE weight fetch (== B single runs, bit-exact) -- the batching keystone.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/swiglu_expert_fp8_pem_sim test/swiglu_expert_fp8_pem_tb.v src/swiglu_expert_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "swiglu_expert_fp8(PE_M batch)"; $(VVP) $(BUILD_DIR)/swiglu_expert_fp8_pem_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: swiglu_expert_fp8_pem"; exit 1; }
 	@# mla_attn_fp8: MLA attention, 7 weight projections via glm_matmul_fp8, bf16 attention/rope/norm/softmax/dsa.
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_sim test/mla_attn_fp8_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "mla_attn_fp8"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
