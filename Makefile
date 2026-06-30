@@ -315,7 +315,10 @@ cache-study:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/expert_prefetch_top test/expert_prefetch_top_tb.v src/expert_prefetch_top.v src/expert_predictor.v src/expert_cache_pf.v src/expert_cache_ctrl.v
 	@printf '[%s] ' "expert_prefetch_top"; $(VVP) $(BUILD_DIR)/expert_prefetch_top | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: expert_prefetch_top"; exit 1; }
-	@echo "cache-study: batching + prefetch + policy + decomp + predictor-prefetch sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
+	@# flash_layout: offline expert->Flash-channel placement so flash_xbar's stripe spreads a token's top-8 (~39%->55% of 8x peak BW).
+	@printf '[%s] ' "flash_layout"; python3 tools/flash_layout.py | grep -E 'OPTIMIZED|peakBW' | head -2 \
+	    || { echo "FAILED: flash_layout"; exit 1; }
+	@echo "cache-study: batching + prefetch + policy + decomp + predictor-prefetch + flash-layout sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
 
 # Formal (bounded model checking) of the memory-system controllers via yosys write_smt2 +
 # yosys-smtbmc -s z3.  Each harness test/formal/<dut>_fv.v instantiates the committed controller
