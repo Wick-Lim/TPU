@@ -342,7 +342,13 @@ cache-study:
 	@# flash_layout: offline expert->Flash-channel placement so flash_xbar's stripe spreads a token's top-8 (~39%->55% of 8x peak BW).
 	@printf '[%s] ' "flash_layout"; python3 tools/flash_layout.py | grep -E 'OPTIMIZED|peakBW' | head -2 \
 	    || { echo "FAILED: flash_layout"; exit 1; }
-	@echo "cache-study: batching + prefetch + policy + decomp + predictor-prefetch + flash-layout sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
+	@# batched_moe: expert-grouped batched MoE -- B tokens, union of experts fetched once each (aggregate-throughput lever).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/batched_moe test/batched_moe_tb.v src/batched_moe.v src/swiglu_expert_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "batched_moe"; $(VVP) $(BUILD_DIR)/batched_moe | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: batched_moe"; exit 1; }
+	@printf '[%s] ' "batched_moe(amortize)"; python3 tools/batched_moe_amortize.py | grep -E '256|amort' | head -2 \
+	    || { echo "FAILED: batched_moe_amortize"; exit 1; }
+	@echo "cache-study: batching + prefetch + policy + decomp + predictor-prefetch + flash-layout + batched-moe sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
 
 # Formal (bounded model checking) of the memory-system controllers via yosys write_smt2 +
 # yosys-smtbmc -s z3.  Each harness test/formal/<dut>_fv.v instantiates the committed controller
