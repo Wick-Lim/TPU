@@ -51,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi soc unittests cache-study formal bitacc sim wave lint synth ppa clean
+.PHONY: all build test hazard axi soc unittests cache-study formal formal-ind bitacc sim wave lint synth ppa clean
 
 all: test hazard unittests lint synth formal
 
@@ -248,6 +248,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/boot_loader_sim test/boot_loader_tb.v src/boot_loader.v
 	@printf '[%s] ' "boot_loader"; $(VVP) $(BUILD_DIR)/boot_loader_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: boot_loader"; exit 1; }
+	@# ecc_secded: (72,64) SECDED ECC for the DDR5/Flash path -- exhaustive single-correct + double-detect.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/ecc_secded_sim test/ecc_secded_tb.v src/ecc_secded.v
+	@printf '[%s] ' "ecc_secded"; $(VVP) $(BUILD_DIR)/ecc_secded_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: ecc_secded"; exit 1; }
 	@# clk_en_ctrl: work-driven clock-enable gating (die idles ~75% Flash-bound -> ~73% idle-power gated; never gates active work).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/clk_en_ctrl_sim test/clk_en_ctrl_tb.v src/clk_en_ctrl.v
 	@printf '[%s] ' "clk_en_ctrl"; $(VVP) $(BUILD_DIR)/clk_en_ctrl_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
@@ -381,6 +385,38 @@ formal:
 	$(call run_bmc,kv_cache_pager,,,16)
 	$(call run_bmc,expert_cache_pf,src/expert_cache_ctrl.v,chparam -set PF_ENABLE 0 expert_cache_pf_fv;,20)
 	@echo "formal: all 5 controllers BMC-proven (no counterexample); see docs/FORMAL.md for bounds + coverage"
+
+# UNBOUNDED proof via temporal k-INDUCTION (yosys-smtbmc -i): base case + induction
+# step => the asserts hold on ALL reachable states, not just the first K cycles.
+# The step needs the design's reachable state space pinned; harnesses add
+# STRENGTHENING INVARIANT asserts (over the DUT's primary I/O + harness shadow
+# regs -- this yosys build has no internal observability) until the step closes.
+define run_kind  # $(1)=dut name  $(2)=ind-harness basename  $(3)=K  $(4)=extra yosys (e.g. connect-bind)
+	@yosys -p "read_verilog -sv -formal -I src src/$(1).v test/formal/$(2).v; \
+	          prep -top $(2) -flatten; $(4) memory_map; async2sync; chformal -lower; \
+	          write_smt2 -wires $(FV_DIR)/$(2).smt2" > $(FV_DIR)/$(2)_build.log 2>&1 \
+	    || { echo "FAILED(build): $(2)"; cat $(FV_DIR)/$(2)_build.log; exit 1; }
+	@test `grep -ic assert $(FV_DIR)/$(2).smt2` -gt 0 \
+	    || { echo "FAILED(vacuous: 0 assertions): $(2)"; exit 1; }
+	@yosys-smtbmc -s z3 -i -t $(3) $(FV_DIR)/$(2).smt2 > $(FV_DIR)/$(2)_kind.log 2>&1 \
+	    && printf '[k-induction %-20s] PROVEN UNBOUNDED  K=%s  (%s asserts)\n' "$(2)" "$(3)" "`grep -ic assert $(FV_DIR)/$(2).smt2`" \
+	    || { echo "FAILED(induction step): $(2)"; tail -20 $(FV_DIR)/$(2)_kind.log; exit 1; }
+endef
+
+# flash_xbar response-FIFO / outstanding proof needs the DUT's OWN per-channel counters
+# (u_dut.outst[c], u_dut.cnt[c]) in the inductive hypothesis.  yosys 0.66 cannot reference
+# them from Verilog (no hierarchical refs), so the harness declares `(* keep *)` UNDRIVEN
+# probe wires and we wire them to the flattened DUT registers post-flatten with `connect`.
+# The TRAILING SPACE before each `;` is load-bearing: it terminates the escaped bracketed
+# id \u_dut.outst[0] (otherwise [0] is parsed as a bit-select of a non-existent wire).
+FLASH_IND_CONN := connect -set \dut_outst0 \u_dut.outst[0] ; connect -set \dut_outst1 \u_dut.outst[1] ; connect -set \dut_cnt0 \u_dut.cnt[0] ; connect -set \dut_cnt1 \u_dut.cnt[1] ;
+formal-ind:
+	$(call run_kind,boot_loader,boot_loader_ind_fv,8)
+	$(call run_kind,kv_cache_pager,kv_cache_pager_ind_fv,16)
+	$(call run_kind,spec_decode_seq,spec_decode_seq_ind_fv,2)
+	$(call run_kind,ddr5_xbar,ddr5_xbar_ind_fv,12)
+	$(call run_kind,flash_xbar,flash_xbar_ind_fv,3,$(FLASH_IND_CONN))
+	@echo "formal-ind: boot_loader done-gate proven UNBOUNDED; kv_cache_pager append/gather in-bounds + window invariants proven UNBOUNDED; spec_decode_seq token-accounting equality + per-cycle modular increment bounds + step-form (non-decreasing-except-wrap) monotonicity proven UNBOUNDED (k-induction K=2); ddr5_xbar request-path routing safety (exclusive one-hot routing / banked-channel selection / ready coherence / payload integrity) proven UNBOUNDED -- response-FIFO no-overflow/tag-issued stay BOUNDED (need internal cnt[]/rr, not referenceable in this yosys build); strict unsigned monotonicity stays BOUNDED (32-bit counter wrap); flash_xbar per-channel-queue no-overflow (cnt[c]<=QDEPTH) + outstanding<=N_CH*QDEPTH (P3) + inflight<=outstanding (P1a/P1b) proven UNBOUNDED via connect-bound internal counters (k-induction K=3) -- tag-issued (P2) stays BOUNDED (needs FIFO-content data-invariant; FIFO is a 2-D memory cell, not connect-bindable) -- see docs/FORMAL.md"
 
 # Real-checkpoint bit-accuracy: prove glm_matmul_fp8 computes the GLM-5.2-FP8 FP8 contract exactly
 # as the real inference engine (argmax-preserving vs fp32-accumulate + float64 ground truth), and

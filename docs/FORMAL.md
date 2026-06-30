@@ -34,9 +34,52 @@ yosys -p "read_verilog -sv -formal -I src src/<dut>.v test/formal/<dut>_fv.v; \
 yosys-smtbmc -s z3 -t <K> scratchpad/<dut>_fv.smt2     # -> ## Status: PASSED
 ```
 
+## Unbounded proofs by k-induction (`make formal-ind`)
+
+A subset of the safety properties is additionally proven **UNBOUNDED** by temporal **k-induction**
+(`yosys-smtbmc -i -s z3`): the base case **and** the induction step both pass, so the asserts hold
+on **all reachable states**, not just the first K cycles. The strengthening harnesses are
+`test/formal/*_ind_fv.v` (run via the `formal-ind` target / `run_kind`). Naive k-induction fails
+the step because the inductive hypothesis admits unreachable states; each harness adds
+**strengthening-invariant** asserts that pin the reachable state space until the step closes.
+
+| Controller | Proven UNBOUNDED (k-induction) | K | Stays BOUNDED (BMC only) |
+|---|---|---|---|
+| `boot_loader` | `done` stable-once-raised + never-early | 8 | — |
+| `kv_cache_pager` | append/gather in-bounds + window invariants | 16 | — |
+| `spec_decode_seq` | token-accounting equality, per-cycle modular increment bounds, non-decreasing-except-wrap | 2 | strict (non-wrapping) monotonicity (32-bit counter wrap) |
+| `ddr5_xbar` | request-path routing safety (one-hot routing / banked select / ready coherence / payload integrity) | 12 | response-FIFO no-overflow, tag-issued |
+| `flash_xbar` | **per-channel-queue no-overflow `cnt[c]≤QDEPTH`, `outstanding ≤ N_CH·QDEPTH` (P3), `inflight ≤ outstanding`, no-underflow (P1a/P1b)** | 3 | tag-issued (P2) |
+
+**`flash_xbar` — how the internal counters are reached.** P3 / per-channel no-overflow are *not*
+inductive on the harness's black-box shadow counters alone: in a spurious pre-state the global
+`outstanding` can sit at the cap while one channel is over-full, so the step admits an issue that
+overflows. The fix pins the DUT's **own** per-channel registers `outst[c]`, `cnt[c]` with the
+strengthening set **S1** `outst[c]≤QDEPTH` (the acceptance-gate invariant, self-inductive via the
+`!ch_full` issue gate), **S2** `cnt[c]≤QDEPTH` (FIFO occupancy, self-inductive via
+`mem_resp_ready=!full`), **S3** `cnt[c]≤outst[c]`, and the linkages **L_out** `outstanding=Σ outst[c]`,
+**L_in** `inflight=Σ cnt[c]`, **L_die** `die_inflight[c]=outst[c]−cnt[c]` (each inductive by
+construction). yosys 0.66 has **no hierarchical-reference support** (`u_dut.outst[0]` parses as a
+fresh flat implicit wire, not the register), so the harness declares `(* keep *)` **undriven** probe
+wires and the build wires them to the flattened DUT registers with `connect -set \dut_outst0
+\u_dut.outst[0] ` — the **trailing space terminates the bracketed escaped id** (otherwise `[0]` is
+parsed as a bit-select). The committed RTL is untouched. Verified non-vacuous: probes
+`PROBE_OUTST`/`PROBE_FULL`/`PROBE_RESP` each yield a BMC counterexample (cap, FIFO-full, and a firing
+response are all reachable, so the bounds are tight), and a mutation (`outst[c]≤QDEPTH−1`) fails both
+BMC and induction (the probe is genuinely bound to a register that reaches QDEPTH). Minimal induction
+depth is **k=2** (k=1 fails); the target runs k=3 for margin.
+
+**`flash_xbar` P2 stays BOUNDED.** "`resp_valid ⇒ issued[resp_tag]`" holds under BMC (to ≥16) but is
+not inductive without a data-invariant over the FIFO **contents** ("every occupied slot holds an
+issued tag"). The response FIFO is a 2-D `$mem` whose elements are not exposed as wires, so the
+`connect`-binding trick cannot reach them, and yosys 0.66 cannot express the quantified
+memory-content invariant from a read-only harness. It therefore remains a bounded (BMC) result.
+
 ## Honest coverage
 
-- **Bounded, not unbounded.** Each property holds for all legal input sequences over the first
+- **Bounded, not unbounded** *(applies to the `make formal` BMC table above; see the k-induction
+  table for the properties additionally proven unbounded).* Each property holds for all legal input
+  sequences over the first
   K cycles from reset — no k-induction was run, so this is not an unbounded proof. The small
   instances wrap/overflow/evict multiple times within K (e.g. `kv_cache_pager` RESIDENT=4 overflows
   by ~cycle 5; `expert_cache_pf` K=55 ≈ 15 fill/evict/hit transactions), so steady-state behaviour
