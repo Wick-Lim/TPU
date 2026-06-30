@@ -169,6 +169,13 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/moe_router_fp8_sim test/moe_router_fp8_tb.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/topk_select.v src/glm_fp_pipe.v
 	@printf '[%s] ' "moe_router_fp8"; $(VVP) $(BUILD_DIR)/moe_router_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: moe_router_fp8"; exit 1; }
+	@# PE_M batch: moe_router_fp8 + mla_attn_fp8 process B rows per ONE weight fetch (== B single runs, bit-exact).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/moe_router_fp8_pem_sim test/moe_router_fp8_pem_tb.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/topk_select.v src/glm_fp_pipe.v
+	@printf '[%s] ' "moe_router_fp8(PE_M)"; $(VVP) $(BUILD_DIR)/moe_router_fp8_pem_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: moe_router_fp8_pem"; exit 1; }
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_pem_sim test/mla_attn_fp8_pem_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "mla_attn_fp8(PE_M)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_pem_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: mla_attn_fp8_pem"; exit 1; }
 	@# glm_decoder_block_fp8: one full GLM-5.2-FP8 decoder layer (mla_attn_fp8 + moe_router_fp8 + swiglu_expert_fp8).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_decoder_block_fp8_sim test/glm_decoder_block_fp8_tb.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_decoder_block_fp8"; $(VVP) $(BUILD_DIR)/glm_decoder_block_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
