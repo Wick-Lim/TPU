@@ -70,29 +70,50 @@
 //   busy                  : high from start until done.
 //
 //----------------------------------------------------------------------------
-// LATENCY  (deterministic, data-independent for a given S)
-//   Let MAC = `FP_MAC_LAT (fp32_mac_pipe latency, 7).  Per query:
+// LATENCY  (deterministic, data-independent for a given S)        [PARALLELIZED]
+//   Let MAC = `FP_MAC_LAT (fp32_mac_pipe latency, 7).  The dot product is the
+//   throughput wall (at 1M context the indexer scores up to ~S keys); the naive
+//   build issued the IDX_DIM MAC terms of ONE key strictly in order -- it waited
+//   ~MAC cycles between terms (issue term d only after term d-1 landed), so each
+//   key cost ~IDX_DIM*MAC and S keys cost ~S*IDX_DIM*MAC.  THIS build SOFTWARE-
+//   PIPELINES across keys: it processes keys in GROUPS of LANES, and issues ONE
+//   MAC term every cycle by ROUND-ROBINing the LANES independent in-flight keys
+//   through the single shared fp32_mac_pipe.  Each key still walks its OWN terms
+//   strictly in order (acc = q[d]*k[d] + acc, c = its own running sum), so its
+//   dot product is the IDENTICAL fp32 FMA chain -- the scores are BIT-EXACT to
+//   the serial build.  When LANES >= MAC the pipe never stalls -> throughput is
+//   1 term/cycle, so scoring costs ~S*IDX_DIM (down from ~S*IDX_DIM*MAC, a ~MACx
+//   = ~7x cut at the wall) plus one MAC drain + ~1 fetch/key.  A short tail group
+//   (gsize < MAC) simply stalls per-lane as before -- still bit-exact.
 //     load q+S         : 1
-//     SPARSE (S>TOPK):
-//       score S keys   : S*IDX_DIM beats issued (one MAC/beat) + MAC drain,
-//                        sequentially, key-by-key  ->  S*IDX_DIM + MAC + ~2/key
+//     SPARSE (S>TOPK):  ceil(S/LANES) groups; per group fetch ~gsize + score
+//                       IDX_DIM*gsize (1/cycle when gsize>=MAC) + MAC drain
+//                       ->  ~S*IDX_DIM + ~S + ceil(S/LANES)*MAC   (vs S*IDX_DIM*MAC)
 //       topk_select    : S_MAX load beats + min(S_MAX,TOPK) extract + handshake
 //     DENSE  (S<=TOPK) : no scoring/select -- emit 0..S-1 directly  (~1 cycle)
-//   Every count is a function of (IDX_DIM, S, S_MAX, TOPK) -- no data-dependent
-//   branch on the SCORE values -- so the latency is fixed per (S, params).
+//   Every count is a function of (IDX_DIM, S, S_MAX, TOPK, LANES) -- no data-
+//   dependent branch on the SCORE values -- so the latency is fixed per (S,params).
 //
 //----------------------------------------------------------------------------
 // STYLE / CORRECTNESS INVARIANTS
 //   * `timescale + this header ; synchronous ACTIVE-HIGH reset.
-//   * NO latch (every reg assigned on every path); NO combinational loop (the
-//     MAC accumulate feeds back ONLY through the pipeline registers of
-//     fp32_mac_pipe and the score_mem register; control is a Moore FSM).
+//   * NO latch (every reg assigned on every path); NO combinational loop (each
+//     key's accumulate feeds back ONLY through the pipeline registers of
+//     fp32_mac_pipe and the per-lane acc register; control is a Moore FSM).
 //   * Reuses fp32_mac_pipe + topk_select UNCHANGED.  fp32 score accumulate.
+//   * BIT-EXACT to the serial build: interleaving keys does NOT reorder any
+//     single key's term-accumulation order, so every score is identical; only
+//     the IDLE pipe slots between a key's terms are now filled by OTHER keys.
 //============================================================================
 module dsa_indexer #(
     parameter integer IDX_DIM = 16,    // small index/scoring dim (real ~128)
     parameter integer S_MAX   = 32,    // max causal keys (real up to 1M ring)
     parameter integer TOPK    = 8,     // index_topk budget (real 2048)
+    // LANES : number of keys processed concurrently (software-pipelined through
+    // the single MAC).  >= `FP_MAC_LAT (7) fully hides the MAC latency -> 1 term/
+    // cycle.  Smaller still correct (just stalls).  Result is bit-exact for ANY
+    // LANES (per-key term order is preserved).
+    parameter integer LANES   = 8,
     // IDXW DERIVED ($clog2(S_MAX)); exposed only to size the index ports.
     // Do NOT override -- always leave default.
     parameter integer IDXW    = (S_MAX <= 1) ? 1 : $clog2(S_MAX)
@@ -125,6 +146,11 @@ module dsa_indexer #(
     // derived sizes / constants
     //------------------------------------------------------------------------
     localparam integer DIW = (IDX_DIM <= 1) ? 1 : $clog2(IDX_DIM); // dim counter
+    localparam integer LW  = (LANES   <= 1) ? 1 : $clog2(LANES);   // lane index
+    // tag-FIFO depth: holds the lane-id of every MAC term in flight (<= `FP_MAC_LAT)
+    // with slack, sized to a power of two so the head/tail pointers wrap freely.
+    localparam integer TQD = 16;
+    localparam integer TQW = $clog2(TQD);                          // = 4
     // -inf : the strict lower bound topk_select treats as never-selectable, used
     // to pad the unused score slots (keys S..S_MAX-1) so selection sees only the
     // S real keys (matches topk_select's NEG_INF / NaN==smallest contract).
@@ -144,13 +170,17 @@ module dsa_indexer #(
     reg [31:0]  score_mem [0:S_MAX-1];
 
     //------------------------------------------------------------------------
-    // (1) DOT-PRODUCT engine : one fp32_mac_pipe, accumulates over IDX_DIM.
-    //   For the current key, we issue IDX_DIM MAC beats  acc = q[d]*k[d] + acc,
-    //   feeding the running accumulator back as `c`.  The accumulator update is
-    //   sequential (one term per emitted result), so we issue a term only after
-    //   the previous term's result has landed -- a simple, deterministic,
-    //   in-order accumulate (throughput is traded for zero hazard logic; IDX_DIM
-    //   is small).  acc starts at +0.0.
+    // (1) DOT-PRODUCT engine : one SHARED fp32_mac_pipe, software-pipelined over
+    //   LANES independent keys.  Keys are scored in GROUPS of up to LANES.  Every
+    //   cycle we issue ONE MAC term  acc[g] = q[d]*k[d] + acc[g]  for some lane g
+    //   that is READY (its previous term has landed), round-robining the lanes so
+    //   the pipe stays full.  Because lane g only ever issues its OWN term d AFTER
+    //   its term d-1 has landed (dim_issue[g]==dim_done[g]), each key's accumulate
+    //   is the IDENTICAL in-order fp32 FMA chain as the serial build -> BIT-EXACT
+    //   scores; the LANES interleave merely fills the pipe's idle slots.  When a
+    //   result lands, a lane-id FIFO (pushed at issue, popped at land -- the pipe
+    //   is in-order & conserves count) names the lane whose acc it updates.
+    //   acc[g] starts at +0.0.
     //------------------------------------------------------------------------
     reg          mac_valid_in;
     reg  [31:0]  mac_a, mac_b, mac_c;
@@ -162,13 +192,70 @@ module dsa_indexer #(
         .valid_out(mac_valid_out), .result(mac_result)
     );
 
-    reg [31:0]   acc;                    // running fp32 dot accumulator
-    reg [DIW:0]  dim_issue;              // index-dim terms ISSUED for this key
-    reg [DIW:0]  dim_done;               // index-dim results LANDED for this key
+    // per-lane state for the LANES in-flight keys of the current group.
+    reg [31:0]  acc_l       [0:LANES-1];           // running fp32 dot accumulator
+    reg [DIW:0] dim_issue_l [0:LANES-1];           // terms ISSUED for this lane
+    reg [DIW:0] dim_done_l  [0:LANES-1];           // terms LANDED for this lane
+    reg [15:0]  kbuf_l      [0:LANES-1][0:IDX_DIM-1]; // each lane's key bf16 vector
+    integer ki, lg;
 
-    // current key's bf16 lanes, latched when key_valid.
-    reg [15:0]   kbuf [0:IDX_DIM-1];
-    integer ki;
+    // group bookkeeping.  All counts/sizes/indices share gbase's width [IDXW:0]
+    // (IDXW+1 bits) so every arithmetic op is width-matched (warning-free); the
+    // LANES-deep arrays are addressed with an explicit [LW-1:0] slice.
+    reg [IDXW:0] gbase;                  // first key index of the current group
+    reg [IDXW:0] gsize;                  // # keys in this group = min(LANES, S-gbase)
+    reg [IDXW:0] fetch_issue;            // key requests issued for this group
+    reg [IDXW:0] fetch_got;              // key vectors captured for this group
+    reg [IDXW:0] rr;                     // round-robin start lane for issue
+
+    // lane-id FIFO (matches each landed MAC result to its lane, latency-agnostic)
+    reg [LW-1:0] tagq [0:TQD-1];
+    reg [TQW-1:0] tq_head, tq_tail;
+    integer tqi;
+
+    //------------------------------------------------------------------------
+    // COMBINATIONAL group/selection logic (Moore inputs to the FSM; pure
+    // functions of the FSM registers -- no feedback, no latch).
+    //   grem  : keys remaining (S - gbase)
+    //   gbnd  : this group's key count = min(LANES, grem)
+    //   isel_found/isel_lane : the round-robin-chosen READY lane to issue (a lane
+    //     is ready when its previous term has landed: dim_issue==dim_done<IDX_DIM)
+    //   grp_all_done : every active lane has landed all IDX_DIM terms
+    //------------------------------------------------------------------------
+    reg [IDXW:0] grem;
+    reg [IDXW:0] gbnd;
+    reg          isel_found;
+    reg [IDXW:0] isel_lane;
+    reg [IDXW:0] isel_scan;
+    reg [IDXW:0] isel_cand;
+    reg          grp_all_done;
+    integer      cg;
+
+    always @(*) begin
+        grem      = s_reg - gbase;
+        gbnd      = (grem >= LANES[IDXW:0]) ? LANES[IDXW:0] : grem;
+        // round-robin scan for the next ready lane to issue.
+        isel_found = 1'b0;
+        isel_lane  = {(IDXW+1){1'b0}};
+        isel_scan  = {(IDXW+1){1'b0}};
+        isel_cand  = {(IDXW+1){1'b0}};
+        for (cg = 0; cg < LANES; cg = cg + 1) begin
+            isel_scan = rr + cg[IDXW:0];
+            if (isel_scan >= LANES[IDXW:0]) isel_scan = isel_scan - LANES[IDXW:0];
+            isel_cand = isel_scan;
+            if (!isel_found && (isel_cand < gsize) &&
+                (dim_issue_l[isel_cand[LW-1:0]] < IDX_DIM[DIW:0]) &&
+                (dim_issue_l[isel_cand[LW-1:0]] == dim_done_l[isel_cand[LW-1:0]])) begin
+                isel_found = 1'b1;
+                isel_lane  = isel_cand;
+            end
+        end
+        // group completion: all active lanes have landed all terms.
+        grp_all_done = 1'b1;
+        for (cg = 0; cg < LANES; cg = cg + 1)
+            if ((cg[IDXW:0] < gsize) && (dim_done_l[cg[LW-1:0]] != IDX_DIM[DIW:0]))
+                grp_all_done = 1'b0;
+    end
 
     //------------------------------------------------------------------------
     // (2) TOP-K selector : pick TOPK highest scores -> their indices.
@@ -205,12 +292,12 @@ module dsa_indexer #(
     // FSM
     //------------------------------------------------------------------------
     localparam [2:0] S_IDLE   = 3'd0,   // wait start; latch q,S
-                     S_SCORE  = 3'd1,   // dot-product every key (sequential MAC)
-                     S_TKL    = 3'd2,   // feed topk score-pull, wait done
-                     S_DENSE  = 3'd3,   // emit 0..S-1 (no-op fallback)
-                     S_DONE   = 3'd4;
+                     S_FETCH  = 3'd1,   // stream this group's key vectors into lanes
+                     S_SCORE  = 3'd2,   // interleaved dot-product (pipelined MACs)
+                     S_TKL    = 3'd3,   // feed topk score-pull, wait done
+                     S_DENSE  = 3'd4,   // emit 0..S-1 (no-op fallback)
+                     S_DONE   = 3'd5;
     reg [2:0]   state;
-    reg [IDXW:0] kcnt;                  // which key we are currently scoring
 
     integer t;
 
@@ -226,10 +313,13 @@ module dsa_indexer #(
             mac_a          <= 32'b0;
             mac_b          <= 32'b0;
             mac_c          <= 32'b0;
-            acc            <= 32'b0;
-            dim_issue      <= {(DIW+1){1'b0}};
-            dim_done       <= {(DIW+1){1'b0}};
-            kcnt           <= {(IDXW+1){1'b0}};
+            gbase          <= {(IDXW+1){1'b0}};
+            gsize          <= {(IDXW+1){1'b0}};
+            fetch_issue    <= {(IDXW+1){1'b0}};
+            fetch_got      <= {(IDXW+1){1'b0}};
+            rr             <= {(IDXW+1){1'b0}};
+            tq_head        <= {TQW{1'b0}};
+            tq_tail        <= {TQW{1'b0}};
             tk_start       <= 1'b0;
             tk_score_valid <= 1'b0;
             tk_score_in    <= 32'b0;
@@ -237,7 +327,13 @@ module dsa_indexer #(
             sel_idx        <= {TOPK*IDXW{1'b0}};
             sel_count      <= {(IDXW+1){1'b0}};
             for (qi = 0; qi < IDX_DIM; qi = qi + 1) qbuf[qi] <= 16'b0;
-            for (ki = 0; ki < IDX_DIM; ki = ki + 1) kbuf[ki] <= 16'b0;
+            for (lg = 0; lg < LANES; lg = lg + 1) begin
+                acc_l[lg]       <= 32'b0;
+                dim_issue_l[lg] <= {(DIW+1){1'b0}};
+                dim_done_l[lg]  <= {(DIW+1){1'b0}};
+                for (ki = 0; ki < IDX_DIM; ki = ki + 1) kbuf_l[lg][ki] <= 16'b0;
+            end
+            for (tqi = 0; tqi < TQD;   tqi = tqi + 1) tagq[tqi] <= {LW{1'b0}};
             for (t  = 0; t  < S_MAX;   t  = t  + 1) score_mem[t] <= NEG_INF;
         end else begin
             // ---- pulse defaults (deassert) ----
@@ -264,71 +360,114 @@ module dsa_indexer #(
                         // win).  Only the SPARSE path reads score_mem (via topk),
                         // so the DENSE path never needs this prefill.
                         for (t = 0; t < S_MAX; t = t + 1) score_mem[t] <= NEG_INF;
-                        // begin scoring key 0
-                        kcnt      <= {(IDXW+1){1'b0}};
-                        acc       <= 32'b0;
-                        dim_issue <= {(DIW+1){1'b0}};
-                        dim_done  <= {(DIW+1){1'b0}};
-                        key_req   <= 1'b1;            // pull key 0's vector
-                        key_idx   <= {IDXW{1'b0}};
-                        state     <= S_SCORE;
+                        // begin the first key-group at base 0 -> fetch its vectors.
+                        gbase       <= {(IDXW+1){1'b0}};
+                        fetch_issue <= {(IDXW+1){1'b0}};
+                        fetch_got   <= {(IDXW+1){1'b0}};
+                        tq_head     <= {TQW{1'b0}};
+                        tq_tail     <= {TQW{1'b0}};
+                        key_req     <= 1'b0;
+                        state       <= S_FETCH;
                     end
                 end
             end
 
             // ----------------------------------------------------------------
-            // SCORE : for each key j=0..S-1 compute score_j = dot(q, k_j).
-            //   - When key_valid lands, latch the key's IDX_DIM bf16 lanes and
-            //     start issuing MAC terms.
-            //   - Issue one term per cycle (acc = q[d]*k[d] + acc) IN ORDER:
-            //     issue term `dim_issue` only after term `dim_issue-1` result has
-            //     landed, so `c` (the running acc) is always the up-to-date sum.
-            //   - When all IDX_DIM results have landed, store acc into
-            //     score_mem[j], advance to key j+1 (or launch topk after the last).
+            // FETCH : stream the current group's key vectors into the lane
+            //   buffers.  gsize = min(LANES, S - gbase) keys (indices gbase..),
+            //   pulled at up to 1/cycle (key_req held high, key_idx incremented).
+            //   The producer answers each request one beat later, in order, so
+            //   the n-th arriving vector belongs to lane n.  When all gsize are
+            //   captured, prime the per-lane accumulators and start scoring.
+            // ----------------------------------------------------------------
+            S_FETCH: begin
+                // this group's key count = min(LANES, S - gbase) (comb: gbnd).
+                gsize <= gbnd;
+
+                // (a) capture an arriving key vector into the next lane slot.
+                if (key_valid) begin
+                    for (ki = 0; ki < IDX_DIM; ki = ki + 1)
+                        kbuf_l[fetch_got[LW-1:0]][ki] <= k_idx[16*ki +: 16];
+                    acc_l[fetch_got[LW-1:0]]       <= 32'b0;   // c for term 0
+                    dim_issue_l[fetch_got[LW-1:0]] <= {(DIW+1){1'b0}};
+                    dim_done_l[fetch_got[LW-1:0]]  <= {(DIW+1){1'b0}};
+                    fetch_got                      <= fetch_got + 1'b1;
+                end
+
+                // (b) issue the next key request (1/cycle) until gbnd issued.
+                if (fetch_issue < gbnd) begin
+                    key_req     <= 1'b1;
+                    key_idx     <= gbase[IDXW-1:0] + fetch_issue[IDXW-1:0];
+                    fetch_issue <= fetch_issue + 1'b1;
+                end else begin
+                    key_req     <= 1'b0;
+                end
+
+                // (c) all key vectors captured -> begin interleaved scoring.
+                if (fetch_got == gbnd) begin
+                    key_req <= 1'b0;
+                    rr      <= {(IDXW+1){1'b0}};
+                    state   <= S_SCORE;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // SCORE : interleaved dot products for the up-to-LANES keys of this
+            //   group.  Each cycle: ISSUE one MAC term for a ready lane (round
+            //   robin), ABSORB any landed result into its lane's acc, and when
+            //   every lane has landed all IDX_DIM terms, store the group's scores
+            //   and advance to the next group (or launch top-K after the last).
+            //   A lane g is READY to issue its term `dim_issue_l[g]` only once
+            //   that term's predecessor has landed (dim_issue_l[g]==dim_done_l[g]),
+            //   so each key's FMA chain stays strictly in order -> BIT-EXACT.
             // ----------------------------------------------------------------
             S_SCORE: begin
-                // (a) capture the requested key vector when the producer answers.
-                if (key_req && key_valid) begin
-                    for (ki = 0; ki < IDX_DIM; ki = ki + 1)
-                        kbuf[ki] <= k_idx[16*ki +: 16];
-                    key_req   <= 1'b0;               // got it; stop requesting
-                    acc       <= 32'b0;              // accumulator for this key
-                    dim_issue <= {(DIW+1){1'b0}};
-                    dim_done  <= {(DIW+1){1'b0}};
-                end
+                // (a) the ready lane to issue is chosen combinationally (isel_*).
 
-                // (b) issue the next MAC term once we hold the key vector and the
-                //     previous term's result has landed (in-order accumulate).
-                if (!key_req && (dim_issue < IDX_DIM[DIW:0]) &&
-                    (dim_issue == dim_done)) begin
+                // (b) issue the chosen lane's next term (a*b + its running acc).
+                if (isel_found) begin
                     mac_valid_in <= 1'b1;
-                    mac_a        <= bf16_to_fp32(qbuf[dim_issue[DIW-1:0]]);
-                    mac_b        <= bf16_to_fp32(kbuf[dim_issue[DIW-1:0]]);
-                    mac_c        <= acc;             // running sum so far
-                    dim_issue    <= dim_issue + 1'b1;
+                    mac_a        <= bf16_to_fp32(qbuf[dim_issue_l[isel_lane[LW-1:0]][DIW-1:0]]);
+                    mac_b        <= bf16_to_fp32(kbuf_l[isel_lane[LW-1:0]][dim_issue_l[isel_lane[LW-1:0]][DIW-1:0]]);
+                    mac_c        <= acc_l[isel_lane[LW-1:0]];
+                    dim_issue_l[isel_lane[LW-1:0]] <= dim_issue_l[isel_lane[LW-1:0]] + 1'b1;
+                    // advance round-robin pointer (wrap at LANES).
+                    rr           <= (isel_lane == LANES[IDXW:0]-1'b1)
+                                    ? {(IDXW+1){1'b0}} : (isel_lane + 1'b1);
+                    // push the issued lane id into the result-routing FIFO.
+                    tagq[tq_tail] <= isel_lane[LW-1:0];
+                    tq_tail       <= tq_tail + 1'b1;
                 end
 
-                // (c) absorb a landed MAC result into the accumulator.
+                // (c) absorb a landed result into the lane named by the FIFO head.
                 if (mac_valid_out) begin
-                    acc      <= mac_result;
-                    dim_done <= dim_done + 1'b1;
+                    acc_l[tagq[tq_head]]      <= mac_result;
+                    dim_done_l[tagq[tq_head]] <= dim_done_l[tagq[tq_head]] + 1'b1;
+                    tq_head                   <= tq_head + 1'b1;
                 end
 
-                // (d) key complete: all IDX_DIM terms landed.  Store the score
-                //     and move on.  (acc holds the final dot product this cycle
-                //     when the last result just landed -> use mac_result.)
-                if (!key_req && (dim_done == IDX_DIM[DIW:0] - 1'b1) &&
-                    mac_valid_out) begin
-                    score_mem[kcnt[IDXW-1:0]] <= mac_result;
-                    if (kcnt == s_reg - 1'b1) begin
+                // (d) group complete (comb grp_all_done): every active lane has
+                //     landed all terms.  Store scores, advance group / launch top-K.
+                if (grp_all_done) begin
+                    // store this group's scores (acc_l holds the final dots).
+                    for (lg = 0; lg < LANES; lg = lg + 1)
+                        if (lg[IDXW:0] < gsize)
+                            score_mem[gbase[IDXW-1:0] + lg[IDXW-1:0]] <= acc_l[lg];
+
+                    if ((gbase + gsize) >= s_reg) begin
                         // scored the last causal key -> launch top-K.
                         tk_start <= 1'b1;
                         tk_addr  <= {(SAW+1){1'b0}};
                         state    <= S_TKL;
                     end else begin
-                        kcnt    <= kcnt + 1'b1;      // next key
-                        key_req <= 1'b1;
-                        key_idx <= kcnt[IDXW-1:0] + 1'b1;
+                        // advance to the next group.
+                        gbase       <= gbase + gsize;
+                        fetch_issue <= {(IDXW+1){1'b0}};
+                        fetch_got   <= {(IDXW+1){1'b0}};
+                        tq_head     <= {TQW{1'b0}};
+                        tq_tail     <= {TQW{1'b0}};
+                        key_req     <= 1'b0;
+                        state       <= S_FETCH;
                     end
                 end
             end
