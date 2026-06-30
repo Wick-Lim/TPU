@@ -326,6 +326,11 @@ cache-study:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/weight_decomp test/weight_decomp_tb.v src/weight_decomp.v
 	@printf '[%s] ' "weight_decomp"; $(VVP) $(BUILD_DIR)/weight_decomp | grep -E 'ALL [0-9]+ TESTS PASSED|RATIO' \
 	    || { echo "FAILED: weight_decomp"; exit 1; }
+	@# weight_decomp2: context-modeled (order-1) lossless FP8 decompressor -- 1.42x on locality-bearing weights (1.13x over order-0).
+	@python3 tools/fp8_ctxpack.py gen scratchpad/wd2_vec.txt >/dev/null
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/weight_decomp2 test/weight_decomp2_tb.v src/weight_decomp2.v
+	@printf '[%s] ' "weight_decomp2(ctx)"; $(VVP) $(BUILD_DIR)/weight_decomp2 | grep -E 'ALL [0-9]+ TESTS PASSED|RATIO' \
+	    || { echo "FAILED: weight_decomp2"; exit 1; }
 	@# expert_prefetch_top: predictor-driven deep prefetch -- MEASURED no-op at real cache size (see docs/IMPROVEMENT_PLAN.md 2.3).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/expert_prefetch_top test/expert_prefetch_top_tb.v src/expert_prefetch_top.v src/expert_predictor.v src/expert_cache_pf.v src/expert_cache_ctrl.v
 	@printf '[%s] ' "expert_prefetch_top"; $(VVP) $(BUILD_DIR)/expert_prefetch_top | grep -E 'ALL [0-9]+ TESTS PASSED' \
