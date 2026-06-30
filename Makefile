@@ -184,6 +184,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_model_fp8_sim test/glm_model_fp8_tb.v src/glm_model_fp8.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_model_fp8"; $(VVP) $(BUILD_DIR)/glm_model_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: glm_model_fp8"; exit 1; }
+	@# glm_model_fp8 PE_M batch: the WHOLE forward pass processes B token-rows per ONE weight fetch (== B single runs, per-row argmax).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_model_fp8_pem_sim test/glm_model_fp8_pem_tb.v src/glm_model_fp8.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
+	@printf '[%s] ' "glm_model_fp8(PE_M batch)"; $(VVP) $(BUILD_DIR)/glm_model_fp8_pem_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: glm_model_fp8_pem"; exit 1; }
 	@# mtp_head_fp8: FP8 multi-token-prediction head (W_proj+decoder_block_fp8 FP8, bf16 LM head + norms).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mtp_head_fp8_sim test/mtp_head_fp8_tb.v src/mtp_head_fp8.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "mtp_head_fp8"; $(VVP) $(BUILD_DIR)/mtp_head_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
