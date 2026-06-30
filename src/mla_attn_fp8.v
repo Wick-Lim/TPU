@@ -56,9 +56,25 @@
 //     own row's data -- so the FSM cycle structure is UNCHANGED and PE_M=1 folds
 //     to exactly the committed single-row datapath.
 //
+//   PER-ROW QUERY POSITION (pos_vec):  each row r carries its OWN query position
+//     pos_r (pos_vec[POSW*r +: POSW]; row 0 = the scalar `pos`).  pos_r drives ONLY
+//     the per-row QUERY RoPE rotation (qrot[r]) -- and the per-row current-token
+//     k_rope coverage pass -- which then flows through the ALREADY-per-row score /
+//     softmax / weighted-V context / W_o.  So row r's output is EXACTLY the single-
+//     token mla_attn_fp8 result for (x_r, pos_r, s_len).  rope_interleave_unit
+//     captures pos at start and pos affects ONLY its angle datapath (never its FSM
+//     timing), so the PE_M replicas stay in perfect lockstep off ONE shared control
+//     handshake even with different pos_r.  At PE_M=1 (or all pos_r equal) every
+//     RoPE replica sees the same angle -> byte-identical to the committed module.
+//
 //   SHARED-CONTEXT ASSUMPTION (documented; holds for batched decode at one step):
-//     pos, s_len and the KV cache (kc_*) are SHARED across the B rows (same decode
-//     step / same context window); rows differ only in their token activation x.
+//     s_len and the KV cache (kc_*) -- i.e. the CAUSAL PREFIX EXTENT and the cached
+//     key latents -- are SHARED across the B rows (same context window); the KEY
+//     projections (W_uk/W_uv, the c_kv RMSNorm, V) depend only on the key, not the
+//     query, so they too are shared/computed-once-per-key.  Rows differ in their
+//     token activation x AND now their query position pos_r.  (Keeping the causal
+//     extent = the shared s_len is also REQUIRED for byte-identicality: the
+//     committed datapath attends all s_len keys regardless of pos, e.g. pos<s_len.)
 //     The DSA top-K selection is driven from row 0's q and SHARED across rows --
 //     EXACT in the dense fallback (S <= TOPK, where dsa_indexer ignores q and
 //     keeps keys 0..S-1), which is the regime the TB and this decode slice use.
@@ -121,8 +137,13 @@ module mla_attn_fp8 #(
     input  wire                        start,
     output reg                         busy,
     output reg                         done,
-    input  wire [POSW-1:0]             pos,        // token position (for RoPE) -- SHARED across rows
-    input  wire [IDXW:0]               s_len,      // S causal keys (<= S_MAX) -- SHARED across rows
+    input  wire [POSW-1:0]             pos,        // token position (for RoPE) -- ROW 0 / PE_M=1 (shared default)
+    // PER-ROW query positions: row r decodes RoPE at pos_vec[POSW*r +: POSW].
+    //   Row 0 uses the scalar `pos` (so a PE_M=1 caller that drives only `pos`
+    //   is byte-identical and need not connect this).  Rows 1..PE_M-1 use their
+    //   own slice.  Default usage = broadcast the single pos -> shared-pos behaviour.
+    input  wire [POSW*PE_M-1:0]        pos_vec,    // per-row query positions (rows 1..; row 0 = `pos`)
+    input  wire [IDXW:0]               s_len,      // S causal keys (<= S_MAX) -- SHARED across rows (KV prefix)
 
     // ---- x input (latched at start) -- PE_M rows, row-major packed ----
     //   row r element k = x_vec[16*(MODEL_DIM*r + k) +: 16]
@@ -185,8 +206,8 @@ module mla_attn_fp8 #(
     //   buffers do not.
     //========================================================================
     reg [15:0] xbuf      [0:PE_M-1][0:MODEL_DIM-1];   // latched x (per row)
-    reg [POSW-1:0] pos_q;                              // shared position
-    reg [IDXW:0]   s_reg;                              // shared S causal keys
+    reg [POSW*PE_M-1:0] pos_qr;                        // PER-ROW query positions (latched): row0=pos, rows=pos_vec
+    reg [IDXW:0]   s_reg;                              // shared S causal keys (KV prefix extent)
 
     reg [15:0] qlora     [0:PE_M-1][0:Q_LORA-1];       // x*W_dq        (per row)
     reg [15:0] qlora_n   [0:PE_M-1][0:Q_LORA-1];       // RMSNorm(qlora)(per row)
@@ -303,7 +324,7 @@ module mla_attn_fp8 #(
     //   q_rope per-head pass and the (per-row) current-token k_rope pass.
     //========================================================================
     reg               rp_start;
-    reg  [POSW-1:0]   rp_pos;
+    reg  [POSW*PE_M-1:0] rp_pos;                       // PER-ROW RoPE position (one slice / replica)
     wire [PE_M-1:0]   rp_in_req, rp_y_valid, rp_busy, rp_done;
     reg  [ROPE_LANES*32*PE_M-1:0] rp_x_in;
     wire [ROPE_LANES*32*PE_M-1:0] rp_y_out;
@@ -313,7 +334,7 @@ module mla_attn_fp8 #(
     for (gp = 0; gp < PE_M; gp = gp + 1) begin : RP
         rope_interleave_unit #(.ROT_DIM(ROPE), .THETA(THETA),
                                .LANES(ROPE_LANES), .POSW(POSW)) u_rope (
-            .clk(clk), .rst(rst), .start(rp_start), .pos(rp_pos),
+            .clk(clk), .rst(rst), .start(rp_start), .pos(rp_pos[POSW*gp +: POSW]),
             .in_req(rp_in_req[gp]), .x_in(rp_x_in[ROPE_LANES*32*gp +: ROPE_LANES*32]),
             .x_valid(rp_x_valid),
             .y_valid(rp_y_valid[gp]), .y_out(rp_y_out[ROPE_LANES*32*gp +: ROPE_LANES*32]),
@@ -568,14 +589,14 @@ module mla_attn_fp8 #(
             done       <= 1'b0;
             out        <= {MODEL_DIM*16*PE_M{1'b0}};
             kc_req     <= 1'b0; kc_idx <= {IDXW{1'b0}};
-            pos_q      <= {POSW{1'b0}};
+            pos_qr     <= {POSW*PE_M{1'b0}};
             s_reg      <= {(IDXW+1){1'b0}};
             rnq_start  <= 1'b0; rnk_start <= 1'b0;
             rnq_x_valid<= 1'b0; rnq_g_valid <= 1'b0;
             rnk_x_valid<= 1'b0; rnk_g_valid <= 1'b0;
             rnq_x_in   <= {16*PE_M{1'b0}}; rnq_gamma_in <= {16*PE_M{1'b0}};
             rnk_x_in   <= 16'h0; rnk_gamma_in <= 16'h0;
-            rp_start   <= 1'b0; rp_pos <= {POSW{1'b0}};
+            rp_start   <= 1'b0; rp_pos <= {POSW*PE_M{1'b0}};
             rp_x_valid <= 1'b0; rp_x_in <= {ROPE_LANES*32*PE_M{1'b0}};
             dsa_start  <= 1'b0; dsa_qidx <= {NOPE*16{1'b0}};
             dsa_slen   <= {(IDXW+1){1'b0}};
@@ -682,7 +703,12 @@ module mla_attn_fp8 #(
                 busy <= 1'b0;
                 if (start) begin
                     busy  <= 1'b1;
-                    pos_q <= pos;
+                    // latch PER-ROW query positions: row 0 = scalar `pos` (so a
+                    // PE_M=1 caller driving only `pos` is byte-identical and need
+                    // not connect pos_vec); rows 1.. take their own pos_vec slice.
+                    for (rr=0; rr<PE_M; rr=rr+1)
+                        pos_qr[POSW*rr +: POSW] <= (rr==0) ? pos
+                                                           : pos_vec[POSW*rr +: POSW];
                     s_reg <= s_len;
                     for (rr=0; rr<PE_M; rr=rr+1)
                         for (s_i=0; s_i<MODEL_DIM; s_i=s_i+1)
@@ -742,7 +768,8 @@ module mla_attn_fp8 #(
                         for (h_i=0; h_i<H_HEADS; h_i=h_i+1)
                             for (d_i=0; d_i<NOPE; d_i=d_i+1)
                                 qrot[rr][h_i*QK_DIM + d_i] <= qfull[rr][h_i*QK_DIM + d_i];
-                    rp_pos   <= pos_q;
+                    for (rr=0; rr<PE_M; rr=rr+1)            // per-row q RoPE position
+                        rp_pos[POSW*rr +: POSW] <= pos_qr[POSW*rr +: POSW];
                     rp_start <= 1'b1;
                     gv_head  <= {$clog2(H_HEADS+1){1'b0}};
                     state    <= S_QROPE;
@@ -777,7 +804,8 @@ module mla_attn_fp8 #(
                         state    <= S_KVDKV;
                     end else begin
                         gv_head  <= gv_head + 1'b1;
-                        rp_pos   <= pos_q;
+                        for (rr=0; rr<PE_M; rr=rr+1)        // per-row q RoPE position
+                            rp_pos[POSW*rr +: POSW] <= pos_qr[POSW*rr +: POSW];
                         rp_start <= 1'b1;       // rope next head
                     end
                 end
@@ -801,7 +829,8 @@ module mla_attn_fp8 #(
             S_KVKR: begin
                 if (gv_go) gv_go <= 1'b0;
                 else if (gv_done) begin
-                    rp_pos   <= pos_q;
+                    for (rr=0; rr<PE_M; rr=rr+1)            // per-row current-token k RoPE position
+                        rp_pos[POSW*rr +: POSW] <= pos_qr[POSW*rr +: POSW];
                     rp_start <= 1'b1;          // rope the per-row k_rope
                     state    <= S_KRROPE;
                 end
