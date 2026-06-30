@@ -16,6 +16,9 @@ with the GLM-5.2 accelerator, which is the active work.
 The normative documents:
 - **[`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md)** — the GLM-5.2 accelerator architecture: exact config, MLA + DSA + MoE detail, the fp64-golden methodology, the memory/streaming system, and the RTL build order.
 - **[`docs/SYSTEM_SINGLE_PACKAGE.md`](docs/SYSTEM_SINGLE_PACKAGE.md)** — a single-module system design to run the real 753B GLM-5.2-FP8 (FP8 compute die + 64 GB DDR5 + 1 TB Flash, e.g. a USB-C external accelerator): memory tiering, MoE expert caching/streaming, the bottleneck/perf/cost model, and how the committed RTL is the compute die.
+- **[`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md)** — the perf/power improvement roadmap targeting the Flash bottleneck, with each lever's measured result (what helped, what was a measured no-op).
+- **[`docs/PPA_FP8.md`](docs/PPA_FP8.md)** — area/timing (cells + ltp) characterization of the optimized FP8 datapath + controllers, the fmax-limiting paths, and the −87.6% accumulator confirmation at scale.
+- **[`docs/FORMAL.md`](docs/FORMAL.md)** — bounded model checking (yosys-smtbmc + z3) of the memory-system controllers: properties proven, bounds, and the honest coverage.
 - **[`SPEC.md`](SPEC.md)** / **[`docs/ISA.md`](docs/ISA.md)** — the underlying scalar TPU core microarchitecture + ISA.
 
 ---
@@ -88,14 +91,35 @@ The RTL that runs the real model from Flash through a fast tier into the FP8 die
 | `expert_predictor.v` | confidence-thresholded expert prefetch predictor | 20 tests (GLM trace) |
 | `kv_cache_pager.v` | MLA latent-KV ring + DSA-gather + Flash overflow | 73 tests; **BMC-proven** (in-bounds, gather correct) |
 | `ddr5_xbar.v` | N-channel banked DDR5 read fabric (~N× aggregate BW) | 3073 tests (7.93× @8ch); **BMC-proven** (no-spurious/no-overflow/tag) |
+| `flash_xbar.v` | N-channel banked **Flash** read fabric (deep outstanding queue hides NAND latency) | 2049 tests (7.99× latency-hide + N× bank); **BMC-proven** |
 | `weight_loader.v` | checkpoint FP8 + block-scale → matmul pull DMA | 240 tests (loader-fed == direct-fed, bit-exact) |
 | `boot_loader.v` | power-up Flash→DDR5 model-load sequencer | 9240 tests; **BMC-proven** (done-gate) |
-| `spec_decode_seq/_top.v` | MTP speculative-decode loop | 621 / 19 tests (spec == greedy); **BMC-proven** (monotonic) |
+| `spec_decode_seq/_top.v` | MTP speculative-decode loop (**K>1 multi-token draft**) | 621 / 1379 / 19 tests (spec == greedy, K=1/2/3); **BMC-proven** (monotonic) |
 | **`glm_fp8_soc.v`** | top: compute + cache + pager + Flash arbiter | 3 tests (token == standalone) |
 | **`glm_fp8_system.v`** | production top: compute + **ddr5_xbar + weight_loader** in the datapath | 3 tests (token == standalone) |
 | **`glm_fp8_system_cdc.v`** | 2-clock wrapper (host/USB ↔ compute via `cdc_async_fifo`) | 31 tests (token == standalone across async clocks) |
 
-Verified by `make unittests` (55 units) + `make formal` (5 controllers, z3 BMC) + `make cache-study`.
+Verified by `make unittests` (every per-unit TB) + `make formal` (6 controllers, z3 BMC) + `make cache-study`; `make all` runs them all green.
+
+### Performance / power levers — measured (see [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md))
+
+The workload is **Flash-bandwidth-bound** (`tokens/s ≈ Flash_BW / [(1−h)·footprint] · K`), so the
+levers target Flash, not compute. Built + measured:
+
+| Lever | What | Measured |
+|---|---|---|
+| `flash_xbar.v` | parallel Flash channels + deep outstanding queue | **7.99× latency-hide + N× banking** |
+| `tools/flash_layout.py` | offline expert→channel placement (kill hotspots) | **39 % → 55 % of 8× peak BW (~+40 %)** |
+| `weight_decomp.v` | on-chip lossless FP8 decompress (fewer Flash bytes) | **1.34×** bit-exact |
+| `spec_decode_seq.v` K>1 | multi-token speculative draft | **K=2 ≈ +23 %** (spec == greedy) |
+| `clk_en_ctrl.v` | gate the ~75 %-idle die | **74 % of idle dynamic power gated** |
+| `expert_prefetch_top.v` | predictor-driven prefetch | **measured NO-OP** at real cache size (honest — popular experts already resident) |
+
+Stacking the built levers projects **~3 → ~30+ tokens/s single-user** and **~9 → ~3 J/token**
+[EST] — the gains come from Flash bandwidth + fewer bytes, *not* cache cleverness. The compute
+die's own optimizations (the −87.6 %-cell BFP accumulator, the fmax fixes, the BMC) improve
+area/power/timing/correctness but don't move tok/s, because the die is only ~20–25 % utilized
+(Flash-starved). All system tok/s / J numbers are **[EST]** (market/physics, not P&R).
 
 **Out of scope** (vendor IP / physical): the DDR5/Flash/USB-C PHYs (TB-stubbed), the tokenizer
 (software), and full-scale synthesis + place-and-route + tapeout.
@@ -170,9 +194,12 @@ an independent fp64 / faithful-fp8 X-aware golden; on success a TB prints
 ## Build / test
 
 ```sh
-make unittests   # build+run every per-unit TB, including the GLM-5.2 + FP8 units
+make unittests   # build+run every per-unit TB, including the GLM-5.2 + FP8 + system units
+make formal      # bounded model checking (yosys-smtbmc + z3) of the 6 memory-system controllers
+make cache-study # GLM-trace cache hit-rate / batching / prefetch / decompress / layout measurements
 make lint        # verilator --lint-only -Wall on the design
 make synth       # yosys elaborate/synth gate (no error, no latch)
+make all         # test + hazard + unittests + lint + synth + formal (the full CI surface)
 ```
 
 Per-GLM-unit canonical compile (list sources explicitly — zsh does not word-split):
