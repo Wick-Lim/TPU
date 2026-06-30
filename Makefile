@@ -395,7 +395,12 @@ bitacc:
 	@printf '[%s] ' "bit_accuracy(RTL==real-contract)"; $(VVP) $(BUILD_DIR)/bit_accuracy | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: bit_accuracy"; exit 1; }
 	@python3 test/bit_accuracy_check.py | grep -E 'ARGMAX-PRESERVED' || { echo "FAILED: bit_accuracy_check"; exit 1; }
-	@echo "bitacc: glm_matmul_fp8 == real GLM-5.2-FP8 FP8 contract, argmax preserved (see docs/BIT_ACCURACY.md)"
+	@# glm_fp8_contract: vectorized (torch/numpy/pure-python) our-FP8 contract, bit-exact to glm_fp8_ref -- the GPU-scale model for the Modal P1.1 real-checkpoint gate.
+	@python3 tools/glm_fp8_contract.py | grep -qE 'ALL [0-9]+ TESTS PASSED' || { echo "FAILED: glm_fp8_contract"; exit 1; }
+	@printf '[%s] ' "glm_fp8_contract"; echo "== glm_fp8_ref (bit-exact, vectorized)"
+	@python3 test/modal_validate_test.py | grep -qE 'ALL [0-9]+ TESTS PASSED' || { echo "FAILED: modal_validate compare logic"; exit 1; }
+	@printf '[%s] ' "modal_validate(compare logic)"; echo "PASS"
+	@echo "bitacc: glm_matmul_fp8 == real GLM-5.2-FP8 FP8 contract, argmax preserved; Modal P1.1 app ready (docs/MODAL_VALIDATE.md)"
 
 wave: $(SIM_BIN)
 	$(VVP) $(SIM_BIN)
