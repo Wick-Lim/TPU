@@ -181,6 +181,15 @@ module mtp_head_fp8 #(
     output reg  [VOCAB*16-1:0]           logits,     // VOCAB bf16 t+2 logits
     output reg  [TOKW-1:0]               argmax,     // arg max logit (spec. t+2 token)
 
+    // ---- DeepSeek-MTP chain hidden state (ADDITIVE; P1.3b) ----
+    //   h_mtp packs the decoder-block output xcur (h_mtp[16*i +: 16] = xcur[i]),
+    //   i.e. the pre-final-norm layer output that seeds the NEXT MTP chain step
+    //   (a = RMSNorm(h_mtp) for predict-layer k+1).  Latched in S_DBW alongside
+    //   the xcur write and held stable through the LM-head + argmax phases, so it
+    //   is valid at `done`.  Purely additive: existing callers leave it
+    //   unconnected and are byte-identical (named-port instantiation).
+    output reg  [MODEL_DIM*16-1:0]       h_mtp,
+
     // ---- combine/final RMSNorm gamma pull (cn_which: 0=h_t,1=emb,2=final) ----
     output wire                          cn_req,
     output wire [1:0]                    cn_which,
@@ -452,6 +461,7 @@ module mtp_head_fp8 #(
             done         <= 1'b0;
             logits       <= {VOCAB*16{1'b0}};
             argmax       <= {TOKW{1'b0}};
+            h_mtp        <= {MODEL_DIM*16{1'b0}};
             mode_q       <= 1'b0;
             pos_q        <= {POSW{1'b0}};
             slen_q       <= {(IDXW+1){1'b0}};
@@ -613,8 +623,12 @@ module mtp_head_fp8 #(
             //---------------------------------------------------------------- decoder block
             S_DBW: begin
                 if (db_done) begin
-                    for (ii=0; ii<MODEL_DIM; ii=ii+1)
-                        xcur[ii] <= db_y[16*ii +: 16];
+                    for (ii=0; ii<MODEL_DIM; ii=ii+1) begin
+                        xcur[ii]           <= db_y[16*ii +: 16];
+                        // latch the packed chain hidden state alongside xcur
+                        // (h_mtp[16*i +: 16] = xcur[i]); held stable to `done`.
+                        h_mtp[16*ii +: 16] <= db_y[16*ii +: 16];
+                    end
                     // launch final rmsnorm over xcur : phase 2.  (xcur is updated
                     // this edge; the reduce pass starts next cycle so it is in place.)
                     cn_phase <= 2'd2;
