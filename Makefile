@@ -94,6 +94,9 @@ soc: $(SOC_BIN)
 # Build + run every per-unit TB.  attention_unit additionally needs softmax_unit.
 unittests:
 	@mkdir -p $(BUILD_DIR)
+	@# expert_predictor_tb reads the generated routing trace (tools/glm_trace.hex);
+	@# regenerate it so `unittests` is self-contained on a fresh clone (deterministic seed).
+	@python3 tools/route_trace.py --dump >/dev/null
 	@set -e; for u in $(UNITS); do \
 	  extra=""; \
 	  if [ "$$u" = "attention_unit" ]; then extra="src/softmax_unit.v"; fi; \
@@ -382,6 +385,7 @@ define run_bmc   # $(1)=dut name  $(2)=extra read deps  $(3)=extra yosys (e.g. c
 endef
 
 formal:
+	@mkdir -p $(FV_DIR)
 	$(call run_bmc,ddr5_xbar,,,12)
 	$(call run_bmc,flash_xbar,,,12)
 	$(call run_bmc,boot_loader,,,16)
@@ -415,6 +419,7 @@ endef
 # id \u_dut.outst[0] (otherwise [0] is parsed as a bit-select of a non-existent wire).
 FLASH_IND_CONN := connect -set \dut_outst0 \u_dut.outst[0] ; connect -set \dut_outst1 \u_dut.outst[1] ; connect -set \dut_cnt0 \u_dut.cnt[0] ; connect -set \dut_cnt1 \u_dut.cnt[1] ;
 formal-ind:
+	@mkdir -p $(FV_DIR)
 	$(call run_kind,boot_loader,boot_loader_ind_fv,8)
 	$(call run_kind,kv_cache_pager,kv_cache_pager_ind_fv,16)
 	$(call run_kind,spec_decode_seq,spec_decode_seq_ind_fv,2)
