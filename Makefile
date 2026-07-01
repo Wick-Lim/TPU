@@ -324,6 +324,23 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(SOC_BIN) test/tpu_soc_tb.v $(SOC_DESIGN)
 	@printf '[%s] ' "tpu_soc"; $(VVP) $(SOC_BIN) | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: tpu_soc"; exit 1; }
+	@# ---- P2 productization building blocks (ECC / reset-CDC / DFT-MBIST / power-ICG) ----
+	@# ecc_mem_wrap: SECDED-protected synchronous RAM (encode on write, decode+correct/detect on read) -- exhaustive single-correct + double-detect.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/ecc_mem_wrap_sim test/ecc_mem_wrap_tb.v src/ecc_mem_wrap.v src/ecc_secded.v
+	@printf '[%s] ' "ecc_mem_wrap"; $(VVP) $(BUILD_DIR)/ecc_mem_wrap_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: ecc_mem_wrap"; exit 1; }
+	@# reset_sync: async-assert / sync-deassert reset synchronizer (CDC signoff) -- immediate assert, STAGES-edge clean deassert.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/reset_sync_sim test/reset_sync_tb.v src/reset_sync.v
+	@printf '[%s] ' "reset_sync"; $(VVP) $(BUILD_DIR)/reset_sync_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: reset_sync"; exit 1; }
+	@# mbist_ctrl: March C- memory BIST for a single-port SRAM (good RAM -> pass; stuck-at-0 cell -> fail + fail_addr).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mbist_ctrl_sim test/mbist_ctrl_tb.v src/mbist_ctrl.v
+	@printf '[%s] ' "mbist_ctrl"; $(VVP) $(BUILD_DIR)/mbist_ctrl_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: mbist_ctrl"; exit 1; }
+	@# icg_cell: glitch-free integrated clock gate (low-phase enable latch + AND) -- turns clk_en into a real gated clock with no runt pulses.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/icg_cell_sim test/icg_cell_tb.v src/icg_cell.v
+	@printf '[%s] ' "icg_cell"; $(VVP) $(BUILD_DIR)/icg_cell_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: icg_cell"; exit 1; }
 	@echo "unittests: all per-unit TBs passed"
 
 # Single-package system study: regenerate the calibrated GLM-scale routing traces, then run
