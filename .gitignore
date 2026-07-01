@@ -5,6 +5,9 @@ build/
 scratchpad/
 scratchpad_build/
 
+# Ephemeral git worktrees created by the harness for parallel agents/workflows
+.claude/worktrees/
+
 # Generated simulation waveforms
 tpu_waveform.vcd
 hazard_waveform.vcd
