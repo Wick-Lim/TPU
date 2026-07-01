@@ -183,6 +183,10 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_ppos_sim test/mla_attn_fp8_ppos_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "mla_attn_fp8(per-position)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_ppos_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: mla_attn_fp8_ppos"; exit 1; }
+	@# mla_attn_fp8 per-row s_len: each PE_M row at its OWN causal extent (score mask before softmax) == its single-token run at that s_len (shared KV prefix).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_pslen_sim test/mla_attn_fp8_pslen_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "mla_attn_fp8(per-slen)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_pslen_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: mla_attn_fp8_pslen"; exit 1; }
 	@# glm_decoder_block_fp8: one full GLM-5.2-FP8 decoder layer (mla_attn_fp8 + moe_router_fp8 + swiglu_expert_fp8).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_decoder_block_fp8_sim test/glm_decoder_block_fp8_tb.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_decoder_block_fp8"; $(VVP) $(BUILD_DIR)/glm_decoder_block_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \

@@ -107,6 +107,15 @@ module mla_attn_fp8 #(
     //   caller leaves pos_vec unconnected (no silent position-0 corruption).  =1:
     //   rows 1..PE_M-1 decode at their OWN pos_vec slice (row 0 still = `pos`).
     parameter integer PER_ROW_POS = 0,
+    // PER_ROW_SLEN=0 (default): every row attends the SHARED scalar `s_len` causal
+    //   extent (s_len_vec IGNORED) -- byte-identical to the pre-per-row-slen path
+    //   and SAFE when a caller leaves s_len_vec unconnected (no silent extent
+    //   change).  =1: each row r attends only keys 0..s_len_r-1 from its OWN
+    //   s_len_vec slice (row 0 still = the scalar `s_len`).  The KV prefix / key
+    //   stream (kc_*) stays SHARED across rows -- rows share context, differ only
+    //   in extent: the shared DSA/score/cache pass covers max(s_len_r), and each
+    //   row's scores for keys j>=s_len_r are masked to bf16 -inf before its softmax.
+    parameter integer PER_ROW_SLEN = 0,
     // ---- derived (do NOT override) ----
     parameter integer QK_DIM    = NOPE + ROPE,
     parameter integer IDXW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
@@ -148,7 +157,12 @@ module mla_attn_fp8 #(
     //   the default PER_ROW_POS=0 this port is ignored and every row shares `pos`,
     //   so an unconnected pos_vec is SAFE (shared-pos, byte-identical).
     input  wire [POSW*PE_M-1:0]        pos_vec,    // per-row query positions (rows 1..; row 0 = `pos`)
-    input  wire [IDXW:0]               s_len,      // S causal keys (<= S_MAX) -- SHARED across rows (KV prefix)
+    input  wire [IDXW:0]               s_len,      // S causal keys (<= S_MAX) -- SHARED across rows (KV prefix); ROW 0 / PER_ROW_SLEN=0 (shared default)
+    // PER-ROW causal extents (ONLY consulted when PER_ROW_SLEN=1): row r attends
+    //   keys 0..s_len_vec[(IDXW+1)*r +: (IDXW+1)]-1.  Row 0 always uses the scalar
+    //   `s_len`.  With the default PER_ROW_SLEN=0 this port is ignored and every row
+    //   shares `s_len`, so an unconnected s_len_vec is SAFE (shared-extent, byte-id).
+    input  wire [(IDXW+1)*PE_M-1:0]    s_len_vec,  // per-row causal extents (rows 1..; row 0 = `s_len`)
 
     // ---- x input (latched at start) -- PE_M rows, row-major packed ----
     //   row r element k = x_vec[16*(MODEL_DIM*r + k) +: 16]
@@ -212,7 +226,8 @@ module mla_attn_fp8 #(
     //========================================================================
     reg [15:0] xbuf      [0:PE_M-1][0:MODEL_DIM-1];   // latched x (per row)
     reg [POSW*PE_M-1:0] pos_qr;                        // PER-ROW query positions (latched): row0=pos, rows=pos_vec
-    reg [IDXW:0]   s_reg;                              // shared S causal keys (KV prefix extent)
+    reg [IDXW:0]   s_reg;                              // SHARED S causal keys latched = max(s_len_r) (KV prefix / DSA / score / cache extent)
+    reg [(IDXW+1)*PE_M-1:0] slen_r;                    // PER-ROW causal extents (latched): row0=s_len, rows=s_len_vec (PER_ROW_SLEN=1) else all=s_len
 
     reg [15:0] qlora     [0:PE_M-1][0:Q_LORA-1];       // x*W_dq        (per row)
     reg [15:0] qlora_n   [0:PE_M-1][0:Q_LORA-1];       // RMSNorm(qlora)(per row)
@@ -241,6 +256,29 @@ module mla_attn_fp8 #(
     // DSA selection results (SHARED -- dense-fallback / row-0-driven; see header)
     reg [IDXW-1:0] sel_list [0:TOPK-1];
     reg [IDXW:0]   sel_cnt;
+
+    //========================================================================
+    // PER-ROW CAUSAL EXTENT resolve (combinational; latched at start).  Row 0 =
+    //   scalar `s_len`; rows 1.. take s_len_vec slice iff PER_ROW_SLEN=1, else the
+    //   shared `s_len`.  slen_next[r] = that row's extent; s_max_next = the MAX over
+    //   rows -- the shared DSA/score/cache extent so every row's keys get scored &
+    //   cached (rows share context, differ only in extent; masking trims the excess
+    //   per row before its softmax).  PER_ROW_SLEN=0 -> all rows = `s_len` and the
+    //   max = `s_len` -> byte-identical to the shared-extent path.
+    //========================================================================
+    reg [(IDXW+1)*PE_M-1:0] slen_next;   // per-row resolved extent (row0=s_len)
+    reg [IDXW:0]            s_max_next;   // shared = max over rows
+    integer                 sl_r;
+    always @* begin
+        s_max_next = s_len;
+        for (sl_r = 0; sl_r < PE_M; sl_r = sl_r + 1) begin
+            slen_next[(IDXW+1)*sl_r +: (IDXW+1)] =
+                ((sl_r == 0) || (PER_ROW_SLEN == 0)) ? s_len
+                                                     : s_len_vec[(IDXW+1)*sl_r +: (IDXW+1)];
+            if (slen_next[(IDXW+1)*sl_r +: (IDXW+1)] > s_max_next)
+                s_max_next = slen_next[(IDXW+1)*sl_r +: (IDXW+1)];
+        end
+    end
 
     //========================================================================
     // SHARED GEMV ENGINES.  PE_M activation rows, ONE shared weight stream.
@@ -596,6 +634,7 @@ module mla_attn_fp8 #(
             kc_req     <= 1'b0; kc_idx <= {IDXW{1'b0}};
             pos_qr     <= {POSW*PE_M{1'b0}};
             s_reg      <= {(IDXW+1){1'b0}};
+            slen_r     <= {((IDXW+1)*PE_M){1'b0}};
             rnq_start  <= 1'b0; rnk_start <= 1'b0;
             rnq_x_valid<= 1'b0; rnq_g_valid <= 1'b0;
             rnk_x_valid<= 1'b0; rnk_g_valid <= 1'b0;
@@ -717,7 +756,14 @@ module mla_attn_fp8 #(
                         pos_qr[POSW*rr +: POSW] <=
                             ((rr==0) || (PER_ROW_POS==0)) ? pos
                                                           : pos_vec[POSW*rr +: POSW];
-                    s_reg <= s_len;
+                    // latch PER-ROW causal extents + the SHARED max extent.  Row 0 =
+                    //   scalar `s_len` always.  PER_ROW_SLEN=0 (default): every row =
+                    //   `s_len` and s_reg = `s_len` -- byte-identical to the shared
+                    //   path; an unconnected s_len_vec is SAFE.  PER_ROW_SLEN=1: rows
+                    //   1.. take their own s_len_vec slice and s_reg = max(s_len_r) so
+                    //   the shared DSA/score/cache pass covers every row's keys.
+                    s_reg  <= s_max_next;
+                    slen_r <= slen_next;
                     for (rr=0; rr<PE_M; rr=rr+1)
                         for (s_i=0; s_i<MODEL_DIM; s_i=s_i+1)
                             xbuf[rr][s_i] <= x_vec[16*(MODEL_DIM*rr + s_i) +: 16];
@@ -1010,8 +1056,19 @@ module mla_attn_fp8 #(
                         sm_in_valid <= 1'b0;
                         if (sm_in_valid_able) begin
                             sm_in_valid <= 1'b1;
+                            // PER-ROW CAUSAL EXTENT mask: row r's logit for the key at
+                            //   selection position sf_feed_i is fed only while sf_feed_i
+                            //   is a valid selected key (< sel_cnt) AND within THAT row's
+                            //   own extent (< slen_r[r]); beyond either it is bf16 -inf
+                            //   (NEG_BIG) so softmax gives it zero mass.  In the dense
+                            //   DSA fallback (the documented PE_M>1 regime) sel_list[s]=s
+                            //   so sf_feed_i IS the key index -> row r attends exactly
+                            //   keys 0..slen_r-1.  PER_ROW_SLEN=0 -> slen_r == sel_cnt for
+                            //   every row -> the extra term never fires (byte-identical).
                             for (rr=0; rr<PE_M; rr=rr+1)
-                                sm_x_in[16*rr +: 16] <= (sf_feed_i < sel_cnt) ?
+                                sm_x_in[16*rr +: 16] <=
+                                    ((sf_feed_i < sel_cnt) &&
+                                     (sf_feed_i < slen_r[(IDXW+1)*rr +: (IDXW+1)])) ?
                                        scores[rr][sf_head[$clog2(H_HEADS)-1:0]][sf_feed_i[IDXW-1:0]]
                                      : NEG_BIG;
                             sf_feed_i   <= sf_feed_i + 1'b1;
