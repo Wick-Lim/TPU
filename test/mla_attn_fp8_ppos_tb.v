@@ -153,7 +153,7 @@ module mla_attn_fp8_ppos_tb;
     mla_attn_fp8 #(.MODEL_DIM(MODEL_DIM), .H_HEADS(H_HEADS), .NOPE(NOPE),
                .ROPE(ROPE), .V_DIM(V_DIM), .Q_LORA(Q_LORA), .KV_LORA(KV_LORA),
                .S_MAX(S_MAX), .TOPK(TOPK), .THETA(THETA), .PE_N(PE_N),
-               .POSW(POSW), .BLK(BLK), .PE_M(PE_M4)) dut4 (
+               .POSW(POSW), .BLK(BLK), .PE_M(PE_M4), .PER_ROW_POS(1)) dut4 (
         .clk(clk), .rst(rst), .start(d4_start), .busy(d4_busy), .done(d4_done),
         .pos(d4_pos), .pos_vec(d4_pos_vec), .s_len(d4_slen), .x_vec(d4_xvec),
         .w_req(d4_wreq), .w_sel(d4_wsel), .w_grp(d4_wgrp), .w_k(d4_wk),
@@ -181,7 +181,7 @@ module mla_attn_fp8_ppos_tb;
     mla_attn_fp8 #(.MODEL_DIM(MODEL_DIM), .H_HEADS(H_HEADS), .NOPE(NOPE),
                .ROPE(ROPE), .V_DIM(V_DIM), .Q_LORA(Q_LORA), .KV_LORA(KV_LORA),
                .S_MAX(S_MAX), .TOPK(TOPK), .THETA(THETA), .PE_N(PE_N),
-               .POSW(POSW), .BLK(BLK), .PE_M(PE_M2)) dut2 (
+               .POSW(POSW), .BLK(BLK), .PE_M(PE_M2), .PER_ROW_POS(1)) dut2 (
         .clk(clk), .rst(rst), .start(d2_start), .busy(d2_busy), .done(d2_done),
         .pos(d2_pos), .pos_vec(d2_pos_vec), .s_len(d2_slen), .x_vec(d2_xvec),
         .w_req(d2_wreq), .w_sel(d2_wsel), .w_grp(d2_wgrp), .w_k(d2_wk),

@@ -151,7 +151,7 @@ module mla_attn_fp8_perrow_pos_tb;
     mla_attn_fp8 #(.MODEL_DIM(MODEL_DIM), .H_HEADS(H_HEADS), .NOPE(NOPE),
                .ROPE(ROPE), .V_DIM(V_DIM), .Q_LORA(Q_LORA), .KV_LORA(KV_LORA),
                .S_MAX(S_MAX), .TOPK(TOPK), .THETA(THETA), .PE_N(PE_N),
-               .POSW(POSW), .BLK(BLK), .PE_M(PE_M)) dut2 (
+               .POSW(POSW), .BLK(BLK), .PE_M(PE_M), .PER_ROW_POS(1)) dut2 (
         .clk(clk), .rst(rst), .start(d2_start), .busy(d2_busy), .done(d2_done),
         .pos(d2_pos), .pos_vec(d2_pos_vec), .s_len(d2_slen), .x_vec(d2_xvec),
         .w_req(d2_wreq), .w_sel(d2_wsel), .w_grp(d2_wgrp), .w_k(d2_wk),

@@ -102,6 +102,11 @@ module mla_attn_fp8 #(
     parameter integer POSW      = 20,
     parameter integer BLK       = 128,  // weight block size along K -- [128,128]
     parameter integer PE_M      = 1,    // query-token ROWS (batch B) sharing one weight fetch
+    // PER_ROW_POS=0 (default): every row decodes RoPE at the SHARED scalar `pos`
+    //   (pos_vec IGNORED) -- byte-identical to the pre-per-row path and SAFE when a
+    //   caller leaves pos_vec unconnected (no silent position-0 corruption).  =1:
+    //   rows 1..PE_M-1 decode at their OWN pos_vec slice (row 0 still = `pos`).
+    parameter integer PER_ROW_POS = 0,
     // ---- derived (do NOT override) ----
     parameter integer QK_DIM    = NOPE + ROPE,
     parameter integer IDXW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
@@ -138,10 +143,10 @@ module mla_attn_fp8 #(
     output reg                         busy,
     output reg                         done,
     input  wire [POSW-1:0]             pos,        // token position (for RoPE) -- ROW 0 / PE_M=1 (shared default)
-    // PER-ROW query positions: row r decodes RoPE at pos_vec[POSW*r +: POSW].
-    //   Row 0 uses the scalar `pos` (so a PE_M=1 caller that drives only `pos`
-    //   is byte-identical and need not connect this).  Rows 1..PE_M-1 use their
-    //   own slice.  Default usage = broadcast the single pos -> shared-pos behaviour.
+    // PER-ROW query positions (ONLY consulted when PER_ROW_POS=1): row r decodes
+    //   RoPE at pos_vec[POSW*r +: POSW].  Row 0 always uses the scalar `pos`.  With
+    //   the default PER_ROW_POS=0 this port is ignored and every row shares `pos`,
+    //   so an unconnected pos_vec is SAFE (shared-pos, byte-identical).
     input  wire [POSW*PE_M-1:0]        pos_vec,    // per-row query positions (rows 1..; row 0 = `pos`)
     input  wire [IDXW:0]               s_len,      // S causal keys (<= S_MAX) -- SHARED across rows (KV prefix)
 
@@ -703,12 +708,15 @@ module mla_attn_fp8 #(
                 busy <= 1'b0;
                 if (start) begin
                     busy  <= 1'b1;
-                    // latch PER-ROW query positions: row 0 = scalar `pos` (so a
-                    // PE_M=1 caller driving only `pos` is byte-identical and need
-                    // not connect pos_vec); rows 1.. take their own pos_vec slice.
+                    // latch PER-ROW query positions.  Row 0 = scalar `pos` always.
+                    //   PER_ROW_POS=0 (default): rows 1.. ALSO use `pos` (shared) --
+                    //     byte-identical to the pre-per-row path; a caller that never
+                    //     connects pos_vec is SAFE (no silent position-0 decode).
+                    //   PER_ROW_POS=1: rows 1.. take their own pos_vec slice.
                     for (rr=0; rr<PE_M; rr=rr+1)
-                        pos_qr[POSW*rr +: POSW] <= (rr==0) ? pos
-                                                           : pos_vec[POSW*rr +: POSW];
+                        pos_qr[POSW*rr +: POSW] <=
+                            ((rr==0) || (PER_ROW_POS==0)) ? pos
+                                                          : pos_vec[POSW*rr +: POSW];
                     s_reg <= s_len;
                     for (rr=0; rr<PE_M; rr=rr+1)
                         for (s_i=0; s_i<MODEL_DIM; s_i=s_i+1)
