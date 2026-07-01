@@ -365,6 +365,27 @@ cache-study:
 	    || { echo "FAILED: batched_moe_amortize"; exit 1; }
 	@echo "cache-study: batching + prefetch + policy + decomp + predictor-prefetch + flash-layout + batched-moe sims passed (see docs/SYSTEM_SINGLE_PACKAGE.md)"
 
+# P1.3c: batched_moe FULL B-COVERAGE.  batched_moe_tb.v (in cache-study) proves the
+# expert-grouped batch identity at ONE width B=4; this sweeps it across widths
+# {1,2,3,5,8} and routing patterns {same,distinct,random,overlap}, re-proving per
+# width that batched_moe(PE_M=B) == B independent PE_M=1 expert runs, BIT-EXACT, with
+# every union expert fetched exactly once.  B is a compile-time port width, so the
+# parametrized TB is recompiled per (B,PATTERN) via +define.  Kept SEPARATE from
+# `unittests`/`all` because each iverilog elaboration of the nested MoE datapath is
+# minutes-long (esp. B=8).  See test/batched_moe_bcov_tb.v.
+BCOV_SRC := src/batched_moe.v src/swiglu_expert_fp8.v src/glm_matmul_fp8.v src/glm_act.v src/glm_fp_pipe.v
+bcov:
+	@mkdir -p $(BUILD_DIR)
+	@set -e; for bp in 1:2:11 2:1:22 3:3:33 5:0:55 8:3:44; do \
+	   B=$${bp%%:*}; rest=$${bp#*:}; P=$${rest%%:*}; S=$${rest##*:}; \
+	   $(IVERILOG) $(IFLAGS) -DBCOV_B=$$B -DBCOV_PAT=$$P -DBCOV_SEED=$$S \
+	     -o $(BUILD_DIR)/bcov_$$B test/batched_moe_bcov_tb.v $(BCOV_SRC); \
+	   printf '[batched_moe B=%s] ' "$$B"; \
+	   $(VVP) $(BUILD_DIR)/bcov_$$B | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	     || { echo "FAILED: batched_moe B=$$B"; exit 1; }; \
+	 done
+	@echo "bcov: batched_moe B-coverage passed for B in {1,2,3,5,8} (batched == per-row, bit-exact)"
+
 # Formal (bounded model checking) of the memory-system controllers via yosys write_smt2 +
 # yosys-smtbmc -s z3.  Each harness test/formal/<dut>_fv.v instantiates the committed controller
 # read-only and asserts safety properties.  The mandatory `async2sync; chformal -lower` lowers
