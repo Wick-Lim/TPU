@@ -76,7 +76,32 @@ i.e. the dense intermediate is at least as wide as the MoE intermediate. If a co
   (`if (FF_GWM > FF_GWD) $fatal`) or `max(0, …)` the two replication widths, so a future
   misconfiguration fails loudly instead of producing a bad netlist.
 
-## 4. What is explicitly OUT of scope for P1.2
+## 4. Block-scale bookkeeping at non-128-multiple dims (B5)
+
+The real config has projection/FFN dims that are **not** multiples of the [128,128]
+block (e.g. per-head NOPE=192, ROPE=64; `W_kr` out=64; and any K that is not a multiple
+of 128). The block-scaled FP8 GEMM must handle a **ragged final K-block**.
+
+This is already proven by the committed `test/glm_matmul_fp8_tb.v`:
+
+- **TEST 6 (K=200)** drives one full 128-wide K-block plus a **partial 72-wide** second
+  block with *distinct* per-block scales, and checks every output element against the
+  fp64 [128,128]-block-scaled golden. The DUT clamps the ragged block correctly
+  (`glm_matmul_fp8.v` streams `NB = ceil(KMAX/BLK)` blocks; the golden mirrors it with
+  `kend = min((b+1)*BLK, K)`).
+- The N (output-column) direction is **caller-tiled**: `glm_matmul_fp8` processes `PE_N`
+  columns per tile with a per-(col, K-block) scale, so a non-128 output width is simply a
+  different tile count at the caller (`mla_attn_fp8` / `glm_decoder_block_fp8`), not a
+  module-level concern. B4's real-dim elaboration (§2) confirms those callers thread the
+  real per-head widths (NOPE=192, ROPE=64, V_DIM=256) structurally.
+
+So the ragged-block-scale contract for full-config dims is **established** (TEST 6 +
+§2 elaboration). What remains of B5 — a full *intermediate-size* end-to-end
+`glm_model_fp8` functional sim — is deferred as low marginal value (it re-proves the
+slice-level functional fidelity at larger dims; the per-op goldens already cover the
+arithmetic, and a full-config functional run is infeasible per §5).
+
+## 5. What is explicitly OUT of scope for P1.2
 
 - **Full-config functional simulation.** The LM-head GEMV alone streams
   MODEL_DIM(6144) × VOCAB(154880) ≈ 2.38e8 K-beats **per token**, and a 256-expert MoE
