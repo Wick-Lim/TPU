@@ -2,7 +2,7 @@
 /* verilator lint_off DECLFILENAME */
 //============================================================================
 // spec_chain_top.v  --  GLM-5.2-FP8 K-STEP MTP-CHAIN SPECULATIVE-DECODE TOP
-//                       (SKELETON -- P1.3b bonus; syntax-compile-checked only)
+//                       (P1.3b -> B8 : PROMOTED pull ports, simulable)
 //----------------------------------------------------------------------------
 // PURPOSE  (the K>1 generalisation of spec_decode_top's K=1 loop)
 //   DeepSeek-MTP runs its single predict layer RECURRENTLY to mint K speculative
@@ -14,7 +14,7 @@
 //     0. MAIN  : glm_model_fp8(PE_M=1, token=cur_tok, pos=cur_pos)
 //                  -> verified m_0 = argmax , h_0 = h_state (final-norm output).
 //     1. CHAIN : for k = 0 .. K-1  (K recurrent mtp_head_fp8 runs):
-//                  h_in_0   = h_0  (main model hidden state)
+//                  h_in_0   = h_0  (main model hidden state)              [seed]
 //                  h_in_k   = h_mtp from step k-1   (*** the P1.3b chain state ***)
 //                  emb_k    = embed(prev token: m_0 for k=0 else draft d_{k-1})
 //                  d_k      = mtp_head_fp8(h_in_k, emb_k, pos=cur_pos+1+k).argmax
@@ -28,35 +28,25 @@
 //                prefix; advance cur_tok/cur_pos over the committed frontier.
 //
 //   PURE ORCHESTRATOR -- reimplements NO math.  It instantiates the committed
-//   units (glm_model_fp8, mtp_head_fp8, spec_decode_seq) and, in the finished
-//   design, routes their weight/cache/embedding PULL interfaces up to the top
-//   exactly as spec_decode_top / spec_batched_top do.
+//   units (glm_model_fp8 x2, mtp_head_fp8, spec_decode_seq) and routes their
+//   weight/cache/embedding PULL interfaces up to the top exactly as
+//   spec_decode_top / spec_batched_top do, using THREE independent pull buses:
+//     m_* : the PE_M=1 main model         (prefix m_)
+//     t_* : the recurrent MTP head        (prefix t_)
+//     v_* : the PE_M=K+1 verify model     (prefix v_)
+//   plus a whole-vector embedding pull (em_req/em_tok/em_vec) that answers the
+//   MTP head's emb_t1 = embed(prev token).
 //
-// *** SKELETON STATUS ***  This file is a STRUCTURAL SCAFFOLD staged for a later
-//   task: the four-phase FSM, the K-step h_mtp chaining registers, the PE_M=K+1
-//   batch assembly and the spec_decode_seq feed are laid out and the sub-unit
-//   instances are wired for CONTROL + DATAPATH (start/busy/done, tokens, hidden
-//   states, drafts, truths).  The large per-unit PULL port sets are bound to
-//   internal placeholder nets (not yet promoted to top-level ports); the system
-//   TB cannot answer them yet, so this module is SYNTAX-compile-checked only
-//   (iverilog -t null) and is NOT simulated.  Promoting the pull nets to top-
-//   level ports (verbatim from spec_batched_top's m_* set, plus a t_* set per
-//   chain step or a shared muxed set) completes it.
-//
-// *** SEED CONVENTION INCONSISTENCY (documented here; NOT fixed in B3 -- B8) ***
-//   The chain is seeded with TWO DIFFERENT hidden-state conventions:
+// *** SEED CONVENTION (documented; now implemented) ***
+//   The chain is seeded with TWO hidden-state conventions:
 //     * step 0   : h_chain[0] = u_main.h_state  -- the POST-final-RMSNorm hidden
 //                  state (the model's normalised output h).
 //     * step k>=1: h_chain[k] = u_mtp.h_mtp     -- the PRE-final-norm db_y decoder-
 //                  block state carried out of the prior chain step.
-//   So step 0's h_t is normalised while every later step's fed-back h_t is the raw
-//   (un-final-normed) db_y.  This is a SEED-scale mismatch: it perturbs the DRAFT
-//   distribution and hence K_eff (the effective accepted-prefix length / acceptance
-//   rate), NOT the spec==greedy safety property -- spec_decode_seq only ever commits
-//   the VERIFY model's own argmaxes (truth_vec), never a raw draft, so a mis-seeded
-//   draft can only be REJECTED, never wrongly committed.  Unifying the seed
-//   convention (feed step 0 the same pre-final-norm state, or re-norm the fed-back
-//   h_mtp) is deferred to the full promotion task B8; B3 leaves it as-is.
+//   This is a SEED-scale mismatch: it perturbs the DRAFT distribution and hence
+//   K_eff (acceptance rate), NOT the spec==greedy safety property -- spec_decode_seq
+//   only ever commits the VERIFY model's own argmaxes (truth_vec), never a raw
+//   draft, so a mis-seeded draft can only be REJECTED, never wrongly committed.
 //
 // DISCIPLINE: synchronous active-high reset; every output registered; no latch;
 //   no combinational loop; handshake-driven (each sub-unit launch waits its done).
@@ -161,7 +151,154 @@ module spec_chain_top #(
     output wire [31:0]                   total_tokens,
     output wire [31:0]                   main_passes,
     output wire [31:0]                   accepts,
-    output wire [31:0]                   rejects
+    output wire [31:0]                   rejects,
+
+    // ====================================================================
+    // whole-vector embedding pull : answers the MTP head's emb_t1 = embed(prev tok)
+    // ====================================================================
+    output wire                          em_req,
+    output wire [TOKW-1:0]               em_tok,
+    input  wire [MODEL_DIM*16-1:0]       em_vec,
+
+    // ====================================================================
+    // m_* : PE_M=1 MAIN model pull bus (routed straight up)
+    // ====================================================================
+    output wire                          m_em_req,
+    output wire [TOKW-1:0]               m_em_tok,
+    output wire [DIMW-1:0]               m_em_idx,
+    input  wire [15:0]                   m_em_val,
+    output wire [LAYW-1:0]               m_db_layer,
+    output wire                          m_idx_fresh,
+    output wire [LAYW-1:0]               m_idx_win,
+    output wire                          m_gn_req,
+    output wire                          m_gn_which,
+    output wire [DIMW-1:0]               m_gn_idx,
+    input  wire [15:0]                   m_gn_val,
+    output wire                          m_aw_req,
+    output wire [3:0]                    m_aw_sel,
+    output wire [A_GRPW-1:0]             m_aw_grp,
+    output wire [A_KCW-1:0]              m_aw_k,
+    input  wire [PE_N*8-1:0]             m_aw_col,
+    input  wire [16*PE_N*A_NB-1:0]       m_aw_scale,
+    output wire                          m_kc_req,
+    output wire [IDXW-1:0]               m_kc_idx,
+    input  wire [KV_LORA*16-1:0]         m_kc_ckv,
+    input  wire [ROPE*16-1:0]            m_kc_krope,
+    input  wire                          m_kc_valid,
+    output wire                          m_rw_req,
+    output wire [R_KW-1:0]               m_rw_k,
+    input  wire [8*N_EXPERT-1:0]         m_rw_col,
+    input  wire [16*N_EXPERT*R_NB-1:0]   m_rw_scale,
+    output wire                          m_fw_req,
+    output wire [1:0]                    m_fw_sel,
+    output wire [FF_GWD-1:0]             m_fw_grp,
+    output wire [FF_KWD-1:0]             m_fw_k,
+    output wire                          m_fw_shared,
+    output wire [EIDXW-1:0]              m_fw_eidx,
+    input  wire [8*TN-1:0]               m_fw_col,
+    input  wire [8*TN-1:0]               m_fw_col_up,
+    input  wire [16*TN*FF_NB_D-1:0]      m_fw_scale_g,
+    input  wire [16*TN*FF_NB_D-1:0]      m_fw_scale_u,
+    output wire                          m_fn_req,
+    output wire [DIMW-1:0]               m_fn_idx,
+    input  wire [15:0]                   m_fn_val,
+    output wire                          m_lw_req,
+    output wire [VTW-1:0]                m_lw_vtile,
+    output wire [DIMW-1:0]               m_lw_k,
+    input  wire [LM_TN*16-1:0]           m_lw_col,
+
+    // ====================================================================
+    // t_* : recurrent MTP head pull bus (routed straight up)
+    // ====================================================================
+    output wire                          t_cn_req,
+    output wire [1:0]                    t_cn_which,
+    output wire [DIMW-1:0]               t_cn_idx,
+    input  wire [15:0]                   t_cn_val,
+    output wire                          t_pw_req,
+    output wire [PTW-1:0]                t_pw_ptile,
+    output wire [CKIW-1:0]               t_pw_k,
+    input  wire [PROJ_TN*8-1:0]          t_pw_col,
+    input  wire [16*PROJ_TN*PROJ_NB-1:0] t_pw_scale,
+    output wire                          t_gn_req,
+    output wire                          t_gn_which,
+    output wire [DIMW-1:0]               t_gn_idx,
+    input  wire [15:0]                   t_gn_val,
+    output wire                          t_aw_req,
+    output wire [3:0]                    t_aw_sel,
+    output wire [A_GRPW-1:0]             t_aw_grp,
+    output wire [A_KCW-1:0]              t_aw_k,
+    input  wire [PE_N*8-1:0]             t_aw_col,
+    input  wire [16*PE_N*A_NB-1:0]       t_aw_scale,
+    output wire                          t_kc_req,
+    output wire [IDXW-1:0]               t_kc_idx,
+    input  wire [KV_LORA*16-1:0]         t_kc_ckv,
+    input  wire [ROPE*16-1:0]            t_kc_krope,
+    input  wire                          t_kc_valid,
+    output wire                          t_rw_req,
+    output wire [R_KW-1:0]               t_rw_k,
+    input  wire [8*N_EXPERT-1:0]         t_rw_col,
+    input  wire [16*N_EXPERT*R_NB-1:0]   t_rw_scale,
+    output wire                          t_fw_req,
+    output wire [1:0]                    t_fw_sel,
+    output wire [FF_GWD-1:0]             t_fw_grp,
+    output wire [FF_KWD-1:0]             t_fw_k,
+    output wire                          t_fw_shared,
+    output wire [EIDXW-1:0]              t_fw_eidx,
+    input  wire [8*TN-1:0]               t_fw_col,
+    input  wire [8*TN-1:0]               t_fw_col_up,
+    input  wire [16*TN*FF_NB_D-1:0]      t_fw_scale_g,
+    input  wire [16*TN*FF_NB_D-1:0]      t_fw_scale_u,
+    output wire                          t_lw_req,
+    output wire [VTW-1:0]                t_lw_vtile,
+    output wire [DIMW-1:0]               t_lw_k,
+    input  wire [LM_TN*16-1:0]           t_lw_col,
+
+    // ====================================================================
+    // v_* : PE_M=K+1 VERIFY model pull bus (routed straight up)
+    // ====================================================================
+    output wire                          v_em_req,
+    output wire [TOKW-1:0]               v_em_tok,
+    output wire [DIMW-1:0]               v_em_idx,
+    input  wire [15:0]                   v_em_val,
+    output wire [LAYW-1:0]               v_db_layer,
+    output wire                          v_idx_fresh,
+    output wire [LAYW-1:0]               v_idx_win,
+    output wire                          v_gn_req,
+    output wire                          v_gn_which,
+    output wire [DIMW-1:0]               v_gn_idx,
+    input  wire [15:0]                   v_gn_val,
+    output wire                          v_aw_req,
+    output wire [3:0]                    v_aw_sel,
+    output wire [A_GRPW-1:0]             v_aw_grp,
+    output wire [A_KCW-1:0]              v_aw_k,
+    input  wire [PE_N*8-1:0]             v_aw_col,
+    input  wire [16*PE_N*A_NB-1:0]       v_aw_scale,
+    output wire                          v_kc_req,
+    output wire [IDXW-1:0]               v_kc_idx,
+    input  wire [KV_LORA*16-1:0]         v_kc_ckv,
+    input  wire [ROPE*16-1:0]            v_kc_krope,
+    input  wire                          v_kc_valid,
+    output wire                          v_rw_req,
+    output wire [R_KW-1:0]               v_rw_k,
+    input  wire [8*N_EXPERT-1:0]         v_rw_col,
+    input  wire [16*N_EXPERT*R_NB-1:0]   v_rw_scale,
+    output wire                          v_fw_req,
+    output wire [1:0]                    v_fw_sel,
+    output wire [FF_GWD-1:0]             v_fw_grp,
+    output wire [FF_KWD-1:0]             v_fw_k,
+    output wire                          v_fw_shared,
+    output wire [EIDXW-1:0]              v_fw_eidx,
+    input  wire [8*TN-1:0]               v_fw_col,
+    input  wire [8*TN-1:0]               v_fw_col_up,
+    input  wire [16*TN*FF_NB_D-1:0]      v_fw_scale_g,
+    input  wire [16*TN*FF_NB_D-1:0]      v_fw_scale_u,
+    output wire                          v_fn_req,
+    output wire [DIMW-1:0]               v_fn_idx,
+    input  wire [15:0]                   v_fn_val,
+    output wire                          v_lw_req,
+    output wire [VTW-1:0]                v_lw_vtile,
+    output wire [DIMW-1:0]               v_lw_k,
+    input  wire [LM_TN*16-1:0]           v_lw_col
 );
     integer ci;
 
@@ -174,11 +311,11 @@ module spec_chain_top #(
     reg [IDXW:0]   slen_q;
     reg            mode_q;
     reg [15:0]     passes_left;
+    reg [TOKW-1:0] prev_tok;      // token whose embedding seeds the next chain step
 
     //========================================================================
     // per-step chain buffers.  h_chain[0] = main-model h_state; h_chain[k] for
     // k>=1 = the h_mtp packed decoder-block state minted by chain step k-1.
-    // draft_id[k] = argmax of chain step k.
     //========================================================================
     reg  [MODEL_DIM*16-1:0] h_chain [0:DRAFT_K];      // one extra: final h_mtp
     reg  [TOKW-1:0]         draft_id [0:DRAFT_K-1];
@@ -194,10 +331,13 @@ module spec_chain_top #(
             truth_q[ci*TOKW +: TOKW] = truth_id[ci];
     end
 
+    // embedding pull : answer emb_t1 = embed(prev_tok) during the chain-prep beat.
+    assign em_req = 1'b1;
+    assign em_tok = prev_tok;
+
     //========================================================================
     // u_main : the FULL FP8 model at PE_M=1 -- one main pass -> verified m_0 and
     //   the hidden state h_state (final-RMSNorm output) that seeds the chain.
-    //   *** SKELETON: pull ports bound to placeholder nets (see file header). ***
     //========================================================================
     reg                        main_start;
     wire                       main_busy, main_done;
@@ -205,19 +345,6 @@ module spec_chain_top #(
     wire [TOKW-1:0]            main_argmax;
     wire [MODEL_DIM*16-1:0]    main_hstate;
     reg  [TOKW-1:0]            main_tok;
-
-    // --- placeholder pull nets for the PE_M=1 main model (not yet top-ported) ---
-    wire                       mn_em_req;   wire [TOKW-1:0] mn_em_tok; wire [DIMW-1:0] mn_em_idx;
-    wire [LAYW-1:0]            mn_db_layer;
-    wire                       mn_idx_fresh; wire [LAYW-1:0] mn_idx_win;
-    wire                       mn_gn_req;   wire mn_gn_which; wire [DIMW-1:0] mn_gn_idx;
-    wire                       mn_aw_req;   wire [3:0] mn_aw_sel; wire [A_GRPW-1:0] mn_aw_grp; wire [A_KCW-1:0] mn_aw_k;
-    wire                       mn_kc_req;   wire [IDXW-1:0] mn_kc_idx;
-    wire                       mn_rw_req;   wire [R_KW-1:0] mn_rw_k;
-    wire                       mn_fw_req;   wire [1:0] mn_fw_sel; wire [FF_GWD-1:0] mn_fw_grp;
-    wire [FF_KWD-1:0]          mn_fw_k;     wire mn_fw_shared; wire [EIDXW-1:0] mn_fw_eidx;
-    wire                       mn_fn_req;   wire [DIMW-1:0] mn_fn_idx;
-    wire                       mn_lw_req;   wire [VTW-1:0] mn_lw_vtile; wire [DIMW-1:0] mn_lw_k;
 
     glm_model_fp8 #(
         .MODEL_DIM(MODEL_DIM), .L(L), .N_DENSE(N_DENSE), .VOCAB(VOCAB),
@@ -230,31 +357,27 @@ module spec_chain_top #(
         .clk(clk), .rst(rst), .start(main_start), .busy(main_busy), .done(main_done),
         .token_id(main_tok), .pos(pos_q), .s_len(slen_q),
         .logits(main_logits), .argmax(main_argmax),
-        .em_req(mn_em_req), .em_tok(mn_em_tok), .em_idx(mn_em_idx), .em_val(16'h0),
-        .db_layer(mn_db_layer), .idx_fresh(mn_idx_fresh), .idx_win(mn_idx_win),
-        .gn_req(mn_gn_req), .gn_which(mn_gn_which), .gn_idx(mn_gn_idx), .gn_val(16'h0),
-        .aw_req(mn_aw_req), .aw_sel(mn_aw_sel), .aw_grp(mn_aw_grp), .aw_k(mn_aw_k),
-        .aw_col({PE_N*8{1'b0}}), .aw_scale({16*PE_N*A_NB{1'b0}}),
-        .kc_req(mn_kc_req), .kc_idx(mn_kc_idx), .kc_ckv({KV_LORA*16{1'b0}}),
-        .kc_krope({ROPE*16{1'b0}}), .kc_valid(1'b0),
-        .rw_req(mn_rw_req), .rw_k(mn_rw_k), .rw_col({8*N_EXPERT{1'b0}}),
-        .rw_scale({16*N_EXPERT*R_NB{1'b0}}),
-        .fw_req(mn_fw_req), .fw_sel(mn_fw_sel), .fw_grp(mn_fw_grp), .fw_k(mn_fw_k),
-        .fw_shared(mn_fw_shared), .fw_eidx(mn_fw_eidx),
-        .fw_col({8*TN{1'b0}}), .fw_col_up({8*TN{1'b0}}),
-        .fw_scale_g({16*TN*FF_NB_D{1'b0}}), .fw_scale_u({16*TN*FF_NB_D{1'b0}}),
-        .fn_req(mn_fn_req), .fn_idx(mn_fn_idx), .fn_val(16'h0),
-        .lw_req(mn_lw_req), .lw_vtile(mn_lw_vtile), .lw_k(mn_lw_k),
-        .lw_col({LM_TN*16{1'b0}}),
+        .em_req(m_em_req), .em_tok(m_em_tok), .em_idx(m_em_idx), .em_val(m_em_val),
+        .db_layer(m_db_layer), .idx_fresh(m_idx_fresh), .idx_win(m_idx_win),
+        .gn_req(m_gn_req), .gn_which(m_gn_which), .gn_idx(m_gn_idx), .gn_val(m_gn_val),
+        .aw_req(m_aw_req), .aw_sel(m_aw_sel), .aw_grp(m_aw_grp), .aw_k(m_aw_k),
+        .aw_col(m_aw_col), .aw_scale(m_aw_scale),
+        .kc_req(m_kc_req), .kc_idx(m_kc_idx), .kc_ckv(m_kc_ckv),
+        .kc_krope(m_kc_krope), .kc_valid(m_kc_valid),
+        .rw_req(m_rw_req), .rw_k(m_rw_k), .rw_col(m_rw_col), .rw_scale(m_rw_scale),
+        .fw_req(m_fw_req), .fw_sel(m_fw_sel), .fw_grp(m_fw_grp), .fw_k(m_fw_k),
+        .fw_shared(m_fw_shared), .fw_eidx(m_fw_eidx),
+        .fw_col(m_fw_col), .fw_col_up(m_fw_col_up),
+        .fw_scale_g(m_fw_scale_g), .fw_scale_u(m_fw_scale_u),
+        .fn_req(m_fn_req), .fn_idx(m_fn_idx), .fn_val(m_fn_val),
+        .lw_req(m_lw_req), .lw_vtile(m_lw_vtile), .lw_k(m_lw_k), .lw_col(m_lw_col),
         .h_state(main_hstate)
     );
 
     //========================================================================
     // u_mtp : ONE mtp_head_fp8 serially reused across the K chain steps.  Its
-    //   h_t input is the phase-selected chain state h_chain[k]; its h_mtp output
-    //   (the P1.3b additive port) is captured into h_chain[k+1] for the next
-    //   step.  emb_t1 is embed(prev token) -- a top-level pull in the finished
-    //   design.  *** SKELETON: pull ports bound to placeholder nets. ***
+    //   h_t input is the phase-selected chain state; its h_mtp output (P1.3b) is
+    //   captured and fed back as the next step's h_t.  emb_t1 = embed(prev token).
     //========================================================================
     reg                        mtp_start;
     reg  [KW:0]                 chain_k;         // current chain step 0..K
@@ -262,19 +385,8 @@ module spec_chain_top #(
     wire [VOCAB*16-1:0]        mtp_logits;
     wire [TOKW-1:0]            mtp_argmax;
     wire [MODEL_DIM*16-1:0]    mtp_h_mtp;        // *** the chained hidden state ***
-    reg  [MODEL_DIM*16-1:0]    mtp_h_t;          // selected h_chain[chain_k]
-    reg  [MODEL_DIM*16-1:0]    mtp_emb;          // embed(prev token) placeholder
-
-    // --- placeholder pull nets for the MTP head (not yet top-ported) ---
-    wire                       tn_cn_req; wire [1:0] tn_cn_which; wire [DIMW-1:0] tn_cn_idx;
-    wire                       tn_pw_req; wire [PTW-1:0] tn_pw_ptile; wire [CKIW-1:0] tn_pw_k;
-    wire                       tn_gn_req; wire tn_gn_which; wire [DIMW-1:0] tn_gn_idx;
-    wire                       tn_aw_req; wire [3:0] tn_aw_sel; wire [A_GRPW-1:0] tn_aw_grp; wire [A_KCW-1:0] tn_aw_k;
-    wire                       tn_kc_req; wire [IDXW-1:0] tn_kc_idx;
-    wire                       tn_rw_req; wire [R_KW-1:0] tn_rw_k;
-    wire                       tn_fw_req; wire [1:0] tn_fw_sel; wire [FF_GWD-1:0] tn_fw_grp;
-    wire [FF_KWD-1:0]          tn_fw_k;   wire tn_fw_shared; wire [EIDXW-1:0] tn_fw_eidx;
-    wire                       tn_lw_req; wire [VTW-1:0] tn_lw_vtile; wire [DIMW-1:0] tn_lw_k;
+    reg  [MODEL_DIM*16-1:0]    mtp_h_t;          // selected chain state
+    reg  [MODEL_DIM*16-1:0]    mtp_emb;          // embed(prev token)
 
     mtp_head_fp8 #(
         .MODEL_DIM(MODEL_DIM), .VOCAB(VOCAB),
@@ -289,28 +401,25 @@ module spec_chain_top #(
         .h_t(mtp_h_t), .emb_t1(mtp_emb),
         .logits(mtp_logits), .argmax(mtp_argmax),
         .h_mtp(mtp_h_mtp),                       // *** P1.3b chain state out ***
-        .cn_req(tn_cn_req), .cn_which(tn_cn_which), .cn_idx(tn_cn_idx), .cn_val(16'h0),
-        .pw_req(tn_pw_req), .pw_ptile(tn_pw_ptile), .pw_k(tn_pw_k),
-        .pw_col({PROJ_TN*8{1'b0}}), .pw_scale({16*PROJ_TN*PROJ_NB{1'b0}}),
-        .gn_req(tn_gn_req), .gn_which(tn_gn_which), .gn_idx(tn_gn_idx), .gn_val(16'h0),
-        .aw_req(tn_aw_req), .aw_sel(tn_aw_sel), .aw_grp(tn_aw_grp), .aw_k(tn_aw_k),
-        .aw_col({PE_N*8{1'b0}}), .aw_scale({16*PE_N*A_NB{1'b0}}),
-        .kc_req(tn_kc_req), .kc_idx(tn_kc_idx), .kc_ckv({KV_LORA*16{1'b0}}),
-        .kc_krope({ROPE*16{1'b0}}), .kc_valid(1'b0),
-        .rw_req(tn_rw_req), .rw_k(tn_rw_k), .rw_col({8*N_EXPERT{1'b0}}),
-        .rw_scale({16*N_EXPERT*R_NB{1'b0}}),
-        .fw_req(tn_fw_req), .fw_sel(tn_fw_sel), .fw_grp(tn_fw_grp), .fw_k(tn_fw_k),
-        .fw_shared(tn_fw_shared), .fw_eidx(tn_fw_eidx),
-        .fw_col({8*TN{1'b0}}), .fw_col_up({8*TN{1'b0}}),
-        .fw_scale_g({16*TN*FF_NB_D{1'b0}}), .fw_scale_u({16*TN*FF_NB_D{1'b0}}),
-        .lw_req(tn_lw_req), .lw_vtile(tn_lw_vtile), .lw_k(tn_lw_k),
-        .lw_col({LM_TN*16{1'b0}})
+        .cn_req(t_cn_req), .cn_which(t_cn_which), .cn_idx(t_cn_idx), .cn_val(t_cn_val),
+        .pw_req(t_pw_req), .pw_ptile(t_pw_ptile), .pw_k(t_pw_k),
+        .pw_col(t_pw_col), .pw_scale(t_pw_scale),
+        .gn_req(t_gn_req), .gn_which(t_gn_which), .gn_idx(t_gn_idx), .gn_val(t_gn_val),
+        .aw_req(t_aw_req), .aw_sel(t_aw_sel), .aw_grp(t_aw_grp), .aw_k(t_aw_k),
+        .aw_col(t_aw_col), .aw_scale(t_aw_scale),
+        .kc_req(t_kc_req), .kc_idx(t_kc_idx), .kc_ckv(t_kc_ckv),
+        .kc_krope(t_kc_krope), .kc_valid(t_kc_valid),
+        .rw_req(t_rw_req), .rw_k(t_rw_k), .rw_col(t_rw_col), .rw_scale(t_rw_scale),
+        .fw_req(t_fw_req), .fw_sel(t_fw_sel), .fw_grp(t_fw_grp), .fw_k(t_fw_k),
+        .fw_shared(t_fw_shared), .fw_eidx(t_fw_eidx),
+        .fw_col(t_fw_col), .fw_col_up(t_fw_col_up),
+        .fw_scale_g(t_fw_scale_g), .fw_scale_u(t_fw_scale_u),
+        .lw_req(t_lw_req), .lw_vtile(t_lw_vtile), .lw_k(t_lw_k), .lw_col(t_lw_col)
     );
 
     //========================================================================
     // u_verify : the FULL FP8 model at PE_M=K+1 -- verify {cur_tok,d_0..d_{K-1}}
-    //   in ONE weight-load -> {m_0 .. m_K} (spec_batched_top PE_M weight-share
-    //   contract).  *** SKELETON: pull ports bound to placeholder nets. ***
+    //   in ONE weight-load -> {m_0 .. m_K} (spec_batched_top PE_M weight-share).
     //========================================================================
     reg                        ver_start;
     wire                       ver_busy, ver_done;
@@ -318,19 +427,6 @@ module spec_chain_top #(
     wire [B*TOKW-1:0]          ver_argmax;
     wire [B*MODEL_DIM*16-1:0]  ver_hstate;
     reg  [B*TOKW-1:0]          ver_tok;         // {cur_tok, d_0 .. d_{K-1}}
-
-    // --- placeholder pull nets for the PE_M=K+1 verify model (not yet top-ported) ---
-    wire                       vn_em_req;   wire [TOKW-1:0] vn_em_tok; wire [DIMW-1:0] vn_em_idx;
-    wire [LAYW-1:0]            vn_db_layer;
-    wire                       vn_idx_fresh; wire [LAYW-1:0] vn_idx_win;
-    wire                       vn_gn_req;   wire vn_gn_which; wire [DIMW-1:0] vn_gn_idx;
-    wire                       vn_aw_req;   wire [3:0] vn_aw_sel; wire [A_GRPW-1:0] vn_aw_grp; wire [A_KCW-1:0] vn_aw_k;
-    wire                       vn_kc_req;   wire [IDXW-1:0] vn_kc_idx;
-    wire                       vn_rw_req;   wire [R_KW-1:0] vn_rw_k;
-    wire                       vn_fw_req;   wire [1:0] vn_fw_sel; wire [FF_GWD-1:0] vn_fw_grp;
-    wire [FF_KWD-1:0]          vn_fw_k;     wire vn_fw_shared; wire [EIDXW-1:0] vn_fw_eidx;
-    wire                       vn_fn_req;   wire [DIMW-1:0] vn_fn_idx;
-    wire                       vn_lw_req;   wire [VTW-1:0] vn_lw_vtile; wire [DIMW-1:0] vn_lw_k;
 
     glm_model_fp8 #(
         .MODEL_DIM(MODEL_DIM), .L(L), .N_DENSE(N_DENSE), .VOCAB(VOCAB),
@@ -343,22 +439,20 @@ module spec_chain_top #(
         .clk(clk), .rst(rst), .start(ver_start), .busy(ver_busy), .done(ver_done),
         .token_id(ver_tok), .pos(pos_q), .s_len(slen_q),
         .logits(ver_logits), .argmax(ver_argmax),
-        .em_req(vn_em_req), .em_tok(vn_em_tok), .em_idx(vn_em_idx), .em_val(16'h0),
-        .db_layer(vn_db_layer), .idx_fresh(vn_idx_fresh), .idx_win(vn_idx_win),
-        .gn_req(vn_gn_req), .gn_which(vn_gn_which), .gn_idx(vn_gn_idx), .gn_val(16'h0),
-        .aw_req(vn_aw_req), .aw_sel(vn_aw_sel), .aw_grp(vn_aw_grp), .aw_k(vn_aw_k),
-        .aw_col({PE_N*8{1'b0}}), .aw_scale({16*PE_N*A_NB{1'b0}}),
-        .kc_req(vn_kc_req), .kc_idx(vn_kc_idx), .kc_ckv({KV_LORA*16{1'b0}}),
-        .kc_krope({ROPE*16{1'b0}}), .kc_valid(1'b0),
-        .rw_req(vn_rw_req), .rw_k(vn_rw_k), .rw_col({8*N_EXPERT{1'b0}}),
-        .rw_scale({16*N_EXPERT*R_NB{1'b0}}),
-        .fw_req(vn_fw_req), .fw_sel(vn_fw_sel), .fw_grp(vn_fw_grp), .fw_k(vn_fw_k),
-        .fw_shared(vn_fw_shared), .fw_eidx(vn_fw_eidx),
-        .fw_col({8*TN{1'b0}}), .fw_col_up({8*TN{1'b0}}),
-        .fw_scale_g({16*TN*FF_NB_D{1'b0}}), .fw_scale_u({16*TN*FF_NB_D{1'b0}}),
-        .fn_req(vn_fn_req), .fn_idx(vn_fn_idx), .fn_val(16'h0),
-        .lw_req(vn_lw_req), .lw_vtile(vn_lw_vtile), .lw_k(vn_lw_k),
-        .lw_col({LM_TN*16{1'b0}}),
+        .em_req(v_em_req), .em_tok(v_em_tok), .em_idx(v_em_idx), .em_val(v_em_val),
+        .db_layer(v_db_layer), .idx_fresh(v_idx_fresh), .idx_win(v_idx_win),
+        .gn_req(v_gn_req), .gn_which(v_gn_which), .gn_idx(v_gn_idx), .gn_val(v_gn_val),
+        .aw_req(v_aw_req), .aw_sel(v_aw_sel), .aw_grp(v_aw_grp), .aw_k(v_aw_k),
+        .aw_col(v_aw_col), .aw_scale(v_aw_scale),
+        .kc_req(v_kc_req), .kc_idx(v_kc_idx), .kc_ckv(v_kc_ckv),
+        .kc_krope(v_kc_krope), .kc_valid(v_kc_valid),
+        .rw_req(v_rw_req), .rw_k(v_rw_k), .rw_col(v_rw_col), .rw_scale(v_rw_scale),
+        .fw_req(v_fw_req), .fw_sel(v_fw_sel), .fw_grp(v_fw_grp), .fw_k(v_fw_k),
+        .fw_shared(v_fw_shared), .fw_eidx(v_fw_eidx),
+        .fw_col(v_fw_col), .fw_col_up(v_fw_col_up),
+        .fw_scale_g(v_fw_scale_g), .fw_scale_u(v_fw_scale_u),
+        .fn_req(v_fn_req), .fn_idx(v_fn_idx), .fn_val(v_fn_val),
+        .lw_req(v_lw_req), .lw_vtile(v_lw_vtile), .lw_k(v_lw_k), .lw_col(v_lw_col),
         .h_state(ver_hstate)
     );
 
@@ -381,13 +475,10 @@ module spec_chain_top #(
 
     //========================================================================
     // LOCAL longest-accepted-prefix (cursor advance only) -- ported verbatim
-    //   from spec_batched_top (~lines 294-324): the SAME function spec_decode_seq
-    //   uses, so cur_tok/cur_pos track the committed frontier (m_{p+1} = last
-    //   committed token; +p+1 positions advanced).  The chain always mints the
-    //   full DRAFT_K drafts, so n_draft is fixed at K here.
-    //   FIX (B3): the skeleton advanced cur_tok<=m_0 and cur_pos+=1 every pass,
-    //   which restarts a multi-pass run (num_passes>=2) INSIDE already-committed
-    //   tokens; this advances over the whole accepted prefix instead.
+    //   from spec_batched_top: the SAME function spec_decode_seq uses, so
+    //   cur_tok/cur_pos track the committed frontier (m_{p} = last committed
+    //   token; +p+1 positions advanced).  The chain always mints the full
+    //   DRAFT_K drafts, so n_draft is fixed at K here.
     //========================================================================
     function automatic [OCW-1:0] acc_prefix;
         input [DRAFT_K*TOKW-1:0]     dv;
@@ -412,24 +503,26 @@ module spec_chain_top #(
 
     localparam [OCW-1:0] K_OCW = DRAFT_K[OCW-1:0];
     wire [OCW-1:0]  pfx_w        = acc_prefix(draft_q, truth_q, K_OCW);   // p (0..K)
-    // next committed-frontier token = m_{p+1} = argmax row p
+    // next committed-frontier token = m_{p} = argmax row p
     wire [TOKW-1:0] frontier_tok = truth_q[TOKW*pfx_w +: TOKW];
     // position advance p+1 (zero-extended to POSW)
     wire [POSW-1:0] pos_adv      = {{(POSW-OCW){1'b0}}, pfx_w}
                                  + {{(POSW-1){1'b0}}, 1'b1};
 
     //========================================================================
-    // MASTER FSM  (four phases: MAIN -> CHAIN xK -> VERIFY -> FEED)
+    // MASTER FSM  (five phases: MAIN -> PREP/CHAIN xK -> VERIFY -> FEED)
     //========================================================================
     localparam [2:0]
         C_IDLE   = 3'd0,
         C_MAIN   = 3'd1,    // run PE_M=1 main pass -> m_0, h_0
-        C_CHAIN  = 3'd2,    // run mtp_head_fp8 K times, chaining h_mtp
-        C_VERIFY = 3'd3,    // run PE_M=K+1 batched verify -> m_0..m_K
-        C_FEED   = 3'd4,    // pulse spec_decode_seq; advance cursor
-        C_DRAIN  = 3'd5,    // drain final pass's bonus commit beats
-        C_DONE   = 3'd6;
+        C_PREP   = 3'd2,    // capture embed(prev tok); launch a chain step
+        C_CHAIN  = 3'd3,    // wait mtp_head_fp8 done, chaining h_mtp
+        C_VERIFY = 3'd4,    // run PE_M=K+1 batched verify -> m_0..m_K
+        C_FEED   = 3'd5,    // pulse spec_decode_seq; advance cursor
+        C_DRAIN  = 3'd6,    // drain final pass's bonus commit beats
+        C_DONE   = 3'd7;
     reg [2:0] state;
+    reg       ver_wait;     // 1 = verify batch launched, waiting on ver_done
     reg [7:0] drain_cnt;    // drain the final pass's commit beats
 
     always @(posedge clk) begin
@@ -440,6 +533,7 @@ module spec_chain_top #(
             main_start  <= 1'b0;
             mtp_start   <= 1'b0;
             ver_start   <= 1'b0;
+            ver_wait    <= 1'b0;
             seq_arm     <= 1'b0;
             seq_pass    <= 1'b0;
             seq_verified<= {TOKW{1'b0}};
@@ -451,8 +545,8 @@ module spec_chain_top #(
             passes_left <= 16'h0;
             drain_cnt   <= 8'd0;
             chain_k     <= {(KW+1){1'b0}};
+            prev_tok    <= {TOKW{1'b0}};
             main_tok    <= {TOKW{1'b0}};
-            ver_tok     <= {B*TOKW{1'b0}};
             mtp_h_t     <= {MODEL_DIM*16{1'b0}};
             mtp_emb     <= {MODEL_DIM*16{1'b0}};
             for (ci = 0; ci <= DRAFT_K; ci = ci + 1) begin
@@ -494,14 +588,20 @@ module spec_chain_top #(
                     // m_0 = verified argmax ; h_0 = final-norm hidden state
                     truth_id[0] <= main_argmax;
                     h_chain[0]  <= main_hstate;
-                    // launch chain step 0 : h_t = h_0, emb = embed(m_0)
+                    // seed chain step 0 : h_t = h_0, emb = embed(m_0)
                     chain_k     <= {(KW+1){1'b0}};
                     mtp_h_t     <= main_hstate;
-                    // mtp_emb <= embed(main_argmax)  -- top-level pull (skeleton: 0)
-                    pos_q       <= cur_pos + 1'b1;   // chain predicts pos+1+k
-                    mtp_start   <= 1'b1;
-                    state       <= C_CHAIN;
+                    prev_tok    <= main_argmax;       // -> em_vec = embed(m_0)
+                    pos_q       <= cur_pos + 1'b1;    // chain predicts pos+1+k
+                    state       <= C_PREP;
                 end
+            end
+            //---------------------------------------------------------------- chain prep
+            // em_vec has settled to embed(prev_tok); capture it and launch the head.
+            C_PREP: begin
+                mtp_emb   <= em_vec;
+                mtp_start <= 1'b1;
+                state     <= C_CHAIN;
             end
             //---------------------------------------------------------------- K-step MTP chain
             // Each finished head: capture d_k = argmax and h_mtp -> h_chain[k+1].
@@ -512,39 +612,39 @@ module spec_chain_top #(
                     h_chain[chain_k + 1'b1]   <= mtp_h_mtp;   // chain the state
                     if (chain_k == (DRAFT_K[KW:0] - 1'b1)) begin
                         // all K drafts minted -> assemble the verify batch
-                        state <= C_VERIFY;
+                        pos_q    <= cur_pos;        // verify batch shares base pos
+                        state    <= C_VERIFY;
+                        ver_wait <= 1'b0;
                     end else begin
                         // advance to the next chain step
                         chain_k   <= chain_k + 1'b1;
                         mtp_h_t   <= mtp_h_mtp;               // feed chained state
-                        // mtp_emb <= embed(mtp_argmax) -- top-level pull (skeleton)
+                        prev_tok  <= mtp_argmax;              // emb(d_k) next
                         pos_q     <= pos_q + 1'b1;
-                        mtp_start <= 1'b1;
-                        state     <= C_CHAIN;
+                        state     <= C_PREP;
                     end
                 end
             end
             //---------------------------------------------------------------- batched verify
             C_VERIFY: begin
-                // NOTE: ver_tok assembly {cur_tok, d_0..d_{K-1}} shown in the
-                // combinational block below; launch the PE_M=K+1 pass here.
-                pos_q     <= cur_pos;            // verify batch shares the base pos
-                ver_start <= 1'b1;
-                if (ver_done) begin
+                if (!ver_wait) begin
+                    ver_start <= 1'b1;              // launch PE_M=K+1 pass (1 pulse)
+                    ver_wait  <= 1'b1;
+                end else if (ver_done) begin
                     for (ci = 0; ci <= DRAFT_K; ci = ci + 1)
                         truth_id[ci] <= ver_argmax[ci*TOKW +: TOKW];
                     state <= C_FEED;
                 end
             end
             //---------------------------------------------------------------- feed controller
+            // commit longest accepted prefix; advance cursor over the WHOLE
+            // accepted frontier (m_{p}, +p+1 positions) -- ported from
+            // spec_batched_top B_FEED so a multi-pass run no longer restarts
+            // inside already-committed tokens.
             C_FEED: begin
-                // commit longest accepted prefix; advance cursor over the WHOLE
-                // accepted frontier (m_{p+1}, +p+1 positions) -- ported from
-                // spec_batched_top B_FEED so a multi-pass run no longer restarts
-                // inside already-committed tokens.
                 seq_verified <= frontier_tok;
                 seq_pass     <= 1'b1;
-                cur_tok      <= frontier_tok;        // m_{p+1} (last committed token)
+                cur_tok      <= frontier_tok;        // m_{p} (last committed token)
                 cur_pos      <= cur_pos + pos_adv;   // advance p+1 positions
                 pos_q        <= cur_pos + pos_adv;
                 passes_left  <= passes_left - 1'b1;
@@ -579,8 +679,8 @@ module spec_chain_top #(
 
     //========================================================================
     // PE_M=K+1 verify batch token vector : {cur_tok, d_0 .. d_{K-1}}, row-major
-    // (row 0 = cur_tok in the LSBs).  Registered into ver_tok as the batch is
-    // launched.  Kept as a registered assembly to stay comb-loop-free.
+    // (row 0 = cur_tok in the LSBs).  Registered so it stays comb-loop-free and
+    // holds stable across the model's serial embed phase.
     //========================================================================
     always @(posedge clk) begin
         if (rst) begin
@@ -593,27 +693,11 @@ module spec_chain_top #(
     end
 
     //========================================================================
-    // unused-net tie-off (SKELETON: placeholder pull nets not yet top-ported)
+    // unused-net tie-off
     //========================================================================
     /* verilator lint_off UNUSEDSIGNAL */
-    wire _unused_main = &{1'b0, main_busy, main_logits,
-        mn_em_req, mn_em_tok, mn_em_idx, mn_db_layer, mn_idx_fresh, mn_idx_win,
-        mn_gn_req, mn_gn_which, mn_gn_idx, mn_aw_req, mn_aw_sel, mn_aw_grp, mn_aw_k,
-        mn_kc_req, mn_kc_idx, mn_rw_req, mn_rw_k, mn_fw_req, mn_fw_sel, mn_fw_grp,
-        mn_fw_k, mn_fw_shared, mn_fw_eidx, mn_fn_req, mn_fn_idx, mn_lw_req,
-        mn_lw_vtile, mn_lw_k};
-    wire _unused_mtp = &{1'b0, mtp_busy, mtp_logits,
-        tn_cn_req, tn_cn_which, tn_cn_idx, tn_pw_req, tn_pw_ptile, tn_pw_k,
-        tn_gn_req, tn_gn_which, tn_gn_idx, tn_aw_req, tn_aw_sel, tn_aw_grp, tn_aw_k,
-        tn_kc_req, tn_kc_idx, tn_rw_req, tn_rw_k, tn_fw_req, tn_fw_sel, tn_fw_grp,
-        tn_fw_k, tn_fw_shared, tn_fw_eidx, tn_lw_req, tn_lw_vtile, tn_lw_k};
-    wire _unused_ver = &{1'b0, ver_busy, ver_logits, ver_hstate,
-        vn_em_req, vn_em_tok, vn_em_idx, vn_db_layer, vn_idx_fresh, vn_idx_win,
-        vn_gn_req, vn_gn_which, vn_gn_idx, vn_aw_req, vn_aw_sel, vn_aw_grp, vn_aw_k,
-        vn_kc_req, vn_kc_idx, vn_rw_req, vn_rw_k, vn_fw_req, vn_fw_sel, vn_fw_grp,
-        vn_fw_k, vn_fw_shared, vn_fw_eidx, vn_fn_req, vn_fn_idx, vn_lw_req,
-        vn_lw_vtile, vn_lw_k};
-    wire _unused_h = &{1'b0, h_chain[DRAFT_K]};
+    wire _unused = &{1'b0, main_busy, main_logits, mtp_busy, mtp_logits,
+        ver_busy, ver_logits, ver_hstate, h_chain[DRAFT_K]};
     /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule
