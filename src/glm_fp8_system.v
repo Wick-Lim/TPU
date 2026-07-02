@@ -122,6 +122,24 @@ module glm_fp8_system #(
     parameter integer KV_CTX      = 1024,   // logical KV context capacity (positions)
     parameter integer KV_RESIDENT = 16,     // KV ring capacity (POWER OF TWO, >= S_MAX)
     parameter integer EFIFO_DEPTH = 16,     // routed-expert request FIFO depth (POW2)
+    // ---- C8 loopback: physically route ddr5_xbar's returned bytes into the die ----
+    //   0 = OFF (DEFAULT): BYTE-IDENTICAL to the pre-loopback module.  The die's
+    //       attention-weight code lanes (aw_col) come straight from the same-cycle
+    //       combinational GDDR6 stub, and ddr5_xbar's returned data stays a counted
+    //       OBSERVATION-only output (the C8 gap: returned bytes not fed to the die).
+    //   1 = ON: the die's aw_col FP8 code lanes are SOURCED from ddr5_xbar's returned
+    //       read data.  Because the die's weight pull is COMBINATIONAL (same-cycle,
+    //       un-stallable) but the xbar answers only after ROW_LAT, the loopback
+    //       STALLS the die by clock-gating (die_clk = clk & enable): on each aw beat
+    //       it issues a banked DDR5 read (TAG_LBAW) encoding {layer,sel,grp,k},
+    //       freezes the die until that beat's response returns, presents the returned
+    //       lanes on the die's aw_col, then advances the die exactly one edge.  Every
+    //       other weight/KV family still comes same-cycle from the stub (unperturbed).
+    //       No glm_model_fp8 edit is needed -- the die is stalled EXTERNALLY by
+    //       gating its clock, which a synchronous die tolerates bit-exactly (its
+    //       per-edge input trajectory is unchanged, so the committed token is
+    //       identical to the LOOPBACK=0 run).  See the new local proof TB.
+    parameter integer LOOPBACK    = 0,
     // ---- DDR5 fast-tier fabric (ddr5_xbar) config ----
     parameter integer DDR_NCH     = 4,      // DDR5 channels (POWER OF TWO)
     parameter integer DDR_ADDR_W  = 32,     // block-address width into the fabric
@@ -343,6 +361,17 @@ module glm_fp8_system #(
     reg                       kc_valid_r;
     reg                       mdl_start;
 
+    // ---- C8 loopback nets (driven in §9 generate; tied off when LOOPBACK==0) ----
+    //   die_clk    : the die's (possibly gated) clock -- == clk when LOOPBACK==0.
+    //   die_aw_col : the die's attention-weight code lanes -- == the stub aw_col
+    //                input when LOOPBACK==0, or the xbar-returned lanes when ==1.
+    //   lb_pending / lb_req_addr / lb_accept : loopback source into the §8 issuer.
+    wire                      die_clk;
+    wire [PE_N*8-1:0]         die_aw_col;
+    wire                      lb_pending;
+    wire [DDR_ADDR_W-1:0]     lb_req_addr;
+    wire                      lb_accept;
+
     glm_model_fp8 #(
         .MODEL_DIM(MODEL_DIM), .L(L), .N_DENSE(N_DENSE), .VOCAB(VOCAB),
         .H_HEADS(H_HEADS), .NOPE(NOPE), .ROPE(ROPE), .V_DIM(V_DIM),
@@ -351,7 +380,7 @@ module glm_fp8_system #(
         .INTER_MOE(INTER_MOE), .INTER_DENSE(INTER_DENSE), .RSCALE(RSCALE), .TN(TN),
         .BLK(BLK), .LM_TN(LM_TN)
     ) u_model (
-        .clk(clk), .rst(rst),
+        .clk(die_clk), .rst(rst),
         .start(mdl_start), .busy(mdl_busy), .done(mdl_done),
         .token_id(prompt_tok), .pos(start_pos), .s_len(s_len),
         .logits(logits), .argmax(mdl_argmax),
@@ -359,7 +388,7 @@ module glm_fp8_system #(
         .db_layer(db_layer), .idx_fresh(idx_fresh), .idx_win(idx_win),
         .gn_req(gn_req), .gn_which(gn_which), .gn_idx(gn_idx), .gn_val(gn_val),
         .aw_req(aw_req), .aw_sel(aw_sel), .aw_grp(aw_grp), .aw_k(aw_k),
-        .aw_col(aw_col), .aw_scale(aw_scale),
+        .aw_col(die_aw_col), .aw_scale(aw_scale),
         .kc_req(kc_req), .kc_idx(kc_idx), .kc_ckv(kc_ckv), .kc_krope(kc_krope),
         .kc_valid(kc_valid_r),
         .rw_req(rw_req), .rw_k(rw_k), .rw_col(rw_col), .rw_scale(rw_scale),
@@ -374,7 +403,9 @@ module glm_fp8_system #(
     assign argmax_o = mdl_argmax;
 
     // kc_valid : 1-cycle-registered ack of kc_req (the verified read contract).
-    always @(posedge clk) begin
+    //   Clocked by die_clk so the ack stays in the die's (possibly gated) domain --
+    //   at LOOPBACK==0 die_clk===clk so this is byte-identical to the original.
+    always @(posedge die_clk) begin
         if (rst) kc_valid_r <= 1'b0;
         else     kc_valid_r <= kc_req;
     end
@@ -787,6 +818,7 @@ module glm_fp8_system #(
     localparam [DDR_TAG_W-1:0] TAG_HOT  = 8'h01;
     localparam [DDR_TAG_W-1:0] TAG_SLOT = 8'h02;
     localparam [DDR_TAG_W-1:0] TAG_LOAD = 8'h03;
+    localparam [DDR_TAG_W-1:0] TAG_LBAW = 8'h04;   // C8 loopback attention-weight read
 
     wire hot_pull = em_req | gn_req | aw_req | rw_req | fw_req | fn_req | lw_req;
 
@@ -795,10 +827,13 @@ module glm_fp8_system #(
     reg [WL_ADDR_W-1:0]  load_addr_q;
     reg [CH_IDX_W-1:0]   bank_rot;
 
-    wire sel_load   = p_load;
-    wire sel_slot   = p_slot & ~p_load;
-    wire sel_hot    = p_hot  & ~p_load & ~p_slot;
-    wire any_pending = p_load | p_slot | p_hot;
+    // §9 loopback read has TOP priority (the die is frozen waiting on it).  When
+    // LOOPBACK==0, lb_pending===0 so every term below reduces to the original.
+    wire sel_lb     = lb_pending;
+    wire sel_load   = p_load & ~lb_pending;
+    wire sel_slot   = p_slot & ~p_load & ~lb_pending;
+    wire sel_hot    = p_hot  & ~p_load & ~p_slot & ~lb_pending;
+    wire any_pending = lb_pending | p_load | p_slot | p_hot;
     /* verilator lint_off UNUSEDSIGNAL */
     wire _sel_hot_unused = sel_hot;
     /* verilator lint_on UNUSEDSIGNAL */
@@ -807,7 +842,10 @@ module glm_fp8_system #(
     reg  [DDR_ADDR_W-1:0] xreq_addr;
     reg  [DDR_TAG_W-1:0]  xreq_tag;
     always @* begin
-        if (sel_load) begin
+        if (sel_lb) begin
+            xreq_tag  = TAG_LBAW;
+            xreq_addr = lb_req_addr;
+        end else if (sel_load) begin
             xreq_tag  = TAG_LOAD;
             xreq_addr = { {(DDR_ADDR_W-WL_ADDR_W-CH_IDX_W){1'b0}}, load_addr_q, bank_rot };
         end else if (sel_slot) begin
@@ -822,6 +860,7 @@ module glm_fp8_system #(
     wire xreq_valid = any_pending;
     wire xreq_ready;
     wire xreq_fire  = xreq_valid & xreq_ready;
+    assign lb_accept = xreq_fire & sel_lb;   // §9 loopback read accepted by the xbar
 
     // issuer state: clears come FIRST, sets AFTER -> a same-cycle new event keeps
     // the source pending (never lost), bank_rot still advances on every accept.
@@ -839,7 +878,8 @@ module glm_fp8_system #(
             if (xreq_fire) begin
                 bank_rot       <= bank_rot + 1'b1;
                 xbar_req_count <= xbar_req_count + 32'd1;
-                if (sel_load)      p_load <= 1'b0;
+                if (sel_lb)        begin /* loopback pending cleared in §9 FSM */ end
+                else if (sel_load) p_load <= 1'b0;
                 else if (sel_slot) p_slot <= 1'b0;
                 else               p_hot  <= 1'b0;
             end
@@ -869,9 +909,106 @@ module glm_fp8_system #(
     );
 
     /* verilator lint_off UNUSEDSIGNAL */
-    wire _xbar_resp_tag_unused = &{1'b0, xbar_resp_tag};
     wire _wl_obs_unused = &{1'b0, wl_mm_start, wl_k_len, wl_w_scale};
     /* verilator lint_on UNUSEDSIGNAL */
+
+    //========================================================================
+    // 9) C8 LOOPBACK -- feed ddr5_xbar's returned bytes into the die's aw_col.
+    //    (LOOPBACK==0 : this generate ties die_clk=clk and die_aw_col=stub, so the
+    //     module is BYTE-IDENTICAL to the pre-loopback design.)
+    //
+    //    The die's attention-weight pull is COMBINATIONAL: it drives {db_layer,
+    //    aw_sel,aw_grp,aw_k} and expects the PE_N FP8 lanes the SAME cycle.  The
+    //    xbar answers only ROW_LAT cycles later, so we STALL the die by gating its
+    //    clock (die_clk = clk & enable, enable latched on the low phase => glitch-
+    //    free).  Per aw beat:  freeze the die, issue a banked DDR5 read (TAG_LBAW)
+    //    whose address encodes the exact {layer,sel,grp,k}, capture the tagged
+    //    response, present its low PE_N*8 bits on die_aw_col, then release the die
+    //    for exactly one edge (which retires the staged lanes and advances aw_k).
+    //    Because the die is synchronous, freezing its clock is transparent: at every
+    //    die edge ALL its inputs equal what they'd be in the LOOPBACK==0 run (the
+    //    stub still serves every other family same-cycle, and the staged aw lanes
+    //    == the stub aw lanes for the same key), so the committed token is identical.
+    //========================================================================
+    generate
+    if (LOOPBACK == 0) begin : g_lb
+        assign die_clk     = clk;
+        assign die_aw_col  = aw_col;              // stub lanes, straight through
+        assign lb_pending  = 1'b0;
+        assign lb_req_addr = {DDR_ADDR_W{1'b0}};
+        /* verilator lint_off UNUSEDSIGNAL */
+        wire _lb_off_unused = &{1'b0, lb_accept, xbar_resp_tag, xbar_resp_data};
+        /* verilator lint_on UNUSEDSIGNAL */
+    end else begin : g_lb
+        // ---- encode the die's current aw pull key -> a banked-read address ----
+        reg [DDR_ADDR_W-1:0] cur_addr;
+        always @* begin
+            cur_addr               = {DDR_ADDR_W{1'b0}};
+            cur_addr[3:0]          = aw_sel;
+            cur_addr[4  +: A_KCW]  = aw_k;
+            cur_addr[12 +: A_GRPW] = aw_grp;
+            cur_addr[20 +: LAYW]   = db_layer;
+            cur_addr[24 +: 8]      = 8'hA5;        // TAG_LBAW address marker
+        end
+
+        // ---- staging + fetch state ----
+        reg  [PE_N*8-1:0]     lb_col_q;      // xbar-returned FP8 lanes (staged)
+        reg                   lb_col_valid;  // staged lanes valid for lb_key_q
+        reg  [DDR_ADDR_W-1:0] lb_key_q;      // key the staged lanes belong to
+        reg                   lb_busy;       // a loopback read is in flight
+        reg                   lb_pend_r;     // request asserted into the §8 issuer
+        reg  [DDR_ADDR_W-1:0] lb_addr_r;     // encoded request address
+
+        // staged lanes are for the exact key the die wants right now?
+        wire lb_have = lb_col_valid && (lb_key_q == cur_addr);
+        // die may advance iff it is not mid-aw-pull, or the beat is ready
+        wire die_ce  = ~aw_req | lb_have;
+        // need a fresh fetch: mid-aw-pull, nothing staged for this key, none in flight
+        wire lb_want = aw_req & ~lb_have & ~lb_busy;
+
+        // glitch-free clock gate: latch the enable on the LOW phase of clk
+        reg die_en_lat;
+        initial die_en_lat = 1'b1;
+        always @(negedge clk) die_en_lat <= die_ce;
+        assign die_clk = clk & die_en_lat;
+
+        assign die_aw_col  = lb_col_q;   // the die reads the xbar-returned lanes
+        assign lb_pending  = lb_pend_r;
+        assign lb_req_addr = lb_addr_r;
+
+        always @(posedge clk) begin
+            if (rst) begin
+                lb_col_q     <= {PE_N*8{1'b0}};
+                lb_col_valid <= 1'b0;
+                lb_key_q     <= {DDR_ADDR_W{1'b0}};
+                lb_busy      <= 1'b0;
+                lb_pend_r    <= 1'b0;
+                lb_addr_r    <= {DDR_ADDR_W{1'b0}};
+            end else begin
+                // (1) the die consumed the staged lanes this edge -> retire them
+                if (die_ce & aw_req) lb_col_valid <= 1'b0;
+                // (2) launch a new banked read for the current key
+                if (lb_want & ~lb_pend_r) begin
+                    lb_pend_r <= 1'b1;
+                    lb_addr_r <= cur_addr;
+                    lb_key_q  <= cur_addr;
+                    lb_busy   <= 1'b1;
+                end
+                // (3) the issuer accepted our request -> drop the request line
+                if (lb_accept) lb_pend_r <= 1'b0;
+                // (4) the tagged response returned -> stage the returned lanes
+                if (xbar_resp_valid & (xbar_resp_tag == TAG_LBAW)) begin
+                    lb_col_q     <= xbar_resp_data[PE_N*8-1:0];
+                    lb_col_valid <= 1'b1;
+                    lb_busy      <= 1'b0;
+                end
+            end
+        end
+        /* verilator lint_off UNUSEDSIGNAL */
+        wire _lb_on_unused = &{1'b0, xbar_resp_data[DDR_DATA_W-1:PE_N*8]};
+        /* verilator lint_on UNUSEDSIGNAL */
+    end
+    endgenerate
 
     // drain counter (responses are always accepted, resp_ready=1)
     always @(posedge clk) begin
