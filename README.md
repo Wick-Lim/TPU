@@ -214,8 +214,9 @@ make unittests   # build+run every per-unit TB, including the GLM-5.2 + FP8 + sy
 make formal      # bounded model checking (yosys-smtbmc + z3) of the 6 memory-system controllers
 make cache-study # GLM-trace cache hit-rate / batching / prefetch / decompress / layout measurements
 make lint        # verilator --lint-only -Wall on the design
-make synth       # yosys elaborate/synth gate (no error, no latch)
-make all         # test + hazard + unittests + lint + synth + formal (the full CI surface)
+make synth       # yosys elaborate/synth gate on the scalar TPU top (no error, no latch)
+make synth-glm   # yosys whole-chip structural gate on the GLM product top glm_fp8_system_cdc
+make all         # test + hazard + unittests + lint + synth + synth-glm + formal (the full CI surface)
 ```
 
 Per-GLM-unit canonical compile (list sources explicitly — zsh does not word-split):

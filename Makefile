@@ -53,7 +53,7 @@ IFLAGS := -g2012 -Wall -I src
 
 .PHONY: all build test hazard axi soc unittests cache-study formal formal-ind bitacc sim wave lint synth synth-glm ppa clean
 
-all: test hazard unittests lint synth formal
+all: test hazard unittests lint synth synth-glm formal
 
 build: $(SIM_BIN)
 
