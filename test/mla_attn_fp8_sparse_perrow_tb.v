@@ -85,6 +85,28 @@ module mla_attn_fp8_sparse_perrow_tb;
 
     localparam integer PE_M  = 3;
 
+    // DSA_REAL_IDX: under -DSPARSE_XFAIL drive the indexer with REAL, query-dependent
+    //   key index vectors (c_kv[j][0:NOPE]) so per-row top-K selection genuinely
+    //   depends on each row's query -> the distinct-x SPARSE rows diverge (the B6
+    //   divergent path becomes LIVE and OBSERVABLE).  In the default build it stays 0
+    //   (zero index vectors, q-independent) so every regression folds byte-identically.
+    //
+    // SWIN_TB: the B7 attention scratch window.  Its committed default is TOPK, whose
+    //   invariant "union u_cnt <= SWIN" holds ONLY when every row selects the SAME
+    //   top-K set (q-independent slice: u_cnt == TOPK).  Once selection is genuinely
+    //   per-row (DSA_REAL_IDX=1) the rows' union can hold up to min(PE_M*TOPK, S_MAX)
+    //   DISTINCT keys -- MORE than TOPK -- so the union-slot scratch must be sized for
+    //   that worst case, else the union slot index wraps and corrupts.  So under the
+    //   divergent build we size SWIN = min(PE_M*TOPK, S_MAX); the default build keeps
+    //   SWIN = TOPK (byte-identical to the committed regression).
+`ifdef SPARSE_XFAIL
+    localparam integer DSA_REAL_IDX = 1;
+    localparam integer SWIN_TB = (PE_M*TOPK < S_MAX) ? PE_M*TOPK : S_MAX;
+`else
+    localparam integer DSA_REAL_IDX = 0;
+    localparam integer SWIN_TB = TOPK;
+`endif
+
     `include "glm_fp.vh"
     `include "fp8_e4m3.vh"
 
@@ -168,8 +190,8 @@ module mla_attn_fp8_sparse_perrow_tb;
     mla_attn_fp8 #(.MODEL_DIM(MODEL_DIM), .H_HEADS(H_HEADS), .NOPE(NOPE),
                .ROPE(ROPE), .V_DIM(V_DIM), .Q_LORA(Q_LORA), .KV_LORA(KV_LORA),
                .S_MAX(S_MAX), .TOPK(TOPK), .THETA(THETA), .PE_N(PE_N),
-               .POSW(POSW), .BLK(BLK), .PE_M(PE_M),
-               .PER_ROW_POS(1), .PER_ROW_SLEN(1)) dutM (
+               .POSW(POSW), .BLK(BLK), .PE_M(PE_M), .SWIN(SWIN_TB),
+               .PER_ROW_POS(1), .PER_ROW_SLEN(1), .DSA_REAL_IDX(DSA_REAL_IDX)) dutM (
         .clk(clk), .rst(rst), .start(d_start), .busy(d_busy), .done(d_done),
         .pos(d_pos), .pos_vec(d_pos_vec), .s_len(d_slen), .s_len_vec(d_slen_vec),
         .x_vec(d_xvec),
@@ -199,7 +221,7 @@ module mla_attn_fp8_sparse_perrow_tb;
     mla_attn_fp8 #(.MODEL_DIM(MODEL_DIM), .H_HEADS(H_HEADS), .NOPE(NOPE),
                .ROPE(ROPE), .V_DIM(V_DIM), .Q_LORA(Q_LORA), .KV_LORA(KV_LORA),
                .S_MAX(S_MAX), .TOPK(TOPK), .THETA(THETA), .PE_N(PE_N),
-               .POSW(POSW), .BLK(BLK), .PE_M(1)) ref1 (
+               .POSW(POSW), .BLK(BLK), .PE_M(1), .SWIN(SWIN_TB), .DSA_REAL_IDX(DSA_REAL_IDX)) ref1 (
         .clk(clk), .rst(rst), .start(r1_start), .busy(r1_busy), .done(r1_done),
         .pos(r1_pos), .pos_vec(r1_pos_vec), .s_len(r1_slen), .s_len_vec(r1_slen_vec),
         .x_vec(r1_xvec),
@@ -362,6 +384,62 @@ module mla_attn_fp8_sparse_perrow_tb;
     endfunction
 
     // ---------------------------------------------------------------------------
+    //  DIVERGENCE PROOF (the whole deliverable): with real query-dependent index
+    //    vectors the batched DUT's PER-ROW DSA selection sel_list_r[r] must actually
+    //    DIFFER across rows whose queries differ.  Read the DUT's internal per-row
+    //    selection lists (hierarchical), print them, and assert at least one row's
+    //    (count,list) differs from row 0 -- i.e. the divergent B6/B7 path is LIVE.
+    // ---------------------------------------------------------------------------
+    integer dvr, dvs; reg dv_diff;
+    task check_divergence; input [256*8-1:0] label; begin
+        test_count = test_count + 1;
+        for (dvr=0; dvr<PE_M; dvr=dvr+1) begin
+            $write("    [%0s] row%0d sel_cnt=%0d sel_list=", label, dvr, dutM.sel_cnt_r[dvr]);
+            for (dvs=0; dvs<TOPK; dvs=dvs+1) $write(" %0d", dutM.sel_list_r[dvr][dvs]);
+            $write("\n");
+        end
+        dv_diff = 1'b0;
+        for (dvr=1; dvr<PE_M; dvr=dvr+1) begin
+            if (dutM.sel_cnt_r[dvr] !== dutM.sel_cnt_r[0]) dv_diff = 1'b1;
+            for (dvs=0; dvs<TOPK; dvs=dvs+1)
+                if (dutM.sel_list_r[dvr][dvs] !== dutM.sel_list_r[0][dvs]) dv_diff = 1'b1;
+        end
+        if (dv_diff)
+            $display("  PASS[%0s] per-row DSA selection is q-DEPENDENT (rows select DIFFERENT key sets)", label);
+        else begin
+            $display("FAIL[%0s] per-row DSA selection IDENTICAL across distinct-x rows (not q-dependent)", label);
+            errors = errors + 1;
+        end
+    end endtask
+
+    // ---------------------------------------------------------------------------
+    //  FETCH-SHARING under genuine per-row divergence.  Once selection is q-dependent
+    //    the batch selects the UNION of the rows' key sets, so its fetch count no
+    //    longer equals ONE single-row run (the pre-B6 exact check).  The correct,
+    //    divergence-proof property is that the batch fetches each distinct union
+    //    key/weight ONCE -- i.e. STRICTLY FEWER beats than PE_M INDEPENDENT single-row
+    //    decodes (fetch shared, not replicated), yet AT LEAST one row's demand (the
+    //    union covers every row).  Bounds: max_single <= batch < sum_of_rows.
+    // ---------------------------------------------------------------------------
+    reg [31:0] sxw [0:PE_M-1];
+    reg [31:0] sxkc[0:PE_M-1];
+    task check_fetch_share_union; input [256*8-1:0] label; begin
+        test_count = test_count + 1;
+        if (!(bw_run < (sxw[0]+sxw[1]+sxw[2]) && bw_run >= imax3(sxw[0],sxw[1],sxw[2]))) begin
+            $display("FAIL[%0s] w_req beats: batch=%0d not in [%0d,%0d) (weight fetch not shared)",
+                     label, bw_run, imax3(sxw[0],sxw[1],sxw[2]), sxw[0]+sxw[1]+sxw[2]);
+            errors = errors + 1;
+        end else if (!(bkc_run < (sxkc[0]+sxkc[1]+sxkc[2]) && bkc_run >= imax3(sxkc[0],sxkc[1],sxkc[2]))) begin
+            $display("FAIL[%0s] kc_req beats: batch=%0d not in [%0d,%0d) (key fetch not shared)",
+                     label, bkc_run, imax3(sxkc[0],sxkc[1],sxkc[2]), sxkc[0]+sxkc[1]+sxkc[2]);
+            errors = errors + 1;
+        end else
+            $display("  PASS[%0s] fetch-share(union): w=%0d in [%0d,%0d)  kc=%0d in [%0d,%0d)",
+                     label, bw_run, imax3(sxw[0],sxw[1],sxw[2]), sxw[0]+sxw[1]+sxw[2],
+                     bkc_run, imax3(sxkc[0],sxkc[1],sxkc[2]), sxkc[0]+sxkc[1]+sxkc[2]);
+    end endtask
+
+    // ---------------------------------------------------------------------------
     //  ENABLED case: batched rows MUST equal the per-row PE_M=1 references.
     //    (dense fallback and/or all-equal-x -- the shared row-0 selection == each
     //     row's own selection, so equivalence is exact.)
@@ -403,14 +481,21 @@ module mla_attn_fp8_sparse_perrow_tb;
         smax_c = imax3(s0,s1,s2);
         run_dutM(p, s0, s1, s2);
 `ifdef SPARSE_XFAIL
-        run_ref(0, p, s0); check_row(0, label);
-        run_ref(1, p, s1); check_row(1, label);
-        run_ref(2, p, s2); check_row(2, label);
+        // (0) PROVE the divergent path is live: per-row selection is q-dependent.
+        check_divergence(label);
+        // (1) per-row BIT-EXACT equivalence -- batched row r (its OWN q-dependent
+        //     selection) === the PE_M=1 reference on row r's own inputs (same module,
+        //     same real index vectors, same KV cache -> identical selection & output).
+        run_ref(0, p, s0); check_row(0, label); sxw[0]=rw_run; sxkc[0]=rkc_run;
+        run_ref(1, p, s1); check_row(1, label); sxw[1]=rw_run; sxkc[1]=rkc_run;
+        run_ref(2, p, s2); check_row(2, label); sxw[2]=rw_run; sxkc[2]=rkc_run;
+        // (2) fetch-sharing under divergence (union fetched once; bounds vs 3 runs).
+        check_fetch_share_union(label);
 `else
         $display("  SKIP[%0s] per-row output compare (distinct-x sparse == B6 gap; define SPARSE_XFAIL to enable)", label);
-`endif
         run_ref(0, p, smax_c);
         check_fetch_share(label);
+`endif
         $display("    (%0s: pos=%0d S=(%0d,%0d,%0d) distinct-x SPARSE)", label, p, s0, s1, s2);
     end endtask
 

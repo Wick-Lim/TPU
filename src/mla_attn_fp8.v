@@ -134,6 +134,22 @@ module mla_attn_fp8 #(
     //   in extent: the shared DSA/score/cache pass covers max(s_len_r), and each
     //   row's scores for keys j>=s_len_r are masked to bf16 -inf before its softmax.
     parameter integer PER_ROW_SLEN = 0,
+    // DSA_REAL_IDX=0 (default): the dsa_indexer is driven with ZERO key index
+    //   vectors (dsa_kidx<=0), so every key scores 0 and top-K keeps keys
+    //   0..min(S,TOPK)-1 by lower-index tie-break -- Q-INDEPENDENT (byte-identical
+    //   to the pre-DSA-real datapath; the divergent per-row path folds to the
+    //   shared list).  =1: the indexer is fed REAL, query-DEPENDENT key index
+    //   vectors so top-K selection actually depends on the query (and thus differs
+    //   per batched row when queries differ).  The DSA index vector for key j is
+    //   the first NOPE lanes of that key's CACHED COMPRESSED LATENT c_kv[j] (bf16),
+    //   pre-fetched once from the KV cache into kidx_buf before the per-row DSA
+    //   pass; the query index vector is the head-0 nope slice of the roped query
+    //   qrot (already wired to dsa_qidx).  score_j = <q_nope, ckv[j][0:NOPE]> in
+    //   the indexer's fp32 reduce -- a faithful IndexShare-style cheap projection
+    //   (the compressed KV latent IS the shared low-rank key representation).  Only
+    //   the SPARSE regime (max causal extent > TOPK) pre-fetches / scores; the DENSE
+    //   fallback (S<=TOPK) never pulls keys, so this is a no-op there for any value.
+    parameter integer DSA_REAL_IDX = 0,
     // ---- derived (do NOT override) ----
     parameter integer QK_DIM    = NOPE + ROPE,
     parameter integer IDXW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
@@ -309,6 +325,22 @@ module mla_attn_fp8 #(
     integer        uk, ur, up;                        // union-build loop vars
     reg            un_pres;                            // key present in some row's selection
     reg [IDXW:0]   un_cnt;                             // running union count (blocking)
+
+    // DSA REAL key-index vectors (DSA_REAL_IDX=1): the per-key index vector fed to
+    //   the indexer, derived from the key's cached compressed latent c_kv[j].  ONE
+    //   PRE-FETCH pass (S_DSAPF) reads keys 0..s_reg-1 from the shared KV cache and
+    //   stores the first NOPE lanes of each c_kv[j] here; the per-row DSA pass then
+    //   answers the indexer's key pull combinationally from this buffer (keeping the
+    //   indexer's fixed 1-beat, in-order pull protocol, exactly like the zero-vector
+    //   response it replaces).  These index vectors depend only on the KEY, so ALL
+    //   PE_M per-row indexer runs (and the standalone PE_M=1 reference) score against
+    //   the SAME kidx_buf -- each row diverges only through its own query qrot[r].
+    //   At DSA_REAL_IDX=0 this buffer is reset to 0 and never read (no pre-fetch).
+    reg [15:0]     kidx_buf [0:S_MAX-1][0:NOPE-1];      // per-key index vector (bf16)
+    reg [IDXW:0]   pf_j;                                // pre-fetch key counter (0..s_reg-1)
+    localparam PF_REQ = 1'b0, PF_WAIT = 1'b1;
+    reg            pf_st;                               // pre-fetch cache handshake sub-state
+    integer        pfd;                                 // pre-fetch lane loop var
 
     //========================================================================
     // PER-ROW CAUSAL EXTENT resolve (combinational; latched at start).  Row 0 =
@@ -515,7 +547,8 @@ module mla_attn_fp8 #(
         S_CTX   = 5'd11,   // weighted-V context              (bf16 fp32-acc, per row)
         S_OUT   = 5'd12,   // ctx*W_o -> out                  (FP8, batched rows)
         S_DONE  = 5'd13,
-        S_UNION = 5'd14;   // build the distinct-key UNION across rows' selections
+        S_UNION = 5'd14,   // build the distinct-key UNION across rows' selections
+        S_DSAPF = 5'd15;   // (DSA_REAL_IDX) pre-fetch per-key index vectors -> kidx_buf
     reg [4:0] state;
 
     // ---- GEMV micro-sequencer sub-state (shared by every projection stage) ----
@@ -712,6 +745,9 @@ module mla_attn_fp8 #(
             dsa_row    <= {DRW{1'b0}};
             u_cnt      <= {(IDXW+1){1'b0}};
             un_pres    <= 1'b0; un_cnt <= {(IDXW+1){1'b0}};
+            pf_j       <= {(IDXW+1){1'b0}}; pf_st <= PF_REQ;
+            for (rr=0; rr<S_MAX; rr=rr+1)
+                for (pfd=0; pfd<NOPE; pfd=pfd+1) kidx_buf[rr][pfd] <= 16'h0;
             for (rr=0; rr<PE_M; rr=rr+1) begin
                 ctx_acc[rr] <= 32'h0;
                 for (s_i=0; s_i<MODEL_DIM; s_i=s_i+1) begin xbuf[rr][s_i]<=16'h0; outbuf[rr][s_i]<=16'h0; end
@@ -971,19 +1007,73 @@ module mla_attn_fp8 #(
                 if (rp_done[0]) begin
                     // PER-ROW DSA (B6): score row 0's selection first, then advance
                     //   through rows 1..PE_M-1 in S_DSA -- each with ITS OWN q + extent.
-                    for (d_i=0; d_i<NOPE; d_i=d_i+1)
-                        dsa_qidx[16*d_i +: 16] <= qrot[0][d_i];
-                    dsa_slen  <= slen_r[(IDXW+1)*0 +: (IDXW+1)];   // row 0 own extent (== s_len)
-                    dsa_start <= 1'b1;
-                    dsa_row   <= {DRW{1'b0}};
-                    state     <= S_DSA;
+                    if ((DSA_REAL_IDX != 0) && (s_reg > TOPK[IDXW:0])) begin
+                        // SPARSE + real index vectors: pre-fetch every candidate
+                        //   key's index vector (c_kv[j][0:NOPE]) into kidx_buf ONCE,
+                        //   then run the per-row indexer against it.  (DENSE never
+                        //   pulls keys, so it skips straight to S_DSA below.)
+                        pf_j  <= {(IDXW+1){1'b0}};
+                        pf_st <= PF_REQ;
+                        state <= S_DSAPF;
+                    end else begin
+                        for (d_i=0; d_i<NOPE; d_i=d_i+1)
+                            dsa_qidx[16*d_i +: 16] <= qrot[0][d_i];
+                        dsa_slen  <= slen_r[(IDXW+1)*0 +: (IDXW+1)];   // row 0 own extent (== s_len)
+                        dsa_start <= 1'b1;
+                        dsa_row   <= {DRW{1'b0}};
+                        state     <= S_DSA;
+                    end
                 end
+            end
+            // ------------------------------------------------------------- DSA pre-fetch
+            // (DSA_REAL_IDX, SPARSE only) : stream every candidate key j=0..s_reg-1
+            //   from the shared KV cache and latch the first NOPE lanes of its cached
+            //   compressed latent c_kv[j] as that key's DSA index vector kidx_buf[j].
+            //   Uses the SAME kc_req/kc_valid handshake as the S_KEY read (so its
+            //   per-key cache cost matches).  When the last key lands, launch the
+            //   per-row indexer on row 0 exactly as the non-pre-fetch path does.
+            S_DSAPF: begin
+                case (pf_st)
+                    PF_REQ: begin
+                        kc_idx <= pf_j[IDXW-1:0];
+                        kc_req <= 1'b1;
+                        pf_st  <= PF_WAIT;
+                    end
+                    PF_WAIT: begin
+                        if (kc_valid) begin
+                            kc_req <= 1'b0;
+                            for (pfd=0; pfd<NOPE; pfd=pfd+1)
+                                kidx_buf[pf_j[IDXW-1:0]][pfd] <= kc_ckv[16*pfd +: 16];
+                            if (pf_j == s_reg - 1'b1) begin
+                                for (d_i=0; d_i<NOPE; d_i=d_i+1)
+                                    dsa_qidx[16*d_i +: 16] <= qrot[0][d_i];
+                                dsa_slen  <= slen_r[(IDXW+1)*0 +: (IDXW+1)];
+                                dsa_start <= 1'b1;
+                                dsa_row   <= {DRW{1'b0}};
+                                state     <= S_DSA;
+                            end else begin
+                                pf_j  <= pf_j + 1'b1;
+                                pf_st <= PF_REQ;
+                            end
+                        end
+                    end
+                    default: pf_st <= PF_REQ;
+                endcase
             end
             // ------------------------------------------------------------- DSA
             S_DSA: begin
                 dsa_key_valid <= 1'b0;
                 if (dsa_key_req) begin
-                    dsa_kidx      <= {NOPE*16{1'b0}};
+                    // DSA_REAL_IDX=1: answer the indexer's per-key pull with the REAL
+                    //   query-dependent index vector kidx_buf[key] (pre-fetched above);
+                    //   =0: the original zero vector (q-independent).  Param-gated ->
+                    //   constant-folds; the buffer read is masked when DSA_REAL_IDX=0.
+                    if (DSA_REAL_IDX != 0) begin
+                        for (d_i=0; d_i<NOPE; d_i=d_i+1)
+                            dsa_kidx[16*d_i +: 16] <= kidx_buf[dsa_key_idx][d_i];
+                    end else begin
+                        dsa_kidx <= {NOPE*16{1'b0}};
+                    end
                     dsa_key_valid <= 1'b1;
                 end
                 if (dsa_done) begin
