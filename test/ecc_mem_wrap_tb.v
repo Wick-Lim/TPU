@@ -83,6 +83,9 @@ module ecc_mem_wrap_tb;
     wire [DATA_W-1:0] rdata;
     wire              serr, derr;
 
+    wire              serr_sticky, derr_sticky;
+    reg               err_ack;
+
     reg               bd_we;
     reg  [ADDR_W-1:0] bd_addr;
     reg  [CODE_W-1:0] bd_code;
@@ -91,6 +94,7 @@ module ecc_mem_wrap_tb;
         .clk(clk), .rst(rst),
         .we(we), .waddr(waddr), .wdata(wdata),
         .re(re), .raddr(raddr), .rdata(rdata), .serr(serr), .derr(derr),
+        .serr_sticky(serr_sticky), .derr_sticky(derr_sticky), .err_ack(err_ack),
         .bd_we(bd_we), .bd_addr(bd_addr), .bd_code(bd_code)
     );
 
@@ -114,7 +118,7 @@ module ecc_mem_wrap_tb;
     //------------------------------------------------------------------
     integer tests = 0;
     integer fails = 0;
-    integer n_clean = 0, n_single = 0, n_double = 0;
+    integer n_clean = 0, n_single = 0, n_double = 0, n_scrub = 0;
 
     task check;
         input [400:0] name;
@@ -131,7 +135,18 @@ module ecc_mem_wrap_tb;
     // --- Bus-idle helper (all controls low). ---
     task bus_idle;
         begin
-            we = 1'b0; re = 1'b0; bd_we = 1'b0;
+            we = 1'b0; re = 1'b0; bd_we = 1'b0; err_ack = 1'b0;
+        end
+    endtask
+
+    // --- Pulse err_ack for one clock to clear the sticky flags. ---
+    task ack_sticky;
+        begin
+            @(negedge clk);
+            bus_idle;
+            err_ack = 1'b1;
+            @(posedge clk); #1;
+            err_ack = 1'b0;
         end
     endtask
 
@@ -191,7 +206,7 @@ module ecc_mem_wrap_tb;
 
         // reset (synchronous, active high)
         bus_idle;
-        we = 1'b0; re = 1'b0; bd_we = 1'b0;
+        we = 1'b0; re = 1'b0; bd_we = 1'b0; err_ack = 1'b0;
         waddr = 0; wdata = 0; raddr = 0; bd_addr = 0; bd_code = 0;
         rst = 1'b1;
         repeat (3) @(posedge clk);
@@ -256,6 +271,70 @@ module ecc_mem_wrap_tb;
         end
 
         //==============================================================
+        // 4) SCRUB WRITE-BACK + STICKY flags.
+        //    A single-bit fault is injected into a stored word; the first read
+        //    corrects it (serr=1) AND heals the array; a second read of the
+        //    SAME address then sees serr=0.  Sticky flags latch across reads
+        //    and are cleared by err_ack.  A double fault sets derr (+sticky)
+        //    and is NOT healed.
+        //==============================================================
+        // Start from a clean sticky state (prior sections tripped the flags).
+        ack_sticky;
+        check("scrub: sticky serr cleared by ack", serr_sticky === 1'b0);
+        check("scrub: sticky derr cleared by ack", derr_sticky === 1'b0);
+
+        // ---- single-bit fault -> corrected, serr, then scrubbed away ----
+        dword    = {$random, $random};
+        addr     = 7;
+        enc_data = dword; #1;
+        cw       = enc_code;
+
+        ecc_write(addr[ADDR_W-1:0], dword);      // clean codeword in the array
+        bad = cw ^ (1'b1 << 3);                  // rot a single data bit
+        raw_write(addr[ADDR_W-1:0], bad);        // inject the fault in place
+
+        ecc_read(addr[ADDR_W-1:0]);              // read #1: correct + heal
+        check("scrub: read1 data corrected", rdata       === dword);
+        check("scrub: read1 serr=1",         serr        === 1'b1);
+        check("scrub: read1 derr=0",         derr        === 1'b0);
+        check("scrub: read1 sticky serr=1",  serr_sticky === 1'b1);
+        check("scrub: read1 sticky derr=0",  derr_sticky === 1'b0);
+
+        ecc_read(addr[ADDR_W-1:0]);              // read #2: bit was healed
+        check("scrub: read2 data still ok",  rdata === dword);
+        check("scrub: read2 serr=0 (healed)",serr  === 1'b0);
+        check("scrub: read2 derr=0",         derr  === 1'b0);
+        // sticky serr still latched from read #1 until acked
+        check("scrub: sticky serr still latched", serr_sticky === 1'b1);
+        n_scrub = n_scrub + 1;
+
+        ack_sticky;                              // clear the latch
+        check("scrub: sticky serr cleared", serr_sticky === 1'b0);
+
+        // ---- double-bit fault -> derr, sticky derr, NOT healed ----
+        dword    = {$random, $random};
+        addr     = 9;
+        enc_data = dword; #1;
+        cw       = enc_code;
+
+        ecc_write(addr[ADDR_W-1:0], dword);
+        bad = cw ^ (1'b1 << 3) ^ (1'b1 << 10);   // two distinct rotted bits
+        raw_write(addr[ADDR_W-1:0], bad);
+
+        ecc_read(addr[ADDR_W-1:0]);              // read #1: detect double
+        check("scrub: dbl read1 derr=1",        derr        === 1'b1);
+        check("scrub: dbl read1 serr=0",        serr        === 1'b0);
+        check("scrub: dbl read1 sticky derr=1", derr_sticky === 1'b1);
+
+        ecc_read(addr[ADDR_W-1:0]);              // read #2: still bad (no heal)
+        check("scrub: dbl read2 derr=1 (not healed)", derr === 1'b1);
+        check("scrub: dbl sticky derr still latched",  derr_sticky === 1'b1);
+        n_scrub = n_scrub + 1;
+
+        ack_sticky;
+        check("scrub: sticky derr cleared", derr_sticky === 1'b0);
+
+        //==============================================================
         // verdict
         //==============================================================
         $display("clean words        : %0d", n_clean);
@@ -263,6 +342,7 @@ module ecc_mem_wrap_tb;
                  n_single, CODE_W, SINGLE_WORDS);
         $display("double-flip cases  : %0d (all C(%0d,2) x %0d words)",
                  n_double, CODE_W, DOUBLE_WORDS);
+        $display("scrub/sticky cases : %0d", n_scrub);
 
         if (fails == 0)
             $display("ALL %0d TESTS PASSED", tests);

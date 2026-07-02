@@ -1,0 +1,88 @@
+# CI for the GLM-5.2-FP8 Verilog accelerator.
+#
+# Three jobs:
+#   python-selftests : the pure-Python golden/contract mirrors (no EDA tools)
+#   eda-functional   : iverilog unit TBs + verilator lint + yosys structural gates
+#   formal           : yosys-smtbmc + z3 bounded + unbounded (k-induction) proofs
+#
+# TOOLCHAIN PIN (important): the formal harnesses depend on Yosys 0.66 behavior
+# (the post-flatten `connect`-bind to reach internal counters, and the
+# `async2sync; chformal -lower` lowering that keeps $check cells from being
+# silently dropped).  The `eda-functional` gates are version-tolerant, but the
+# `formal` job SHOULD run Yosys 0.66 to match the local baseline — see the note
+# in that job.  Local baseline: iverilog 13.0, yosys 0.66, z3 4.16.
+
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python-selftests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install python deps
+        run: python -m pip install --upgrade numpy
+      - name: FP8 reference golden selftest
+        run: python3 tools/glm_fp8_ref.py
+      - name: FP8 contract selftest (all available backends)
+        run: python3 tools/glm_fp8_contract.py
+      - name: Checkpoint pack round-trip selftest
+        run: python3 tools/ckpt_pack.py
+      - name: Modal-validate bridge selftest (modal absent -> shim)
+        run: PYTHONPATH=tools python3 test/modal_validate_test.py
+      - name: Trace + layout dumps (regenerate CI inputs)
+        run: |
+          python3 tools/route_trace.py --dump
+          python3 tools/flash_layout.py --dump-map tools/flash_map.hex
+
+  eda-functional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install EDA tools (iverilog + verilator + yosys + z3)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog verilator yosys z3
+      - name: Tool versions
+        run: |
+          iverilog -V 2>&1 | head -1 || true
+          verilator --version || true
+          yosys --version || true
+          z3 --version || true
+      - name: Unit testbenches (every per-unit TB)
+        run: make unittests
+      - name: Lint (verilator -Wall)
+        run: make lint
+      - name: Structural synth gates (TPU + GLM full chip)
+        run: |
+          make synth
+          make synth-glm    # first-ever whole-chip GLM structural gate (task C1)
+      - name: Bit-accuracy (FP8 3-way contract identity + argmax-preserved)
+        run: make bitacc
+      - name: Cache study (hit-rate / batching / decompress / layout)
+        run: make cache-study
+
+  formal:
+    runs-on: ubuntu-latest
+    # NOTE: the *_ind_fv connect-bind + chformal -lower harnesses are validated
+    # against Yosys 0.66.  apt's yosys may differ; if the proofs regress here,
+    # pin Yosys 0.66 (e.g. via the OSS CAD Suite release that ships it) so the
+    # formal flow matches the local baseline before trusting a green/red result.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yosys + z3 (+ iverilog for shared deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yosys z3 iverilog
+      - name: Bounded model checking (6 controllers)
+        run: make formal
+      - name: Unbounded k-induction proofs
+        run: make formal-ind

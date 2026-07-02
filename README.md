@@ -44,10 +44,16 @@ FP8, and its `config.json` *quantization_config* is what drives the hardware:
 
 Architecture (the slice preserves every ratio): hidden 6144, 78 layers
 (`first_k_dense_replace=3`), 64 heads (`head_dim=192`), **MLA** latent attention
-(`qk_nope 192 + qk_rope 64`, `v 256`, `kv_lora 512`, `q_lora 2048`), **MoE** 256
+(`qk_nope 192 + qk_rope 64`, `v 256`, `kv_lora 512`, `q_lora 1536`), **MoE** 256
 experts top-8 + 1 shared (`moe_intermediate 2048`), dense `intermediate 12288`,
 **DSA** sparse attention (`index_topk 2048`), vocab 154880, 1M context,
 `rope_theta 8e6` interleaved, RMSNorm `eps 1e-5`, MTP (`num_nextn_predict_layers 1`).
+
+> The real-config MLA low-rank sizes (`q_lora 1536`, `kv_lora 512`) follow the
+> DeepSeek-MLA standard used throughout [`docs/ACCEL_GLM52.md`](docs/ACCEL_GLM52.md);
+> they are RTL parameters and are to be confirmed against the checkpoint
+> safetensors shapes when the full-config parameter file (`configs/full_glm52.vh`)
+> lands. The committed RTL slice uses `q_lora 64 / kv_lora 32` (every ratio preserved).
 
 ---
 
@@ -106,7 +112,10 @@ The RTL that runs the real model from Flash through a fast tier into the FP8 die
 | **`glm_fp8_system.v`** | production top: compute + **ddr5_xbar + weight_loader** in the datapath | 3 tests (token == standalone) |
 | **`glm_fp8_system_cdc.v`** | 2-clock wrapper (host/USB ↔ compute via `cdc_async_fifo`) | 31 tests (token == standalone across async clocks) |
 
-Verified by `make unittests` (every per-unit TB) + `make formal` (6 controllers, z3 BMC) + `make cache-study`; `make all` runs them all green.
+Verified by `make unittests` (every per-unit TB) + `make formal` (6 controllers, z3 BMC).
+`make all` = `test hazard unittests lint synth formal` (the full CI surface); `make synth-glm`
+(the whole-chip GLM structural gate), `make bitacc`, `make cache-study`, and `make formal-ind`
+are additional targets run separately.
 
 ### Performance / power levers — measured (see [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md))
 

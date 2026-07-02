@@ -10,6 +10,24 @@
 // transparently CORRECTING any single-bit flip and DETECTING any double-bit
 // flip that occurred while the word sat in the array.
 //
+// SCRUB WRITE-BACK (P2.1 heal-on-read):
+//   Correcting a single-bit flip on the READ output alone leaves the rotted
+//   bit in the array, where it can accumulate a second flip and become an
+//   uncorrectable double error.  This wrapper therefore SCRUBS: whenever a read
+//   detects+corrects a single-bit error, the corrected codeword (re-encoded
+//   from the corrected payload) is written back into the array one cycle later,
+//   healing the bit in place.  The external read-latency contract is unchanged
+//   (rdata/serr/derr still valid 2 rising edges after re); scrub is an extra
+//   internal write that lands on the same cycle the corrected read is
+//   registered.  A subsequent read of the same address therefore sees serr=0.
+//
+// STICKY STATUS (serr_sticky/derr_sticky + err_ack):
+//   The per-read serr/derr pulses are momentary.  Two sticky flags LATCH that
+//   at least one single- / double-error was ever observed since the last clear,
+//   so slow software can poll them.  A synchronous err_ack clears both; a new
+//   error observed in the same cycle as err_ack still latches (errors are never
+//   lost).  rst clears them.
+//
 // This is the memory-path use of the codec: a bit that rots in DRAM/Flash is
 // silently repaired (serr) rather than corrupting an activation/weight, and a
 // 2-bit event is surfaced (derr) instead of being silently miscorrected.
@@ -49,6 +67,8 @@ module ecc_mem_wrap #(
     we, waddr, wdata,
     // read port (synchronous, 1-cycle, ECC-decoded)
     re, raddr, rdata, serr, derr,
+    // sticky error status + synchronous ack/clear
+    serr_sticky, derr_sticky, err_ack,
     // optional back-door raw-codeword write (fault injection / scrub); off = old behavior
     bd_we, bd_addr, bd_code
 );
@@ -98,6 +118,10 @@ module ecc_mem_wrap #(
     output reg                 serr;
     output reg                 derr;
 
+    output reg                 serr_sticky;   // latched: a single-error was seen
+    output reg                 derr_sticky;   // latched: a double-error was seen
+    input  wire                err_ack;       // sync clear for both sticky flags
+
     input  wire                bd_we;
     input  wire [ADDR_W-1:0]   bd_addr;
     input  wire [CODE_W-1:0]   bd_code;
@@ -124,29 +148,14 @@ module ecc_mem_wrap #(
     //------------------------------------------------------------------
     reg [CODE_W-1:0] mem [0:DEPTH-1];
     reg [CODE_W-1:0] rd_code;          // codeword fetched on the read posedge
+    reg [ADDR_W-1:0] rd_addr_q;        // address that produced rd_code (for scrub)
+    reg              rd_valid_q;       // rd_code holds a genuine fetched word
     integer i;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            for (i = 0; i < DEPTH; i = i + 1)
-                mem[i] <= {CODE_W{1'b0}};
-            rd_code <= {CODE_W{1'b0}};
-        end else begin
-            // Normal encoded write.
-            if (we)
-                mem[waddr] <= enc_code;
-            // Back-door raw-codeword write (fault injection / scrubber).
-            // Independent address: may coexist with a normal write elsewhere.
-            if (bd_we)
-                mem[bd_addr] <= bd_code;
-            // Synchronous read fetch (1-cycle latency).
-            if (re)
-                rd_code <= mem[raddr];
-        end
-    end
 
     //------------------------------------------------------------------
     // READ-path codec: decode the fetched codeword (pure combinational).
+    // Declared before the array block so the scrub write-back can consume
+    // dec_serr/dec_derr in the same clocked block.
     //------------------------------------------------------------------
     wire [DATA_W-1:0] dec_data;
     wire              dec_serr, dec_derr;
@@ -162,17 +171,79 @@ module ecc_mem_wrap #(
     );
 
     //------------------------------------------------------------------
-    // Register the decode results -> every output is a register.
+    // SCRUB-path codec: re-ENCODE the corrected payload -> clean codeword.
+    // For a single-bit error dec_data is the corrected payload, so scrub_code
+    // is the original clean codeword; writing it back heals the array bit.
     //------------------------------------------------------------------
+    wire [CODE_W-1:0] scrub_code;
+    wire [DATA_W-1:0] scr_data_unused;
+    wire              scr_serr_unused, scr_derr_unused;
+
+    ecc_secded #(.DATA_W(DATA_W)) u_scrub (
+        .data_in    (dec_data),
+        .code_out   (scrub_code),
+        .code_in    ({CODE_W{1'b0}}),
+        .data_out   (scr_data_unused),
+        .single_err (scr_serr_unused),
+        .double_err (scr_derr_unused)
+    );
+
+    // A scrub write-back is due this cycle iff the word currently in rd_code is
+    // a genuine fetch that decoded to a CORRECTABLE single error.
+    wire scrub_we = rd_valid_q & dec_serr & ~dec_derr;
+
     always @(posedge clk) begin
         if (rst) begin
-            rdata <= {DATA_W{1'b0}};
-            serr  <= 1'b0;
-            derr  <= 1'b0;
+            for (i = 0; i < DEPTH; i = i + 1)
+                mem[i] <= {CODE_W{1'b0}};
+            rd_code    <= {CODE_W{1'b0}};
+            rd_addr_q  <= {ADDR_W{1'b0}};
+            rd_valid_q <= 1'b0;
+        end else begin
+            // Track the in-flight read so the scrub write can target its addr.
+            rd_valid_q <= re;
+            if (re)
+                rd_addr_q <= raddr;
+            // Scrub write-back (lowest priority: an explicit we/bd_we to the
+            // same address this cycle overrides the heal).
+            if (scrub_we)
+                mem[rd_addr_q] <= scrub_code;
+            // Normal encoded write.
+            if (we)
+                mem[waddr] <= enc_code;
+            // Back-door raw-codeword write (fault injection / scrubber).
+            // Independent address: may coexist with a normal write elsewhere.
+            if (bd_we)
+                mem[bd_addr] <= bd_code;
+            // Synchronous read fetch (1-cycle latency).
+            if (re)
+                rd_code <= mem[raddr];
+        end
+    end
+
+    //------------------------------------------------------------------
+    // Register the decode results -> every output is a register.
+    //------------------------------------------------------------------
+    // A genuine read completes (decode result becomes valid) this cycle iff
+    // rd_valid_q is set; only then do the sticky flags accumulate.
+    wire read_serr = rd_valid_q & dec_serr;
+    wire read_derr = rd_valid_q & dec_derr;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            rdata       <= {DATA_W{1'b0}};
+            serr        <= 1'b0;
+            derr        <= 1'b0;
+            serr_sticky <= 1'b0;
+            derr_sticky <= 1'b0;
         end else begin
             rdata <= dec_data;
             serr  <= dec_serr;
             derr  <= dec_derr;
+            // Sticky latch: err_ack clears, but a new error the same cycle
+            // still latches (set dominates clear -> errors are never lost).
+            serr_sticky <= (serr_sticky & ~err_ack) | read_serr;
+            derr_sticky <= (derr_sticky & ~err_ack) | read_derr;
         end
     end
 

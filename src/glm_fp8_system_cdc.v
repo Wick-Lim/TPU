@@ -278,11 +278,48 @@ module glm_fp8_system_cdc #(
     output wire                          loader_in_valid
 );
     // ======================================================================
-    // Per-domain active-LOW resets for the cdc_async_fifo primitive (its reset
-    // convention is active-low, sampled synchronously in each clock).
+    // PER-DOMAIN RESET SYNCHRONIZERS (async-assert / sync-deassert).
+    //   The top-level host_rst / core_rst inputs are treated as ASYNC reset
+    //   REQUESTS (a real chip's power-on / SoC reset is asynchronous to each
+    //   recovered/PLL clock).  Each is fed through a reset_sync in ITS OWN
+    //   destination clock domain so that:
+    //     * ASSERT is asynchronous  -- the domain drops into reset the instant
+    //       the request goes high, even before its clock toggles;
+    //     * DEASSERT is synchronous -- the release walks STAGES flops on the
+    //       destination clock, so the reset the domain sees deasserts cleanly
+    //       (no reset-recovery metastability).
+    //   Active-HIGH polarity is preserved (die-wide convention).  Everything
+    //   internal to this wrapper uses the SYNCHRONIZED resets below; the raw
+    //   input pins feed ONLY the synchronizers.
+    //   Directed timing note (proven by test/reset_sync_tb.v property (b)):
+    //   after the async request releases, rst_out stays asserted for EXACTLY
+    //   STAGES destination-clock edges, then deasserts on the STAGES-th edge --
+    //   here STAGES=2, so host_rst_sync / core_rst_sync each deassert 2 edges
+    //   of their own clock after host_rst / core_rst fall.
     // ======================================================================
-    wire host_rst_n = ~host_rst;
-    wire core_rst_n = ~core_rst;
+    localparam integer RST_SYNC_STAGES = 2;
+
+    wire host_rst_sync;   // host_clk-domain reset, active-high, sync-deasserted
+    wire core_rst_sync;   // core_clk-domain reset, active-high, sync-deasserted
+
+    reset_sync #(.STAGES(RST_SYNC_STAGES)) u_host_rst_sync (
+        .clk    (host_clk),
+        .arst_in(host_rst),      // async reset request -> host_clk domain
+        .rst_out(host_rst_sync)
+    );
+    reset_sync #(.STAGES(RST_SYNC_STAGES)) u_core_rst_sync (
+        .clk    (core_clk),
+        .arst_in(core_rst),      // async reset request -> core_clk domain
+        .rst_out(core_rst_sync)
+    );
+
+    // ======================================================================
+    // Per-domain active-LOW resets for the cdc_async_fifo primitive (its reset
+    // convention is active-low, sampled synchronously in each clock).  Derived
+    // from the SYNCHRONIZED per-domain resets above.
+    // ======================================================================
+    wire host_rst_n = ~host_rst_sync;
+    wire core_rst_n = ~core_rst_sync;
 
     // ======================================================================
     // ============================ host_clk DOMAIN =========================
@@ -291,8 +328,8 @@ module glm_fp8_system_cdc #(
     // ======================================================================
     reg  start_d;
     always @(posedge host_clk) begin
-        if (host_rst) start_d <= 1'b0;
-        else          start_d <= start;
+        if (host_rst_sync) start_d <= 1'b0;
+        else               start_d <= start;
     end
     wire start_rise = start & ~start_d;
 
@@ -335,7 +372,7 @@ module glm_fp8_system_cdc #(
     assign req_rd_en = ~req_rd_empty & ~req_rd_d;
 
     always @(posedge core_clk) begin
-        if (core_rst) begin
+        if (core_rst_sync) begin
             req_rd_d       <= 1'b0;
             sys_start      <= 1'b0;
             sys_prompt_tok <= {TOKW{1'b0}};
@@ -372,7 +409,7 @@ module glm_fp8_system_cdc #(
         .DDR_TAG_W(DDR_TAG_W), .DDR_ROW_LAT(DDR_ROW_LAT), .DDR_RESP_QD(DDR_RESP_QD),
         .WL_KMAX(WL_KMAX), .WL_ADDR_W(WL_ADDR_W), .LOADER_KLEN(LOADER_KLEN)
     ) u_sys (
-        .clk(core_clk), .rst(core_rst),
+        .clk(core_clk), .rst(core_rst_sync),
         // host port -- now driven from the core-side request unpack / captured back
         .start(sys_start), .prompt_tok(sys_prompt_tok),
         .start_pos(sys_start_pos), .s_len(sys_s_len),
@@ -448,7 +485,7 @@ module glm_fp8_system_cdc #(
     assign tok_rd_en = ~tok_rd_empty & ~tok_rd_d;
 
     always @(posedge host_clk) begin
-        if (host_rst) begin
+        if (host_rst_sync) begin
             tok_rd_d  <= 1'b0;
             next_tok  <= {TOKW{1'b0}};
             tok_valid <= 1'b0;
@@ -473,7 +510,7 @@ module glm_fp8_system_cdc #(
     // ---- busy (level) 2-FF sync ----
     reg busy_s1, busy_s2;
     always @(posedge host_clk) begin
-        if (host_rst) begin
+        if (host_rst_sync) begin
             busy_s1 <= 1'b0;
             busy_s2 <= 1'b0;
         end else begin
@@ -485,7 +522,7 @@ module glm_fp8_system_cdc #(
     // ---- done toggle (core) ----
     reg done_tgl_c;
     always @(posedge core_clk) begin
-        if (core_rst)        done_tgl_c <= 1'b0;
+        if (core_rst_sync)   done_tgl_c <= 1'b0;
         else if (sys_done)   done_tgl_c <= ~done_tgl_c;
     end
 
@@ -493,7 +530,7 @@ module glm_fp8_system_cdc #(
     reg done_tgl_h1, done_tgl_h2, done_tgl_h3;
     wire done_edge = done_tgl_h3 ^ done_tgl_h2;
     always @(posedge host_clk) begin
-        if (host_rst) begin
+        if (host_rst_sync) begin
             done_tgl_h1 <= 1'b0;
             done_tgl_h2 <= 1'b0;
             done_tgl_h3 <= 1'b0;
@@ -513,7 +550,7 @@ module glm_fp8_system_cdc #(
     // ----------------------------------------------------------------------
     reg host_pending;
     always @(posedge host_clk) begin
-        if (host_rst) host_pending <= 1'b0;
+        if (host_rst_sync) host_pending <= 1'b0;
         else begin
             if (req_wr_en)       host_pending <= 1'b1;
             else if (done_edge)  host_pending <= 1'b0;
@@ -521,7 +558,7 @@ module glm_fp8_system_cdc #(
     end
 
     always @(posedge host_clk) begin
-        if (host_rst) begin
+        if (host_rst_sync) begin
             busy <= 1'b0;
             done <= 1'b0;
         end else begin

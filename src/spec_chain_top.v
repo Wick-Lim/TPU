@@ -43,6 +43,21 @@
 //   level ports (verbatim from spec_batched_top's m_* set, plus a t_* set per
 //   chain step or a shared muxed set) completes it.
 //
+// *** SEED CONVENTION INCONSISTENCY (documented here; NOT fixed in B3 -- B8) ***
+//   The chain is seeded with TWO DIFFERENT hidden-state conventions:
+//     * step 0   : h_chain[0] = u_main.h_state  -- the POST-final-RMSNorm hidden
+//                  state (the model's normalised output h).
+//     * step k>=1: h_chain[k] = u_mtp.h_mtp     -- the PRE-final-norm db_y decoder-
+//                  block state carried out of the prior chain step.
+//   So step 0's h_t is normalised while every later step's fed-back h_t is the raw
+//   (un-final-normed) db_y.  This is a SEED-scale mismatch: it perturbs the DRAFT
+//   distribution and hence K_eff (the effective accepted-prefix length / acceptance
+//   rate), NOT the spec==greedy safety property -- spec_decode_seq only ever commits
+//   the VERIFY model's own argmaxes (truth_vec), never a raw draft, so a mis-seeded
+//   draft can only be REJECTED, never wrongly committed.  Unifying the seed
+//   convention (feed step 0 the same pre-final-norm state, or re-norm the fed-back
+//   h_mtp) is deferred to the full promotion task B8; B3 leaves it as-is.
+//
 // DISCIPLINE: synchronous active-high reset; every output registered; no latch;
 //   no combinational loop; handshake-driven (each sub-unit launch waits its done).
 //============================================================================
@@ -122,6 +137,7 @@ module spec_chain_top #(
     parameter integer PROJ_NB    = (CK + BLK - 1) / BLK,
     // spec_decode_seq batch-interface widths
     parameter integer DKW        = (DRAFT_K <= 1) ? 1 : $clog2(DRAFT_K + 1),
+    parameter integer OCW        = $clog2(DRAFT_K + 2),   // 0..K+1 prefix count width
     // chain-step counter width
     parameter integer KW         = (DRAFT_K <= 1) ? 1 : $clog2(DRAFT_K)
 )(
@@ -364,6 +380,45 @@ module spec_chain_top #(
     );
 
     //========================================================================
+    // LOCAL longest-accepted-prefix (cursor advance only) -- ported verbatim
+    //   from spec_batched_top (~lines 294-324): the SAME function spec_decode_seq
+    //   uses, so cur_tok/cur_pos track the committed frontier (m_{p+1} = last
+    //   committed token; +p+1 positions advanced).  The chain always mints the
+    //   full DRAFT_K drafts, so n_draft is fixed at K here.
+    //   FIX (B3): the skeleton advanced cur_tok<=m_0 and cur_pos+=1 every pass,
+    //   which restarts a multi-pass run (num_passes>=2) INSIDE already-committed
+    //   tokens; this advances over the whole accepted prefix instead.
+    //========================================================================
+    function automatic [OCW-1:0] acc_prefix;
+        input [DRAFT_K*TOKW-1:0]     dv;
+        input [(DRAFT_K+1)*TOKW-1:0] tv;
+        input [OCW-1:0]              ndi;
+        integer       fj;
+        reg           fb;
+        reg [OCW-1:0] fp;
+        begin
+            fp = {OCW{1'b0}};
+            fb = 1'b0;
+            for (fj = 0; fj < DRAFT_K; fj = fj + 1) begin
+                if (!fb && (fj < ndi) &&
+                    (dv[fj*TOKW +: TOKW] == tv[fj*TOKW +: TOKW]))
+                    fp = fp + 1'b1;
+                else
+                    fb = 1'b1;
+            end
+            acc_prefix = fp;
+        end
+    endfunction
+
+    localparam [OCW-1:0] K_OCW = DRAFT_K[OCW-1:0];
+    wire [OCW-1:0]  pfx_w        = acc_prefix(draft_q, truth_q, K_OCW);   // p (0..K)
+    // next committed-frontier token = m_{p+1} = argmax row p
+    wire [TOKW-1:0] frontier_tok = truth_q[TOKW*pfx_w +: TOKW];
+    // position advance p+1 (zero-extended to POSW)
+    wire [POSW-1:0] pos_adv      = {{(POSW-OCW){1'b0}}, pfx_w}
+                                 + {{(POSW-1){1'b0}}, 1'b1};
+
+    //========================================================================
     // MASTER FSM  (four phases: MAIN -> CHAIN xK -> VERIFY -> FEED)
     //========================================================================
     localparam [2:0]
@@ -372,8 +427,10 @@ module spec_chain_top #(
         C_CHAIN  = 3'd2,    // run mtp_head_fp8 K times, chaining h_mtp
         C_VERIFY = 3'd3,    // run PE_M=K+1 batched verify -> m_0..m_K
         C_FEED   = 3'd4,    // pulse spec_decode_seq; advance cursor
-        C_DONE   = 3'd5;
+        C_DRAIN  = 3'd5,    // drain final pass's bonus commit beats
+        C_DONE   = 3'd6;
     reg [2:0] state;
+    reg [7:0] drain_cnt;    // drain the final pass's commit beats
 
     always @(posedge clk) begin
         if (rst) begin
@@ -392,6 +449,7 @@ module spec_chain_top #(
             slen_q      <= {(IDXW+1){1'b0}};
             mode_q      <= 1'b0;
             passes_left <= 16'h0;
+            drain_cnt   <= 8'd0;
             chain_k     <= {(KW+1){1'b0}};
             main_tok    <= {TOKW{1'b0}};
             ver_tok     <= {B*TOKW{1'b0}};
@@ -480,21 +538,33 @@ module spec_chain_top #(
             end
             //---------------------------------------------------------------- feed controller
             C_FEED: begin
-                // commit longest accepted prefix; advance cursor over frontier.
-                seq_verified <= truth_id[0];
+                // commit longest accepted prefix; advance cursor over the WHOLE
+                // accepted frontier (m_{p+1}, +p+1 positions) -- ported from
+                // spec_batched_top B_FEED so a multi-pass run no longer restarts
+                // inside already-committed tokens.
+                seq_verified <= frontier_tok;
                 seq_pass     <= 1'b1;
-                cur_tok      <= truth_id[0];
-                cur_pos      <= cur_pos + 1'b1;
-                pos_q        <= cur_pos + 1'b1;
+                cur_tok      <= frontier_tok;        // m_{p+1} (last committed token)
+                cur_pos      <= cur_pos + pos_adv;   // advance p+1 positions
+                pos_q        <= cur_pos + pos_adv;
                 passes_left  <= passes_left - 1'b1;
                 if (passes_left <= 16'h1) begin
-                    state <= C_DONE;
+                    drain_cnt <= 8'd0;
+                    state     <= C_DRAIN;
                 end else begin
                     // next pass: re-launch the main model on the new cursor
-                    main_tok   <= truth_id[0];
+                    main_tok   <= frontier_tok;
                     main_start <= 1'b1;
                     state      <= C_MAIN;
                 end
+            end
+            //---------------------------------------------------------------- drain
+            // The final pass_valid drains up to K bonus commit beats over the next
+            // p idle cycles; hold K+1 cycles so they all land before going idle
+            // (mirrors spec_batched_top B_DRAIN -- 'done' no longer races them).
+            C_DRAIN: begin
+                if (drain_cnt == DRAFT_K[7:0]) state <= C_DONE;
+                else drain_cnt <= drain_cnt + 8'd1;
             end
             //----------------------------------------------------------------
             C_DONE: begin

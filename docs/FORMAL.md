@@ -48,7 +48,7 @@ the step because the inductive hypothesis admits unreachable states; each harnes
 | `boot_loader` | `done` stable-once-raised + never-early | 8 | — |
 | `kv_cache_pager` | append/gather in-bounds + window invariants | 16 | — |
 | `spec_decode_seq` | token-accounting equality, per-cycle modular increment bounds, non-decreasing-except-wrap | 2 | strict (non-wrapping) monotonicity (32-bit counter wrap) |
-| `ddr5_xbar` | request-path routing safety (one-hot routing / banked select / ready coherence / payload integrity) | 12 | response-FIFO no-overflow, tag-issued |
+| `ddr5_xbar` | request-path routing safety (one-hot routing / banked select / ready coherence / payload integrity) **+ response-FIFO no-overflow/no-underflow (conservation form: `cnt[c]≤RESP_QD`, `inflight ≤ N_CH·RESP_QD`, no phantom emit)** | 12 | tag-issued |
 | `flash_xbar` | **per-channel-queue no-overflow `cnt[c]≤QDEPTH`, `outstanding ≤ N_CH·QDEPTH` (P3), `inflight ≤ outstanding`, no-underflow (P1a/P1b)** | 3 | tag-issued (P2) |
 
 **`flash_xbar` — how the internal counters are reached.** P3 / per-channel no-overflow are *not*
@@ -68,6 +68,8 @@ parsed as a bit-select). The committed RTL is untouched. Verified non-vacuous: p
 response are all reachable, so the bounds are tight), and a mutation (`outst[c]≤QDEPTH−1`) fails both
 BMC and induction (the probe is genuinely bound to a register that reaches QDEPTH). Minimal induction
 depth is **k=2** (k=1 fails); the target runs k=3 for margin.
+
+**`ddr5_xbar` response-FIFO lifted to UNBOUNDED.** The response-FIFO no-overflow/no-underflow (conservation form) is now proven UNBOUNDED by the same connect-bind trick (`test/formal/ddr5_xbar_ind_fv.v`, k=12): the harness's black-box `inflight` shadow is pinned to the DUT's own per-channel occupancy counters via `connect -set \dut_cnt0 \u_dut.cnt[0] ` with the strengthening set **S2** `cnt[c]≤RESP_QD` (self-inductive via the `mem_resp_ready=!full` enq gate and the `fifo_ne` grant gate) and **L_in** `inflight=Σ cnt[c]` (inductive by construction), giving `inflight ≤ N_CH·RESP_QD` (no overflow) and `deq_fire ⇒ inflight≥1` (no underflow); base case and induction step both pass, non-vacuous (`PROBE_FULL`/`PROBE_RESP`/`PROBE_ENQ` each yield a BMC counterexample, and tightening S2 to `cnt[c]≤RESP_QD−1` fails — the probe is genuinely bound to a register reaching RESP_QD). `tag-issued` stays BOUNDED (needs a FIFO-content data-invariant over the 2-D `$mem`, not connect-bindable).
 
 **`flash_xbar` P2 stays BOUNDED.** "`resp_valid ⇒ issued[resp_tag]`" holds under BMC (to ≥16) but is
 not inductive without a data-invariant over the FIFO **contents** ("every occupied slot holds an

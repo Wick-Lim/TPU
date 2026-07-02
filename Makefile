@@ -51,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi soc unittests cache-study formal formal-ind bitacc sim wave lint synth ppa clean
+.PHONY: all build test hazard axi soc unittests cache-study formal formal-ind bitacc sim wave lint synth synth-glm ppa clean
 
 all: test hazard unittests lint synth formal
 
@@ -187,6 +187,12 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_pslen_sim test/mla_attn_fp8_pslen_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "mla_attn_fp8(per-slen)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_pslen_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: mla_attn_fp8_pslen"; exit 1; }
+	@# mla_attn_fp8 sparse+per-row oracle (task B2): batched row === PE_M=1 reference on that row's
+	@# own (x,pos,s_len) with S_MAX>TOPK, + fetch-sharing (one weight/kc fetch per distinct key).
+	@# The distinct-x sparse compare is the pending-B6 oracle (guarded by SPARSE_XFAIL, default off).
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_sparse_perrow_sim test/mla_attn_fp8_sparse_perrow_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "mla_attn_fp8(sparse-perrow)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_sparse_perrow_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: mla_attn_fp8_sparse_perrow"; exit 1; }
 	@# glm_decoder_block_fp8: one full GLM-5.2-FP8 decoder layer (mla_attn_fp8 + moe_router_fp8 + swiglu_expert_fp8).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_decoder_block_fp8_sim test/glm_decoder_block_fp8_tb.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_decoder_block_fp8"; $(VVP) $(BUILD_DIR)/glm_decoder_block_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
@@ -220,7 +226,7 @@ unittests:
 	@printf '[%s] ' "glm_fp8_system"; $(VVP) $(BUILD_DIR)/glm_fp8_system_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: glm_fp8_system"; exit 1; }
 	@# glm_fp8_system_cdc: 2-clock wrapper (host/USB <-> compute via cdc_async_fifo) == standalone across async clocks.
-	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_fp8_system_cdc_sim test/glm_fp8_system_cdc_tb.v src/glm_fp8_system_cdc.v src/glm_fp8_system.v src/cdc_async_fifo.v src/glm_model_fp8.v src/ddr5_xbar.v src/weight_loader.v src/expert_cache_pf.v src/expert_cache_ctrl.v src/kv_cache_pager.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_fp8_system_cdc_sim test/glm_fp8_system_cdc_tb.v src/glm_fp8_system_cdc.v src/glm_fp8_system.v src/cdc_async_fifo.v src/reset_sync.v src/glm_model_fp8.v src/ddr5_xbar.v src/weight_loader.v src/expert_cache_pf.v src/expert_cache_ctrl.v src/kv_cache_pager.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_fp8_system_cdc"; $(VVP) $(BUILD_DIR)/glm_fp8_system_cdc_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: glm_fp8_system_cdc"; exit 1; }
 	@# expert_cache_ctrl: MoE expert-weight HBM cache controller (tag/LRU/miss-DMA), single-package system PoC.
@@ -460,14 +466,17 @@ endef
 # The TRAILING SPACE before each `;` is load-bearing: it terminates the escaped bracketed
 # id \u_dut.outst[0] (otherwise [0] is parsed as a bit-select of a non-existent wire).
 FLASH_IND_CONN := connect -set \dut_outst0 \u_dut.outst[0] ; connect -set \dut_outst1 \u_dut.outst[1] ; connect -set \dut_cnt0 \u_dut.cnt[0] ; connect -set \dut_cnt1 \u_dut.cnt[1] ;
+# ddr5_xbar response-FIFO proof (task C5) uses the same connect-bind trick to reach
+# the DUT's per-channel response-FIFO occupancy counters cnt[0..N_CH-1] (N_CH=2 slice).
+DDR5_IND_CONN := connect -set \dut_cnt0 \u_dut.cnt[0] ; connect -set \dut_cnt1 \u_dut.cnt[1] ;
 formal-ind:
 	@mkdir -p $(FV_DIR)
 	$(call run_kind,boot_loader,boot_loader_ind_fv,8)
 	$(call run_kind,kv_cache_pager,kv_cache_pager_ind_fv,16)
 	$(call run_kind,spec_decode_seq,spec_decode_seq_ind_fv,2)
-	$(call run_kind,ddr5_xbar,ddr5_xbar_ind_fv,12)
+	$(call run_kind,ddr5_xbar,ddr5_xbar_ind_fv,12,$(DDR5_IND_CONN))
 	$(call run_kind,flash_xbar,flash_xbar_ind_fv,3,$(FLASH_IND_CONN))
-	@echo "formal-ind: boot_loader done-gate proven UNBOUNDED; kv_cache_pager append/gather in-bounds + window invariants proven UNBOUNDED; spec_decode_seq token-accounting equality + per-cycle modular increment bounds + step-form (non-decreasing-except-wrap) monotonicity proven UNBOUNDED (k-induction K=2); ddr5_xbar request-path routing safety (exclusive one-hot routing / banked-channel selection / ready coherence / payload integrity) proven UNBOUNDED -- response-FIFO no-overflow/tag-issued stay BOUNDED (need internal cnt[]/rr, not referenceable in this yosys build); strict unsigned monotonicity stays BOUNDED (32-bit counter wrap); flash_xbar per-channel-queue no-overflow (cnt[c]<=QDEPTH) + outstanding<=N_CH*QDEPTH (P3) + inflight<=outstanding (P1a/P1b) proven UNBOUNDED via connect-bound internal counters (k-induction K=3) -- tag-issued (P2) stays BOUNDED (needs FIFO-content data-invariant; FIFO is a 2-D memory cell, not connect-bindable) -- see docs/FORMAL.md"
+	@echo "formal-ind: boot_loader done-gate proven UNBOUNDED; kv_cache_pager append/gather in-bounds + window invariants proven UNBOUNDED; spec_decode_seq token-accounting equality + per-cycle modular increment bounds + step-form (non-decreasing-except-wrap) monotonicity proven UNBOUNDED (k-induction K=2); ddr5_xbar request-path routing safety (exclusive one-hot routing / banked-channel selection / ready coherence / payload integrity) proven UNBOUNDED + response-FIFO no-overflow/underflow (cnt[c]<=RESP_QD conservation form, inflight<=CAP) proven UNBOUNDED via connect-bound internal cnt[] counters (task C5) -- tag-issued stays BOUNDED (FIFO-content data-invariant; the FIFO is a 2-D memory cell, not connect-bindable); strict unsigned monotonicity stays BOUNDED (32-bit counter wrap); flash_xbar per-channel-queue no-overflow (cnt[c]<=QDEPTH) + outstanding<=N_CH*QDEPTH (P3) + inflight<=outstanding (P1a/P1b) proven UNBOUNDED via connect-bound internal counters (k-induction K=3) -- tag-issued (P2) stays BOUNDED (needs FIFO-content data-invariant; FIFO is a 2-D memory cell, not connect-bindable) -- see docs/FORMAL.md"
 
 # Real-checkpoint bit-accuracy: prove glm_matmul_fp8 computes the GLM-5.2-FP8 FP8 contract exactly
 # as the real inference engine (argmax-preserving vs fp32-accumulate + float64 ground truth), and
@@ -503,6 +512,27 @@ lint:
 synth:
 	$(YOSYS) -q -p "read_verilog -sv -I src $(DESIGN); \
 	                hierarchy -top TPU -check; proc; opt; check -assert; stat"
+
+# ---- Whole-chip structural gate for the GLM-5.2-FP8 product top (task C1) ----
+# `synth` above gates only the legacy scalar TPU core.  This gate elaborates the
+# ENTIRE product hierarchy -- the 2-clock chip top `glm_fp8_system_cdc` and every
+# GLM compute + memory-system + CDC leaf beneath it -- and runs `check -assert`,
+# which FAILS (non-zero exit) on any unresolved hierarchy, combinational loop,
+# multiple driver, or inferred latch anywhere in the GLM datapath.  This is the
+# first structural sign-off of the actual product top (nothing gated it before).
+# `stat` prints the flattened gate-level cell count for the whole chip.
+GLM_CDC_SRCS := src/glm_fp8_system_cdc.v src/glm_fp8_system.v src/cdc_async_fifo.v \
+	src/reset_sync.v src/glm_model_fp8.v src/ddr5_xbar.v src/weight_loader.v \
+	src/expert_cache_pf.v src/expert_cache_ctrl.v src/kv_cache_pager.v \
+	src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v \
+	src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v \
+	src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v \
+	src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v \
+	src/glm_fp_pipe.v
+
+synth-glm:
+	$(YOSYS) -q -p "read_verilog -sv -I src $(GLM_CDC_SRCS); \
+	                hierarchy -top glm_fp8_system_cdc -check; proc; opt; check -assert; stat"
 
 # ---- PPA (area + timing) via yosys synth_ecp5 -----------------------------
 # For each tensor unit and the full TPU top we map to real Lattice ECP5 FPGA

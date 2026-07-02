@@ -389,8 +389,8 @@ module glm_model_fp8 #(
             fn_start    <= 1'b0;
             fn_x_in     <= {16*PE_M{1'b0}}; fn_x_valid <= 1'b0;
             fn_gamma_in <= {16*PE_M{1'b0}}; fn_g_valid <= 1'b0;
-            fn_ridx     <= {(DIMW+1){1'b0}};
-            fn_widx     <= {(DIMW+1){1'b0}};
+            // fn_ridx / fn_widx are owned by the final-norm beat-counter block
+            // below (single driver -- see the synth-glm driver-conflict note).
             mm_start    <= 1'b0; mm_in_valid <= 1'b0;
             mm_klen     <= {LMKW{1'b0}}; mm_a <= {16*PE_M{1'b0}};
             vtile       <= {VTW{1'b0}};
@@ -467,10 +467,12 @@ module glm_model_fp8 #(
                         for (ii=0; ii<MODEL_DIM; ii=ii+1)
                             xcur[rr][ii] <= db_y[16*(MODEL_DIM*rr + ii) +: 16];
                     if (lcur == (L[LAYW:0]-1'b1)) begin
-                        // last layer done -> final rmsnorm
+                        // last layer done -> final rmsnorm.  fn_ridx/fn_widx are
+                        // cleared by the beat-counter block on this fn_start pulse
+                        // (same one-cycle-later pattern as fn_gidx; the unit's
+                        // first fn_in_req comes strictly later, so the indices
+                        // are 0 before any beat is pulled).
                         fn_start <= 1'b1;
-                        fn_ridx  <= {(DIMW+1){1'b0}};
-                        fn_widx  <= {(DIMW+1){1'b0}};
                         state    <= M_FNORM;
                     end else begin
                         // advance to next layer
@@ -597,11 +599,24 @@ module glm_model_fp8 #(
     // final-norm pull beat counters (mirror the unit's beat order; LANES=1 so
     // beat == element index).  Reset at each fn_start.  SHARED (lockstep units).
     //========================================================================
+    // SINGLE DRIVER for fn_ridx/fn_widx/fn_gidx (this block only).  They were
+    // previously also reset/cleared from the main FSM block -- two always
+    // blocks driving the same regs.  Simulation happened to work (the writes
+    // never landed on the same cycle) but synthesis sees a multi-driven net:
+    // the first whole-chip `make synth-glm` gate flagged fn_ridx/fn_widx as
+    // driver-driver conflicts and yosys resolved them to CONSTANT 0 -- i.e.
+    // the netlist would stream the final norm entirely through element 0.
+    // All three counters now clear on the fn_start pulse (one cycle after the
+    // FSM raises it; the unit's first fn_in_req comes strictly later).
     always @(posedge clk) begin
         if (rst) begin
+            fn_ridx <= {(DIMW+1){1'b0}};
+            fn_widx <= {(DIMW+1){1'b0}};
             fn_gidx <= {(DIMW+1){1'b0}};
         end else begin
             if (fn_start) begin
+                fn_ridx <= {(DIMW+1){1'b0}};
+                fn_widx <= {(DIMW+1){1'b0}};
                 fn_gidx <= {(DIMW+1){1'b0}};
             end else begin
                 if (fn_in_req[0])  fn_ridx <= fn_ridx + 1'b1;

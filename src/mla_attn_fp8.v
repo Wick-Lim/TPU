@@ -1056,19 +1056,30 @@ module mla_attn_fp8 #(
                         sm_in_valid <= 1'b0;
                         if (sm_in_valid_able) begin
                             sm_in_valid <= 1'b1;
-                            // PER-ROW CAUSAL EXTENT mask: row r's logit for the key at
-                            //   selection position sf_feed_i is fed only while sf_feed_i
-                            //   is a valid selected key (< sel_cnt) AND within THAT row's
-                            //   own extent (< slen_r[r]); beyond either it is bf16 -inf
-                            //   (NEG_BIG) so softmax gives it zero mass.  In the dense
-                            //   DSA fallback (the documented PE_M>1 regime) sel_list[s]=s
-                            //   so sf_feed_i IS the key index -> row r attends exactly
-                            //   keys 0..slen_r-1.  PER_ROW_SLEN=0 -> slen_r == sel_cnt for
-                            //   every row -> the extra term never fires (byte-identical).
+                            // PER-ROW CAUSAL EXTENT mask: selection slot sf_feed_i holds
+                            //   the score for the ACTUAL key index sel_list[sf_feed_i]
+                            //   (scores/probs/vstore are all indexed by SELECTION SLOT --
+                            //   see K_SCORE).  Row r's logit for that slot is fed only
+                            //   while the slot is a valid selected key (< sel_cnt) AND the
+                            //   slot's ACTUAL key index sel_list[sf_feed_i] is within THAT
+                            //   row's own causal extent (< slen_r[r]); beyond either it is
+                            //   bf16 -inf (NEG_BIG) so softmax gives it zero mass.  The
+                            //   extent test MUST use the actual key index (sel_list), not
+                            //   the slot, because in the SPARSE path (S>TOPK) slot != key.
+                            //   No-op guarantees:
+                            //     * Dense DSA fallback (the documented PE_M>1 regime):
+                            //       sel_list[s]=s so sel_list[sf_feed_i]==sf_feed_i ->
+                            //       byte-identical to the prior slot-based compare.
+                            //     * PER_ROW_SLEN=0: slen_r[r]==s_reg and every selected key
+                            //       index is < s_reg (DSA only selects keys 0..s_reg-1), so
+                            //       the extent term is always true and never fires -> the
+                            //       mask reduces to (sf_feed_i < sel_cnt) (byte-identical).
+                            //   (When sf_feed_i>=TOPK, sel_list[] read is out-of-range/X but
+                            //    sf_feed_i<sel_cnt is already false, and 1'b0 && X == 1'b0.)
                             for (rr=0; rr<PE_M; rr=rr+1)
                                 sm_x_in[16*rr +: 16] <=
                                     ((sf_feed_i < sel_cnt) &&
-                                     (sf_feed_i < slen_r[(IDXW+1)*rr +: (IDXW+1)])) ?
+                                     (sel_list[sf_feed_i[IDXW-1:0]] < slen_r[(IDXW+1)*rr +: (IDXW+1)])) ?
                                        scores[rr][sf_head[$clog2(H_HEADS)-1:0]][sf_feed_i[IDXW-1:0]]
                                      : NEG_BIG;
                             sf_feed_i   <= sf_feed_i + 1'b1;
