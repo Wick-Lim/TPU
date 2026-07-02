@@ -150,6 +150,23 @@ module mla_attn_fp8 #(
     //   the SPARSE regime (max causal extent > TOPK) pre-fetches / scores; the DENSE
     //   fallback (S<=TOPK) never pulls keys, so this is a no-op there for any value.
     parameter integer DSA_REAL_IDX = 0,
+    // VSTORE_RAM=1 (default): the attention V-scratch (vstore) and per-row score
+    //   scratch (scores) synthesize as INFERRED MEMORIES (BRAM) instead of a giant
+    //   flip-flop array -- the B7 follow-up toward realizing large SWIN.
+    //     * vstore_mem : DEPTH=SWIN, WIDTH=HV*16 -- ONE wide word per UNION SLOT
+    //       packing every head*dim lane of that key's V.  The K_UV store is a SINGLE
+    //       synchronous write port (one word/cycle); the CX_ACC context FMA reads the
+    //       word (async) and part-selects lane (head*V_DIM+dim).  DEPTH scales to the
+    //       top-K window (SWIN), not S_MAX.
+    //     * scores_mem : flat DEPTH=PE_M*H_HEADS*SWIN x 16b, addr (row,head,slot).
+    //   WHY IT INFERS AS RAM (and the flop form does not): the ONLY thing that forced
+    //   the 3-D unpacked array to flops was the BULK SYNCHRONOUS RESET clearing every
+    //   location each rst (yosys lowers such a memory to registers).  Here the reset
+    //   is DROPPED: the mems are init-0 (sim) and EVERY read slot is written before it
+    //   is used -- masked padding reads multiply by probs==+0.0 (fp32_mul(0,x)->+0),
+    //   so the datapath stays BYTE-IDENTICAL to the flop form.  =0: the original
+    //   fully-parallel, reset-cleared flop arrays (safe non-memory fallback).
+    parameter integer VSTORE_RAM = 1,
     // ---- derived (do NOT override) ----
     parameter integer QK_DIM    = NOPE + ROPE,
     parameter integer IDXW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
@@ -286,9 +303,23 @@ module mla_attn_fp8 #(
     //   SLOT (0..u_cnt-1 <= SWIN-1), NOT the raw key (0..S_MAX-1).  scores/vstore
     //   are written at union slot ksel and read via rowslot2union[row][row-slot];
     //   probs stays row-slot-indexed.  All three shrink from S_MAX to SWIN.
+    // ---- RAM form (VSTORE_RAM=1): inferred memories, see the VSTORE_RAM header ----
+    localparam integer VMEMW = HV*16;                  // vstore packed word: all heads*dims of one key
+    localparam integer SCDEP = PE_M*H_HEADS*SWIN;      // scores flat depth (row,head,slot)
+    reg [VMEMW-1:0] vstore_mem [0:SWIN-1];             // [union slot] -> {head,dim} V lanes (RAM)
+    reg [15:0]      scores_mem [0:SCDEP-1];            // [(row*H_HEADS+head)*SWIN+slot]     (RAM)
+    reg [VMEMW-1:0] vword;                             // combinational V-pack temp        (RAM write)
+    // ---- flop form (VSTORE_RAM=0): original fully-parallel, reset-cleared arrays ----
     reg [15:0] scores    [0:PE_M-1][0:H_HEADS-1][0:SWIN-1];            // per row, UNION-SLOT-indexed
     reg [15:0] vstore    [0:H_HEADS-1][0:SWIN-1][0:V_DIM-1];           // SHARED (key V), UNION-SLOT-indexed
     reg [15:0] probs     [0:PE_M-1][0:H_HEADS-1][0:SWIN-1];            // per row, SLOT-indexed
+    // RAM mems are init-0 (sim) so unwritten slots read 0 exactly like the pre-change
+    //   reset-to-0 first run; every used slot is written before read (byte-identical).
+    integer vinit_i;
+    initial begin
+        for (vinit_i=0; vinit_i<SWIN;  vinit_i=vinit_i+1) vstore_mem[vinit_i] = {VMEMW{1'b0}};
+        for (vinit_i=0; vinit_i<SCDEP; vinit_i=vinit_i+1) scores_mem[vinit_i] = 16'h0;
+    end
     reg [15:0] ctx       [0:PE_M-1][0:HV-1];                           // per row (O concat)
     reg [15:0] outbuf    [0:PE_M-1][0:MODEL_DIM-1];                    // per row
 
@@ -758,13 +789,19 @@ module mla_attn_fp8 #(
                 for (s_i=0; s_i<HV;       s_i=s_i+1) ctx[rr][s_i]<=16'h0;
                 for (h_i=0; h_i<H_HEADS;  h_i=h_i+1)
                     for (s_i=0; s_i<SWIN; s_i=s_i+1) begin
-                        scores[rr][h_i][s_i]<=16'h0; probs[rr][h_i][s_i]<=16'h0;
+                        // RAM form: scores is an inferred memory (init-0, written
+                        //   before read) -- NO bulk reset (a bulk clear forces flops).
+                        if (!VSTORE_RAM) scores[rr][h_i][s_i]<=16'h0;
+                        probs[rr][h_i][s_i]<=16'h0;
                     end
             end
             for (s_i=0; s_i<KV_LORA;  s_i=s_i+1) begin ckv_key[s_i]<=16'h0; ckv_n[s_i]<=16'h0; end
             for (s_i=0; s_i<ROPE;     s_i=s_i+1) krope_j[s_i]<=16'h0;
             for (s_i=0; s_i<HNOPE;    s_i=s_i+1) knope_j[s_i]<=16'h0;
             for (s_i=0; s_i<HV;       s_i=s_i+1) v_j[s_i]<=16'h0;
+            // RAM form: vstore is an inferred memory (init-0, written before read) --
+            //   NO bulk reset (a bulk parallel clear is what forces the flop array).
+            if (!VSTORE_RAM)
             for (h_i=0; h_i<H_HEADS;  h_i=h_i+1)
                 for (s_i=0; s_i<SWIN; s_i=s_i+1)
                     for (d_i=0; d_i<V_DIM; d_i=d_i+1) vstore[h_i][s_i][d_i]<=16'h0;
@@ -1201,10 +1238,19 @@ module mla_attn_fp8 #(
                         if (gv_done) begin
                             // store V at the UNION SLOT ksel (SWIN-sized scratch); each
                             //   row later reads its selected keys' V via rowslot2union.
-                            for (h_i=0; h_i<H_HEADS; h_i=h_i+1)
-                                for (d_i=0; d_i<V_DIM; d_i=d_i+1)
-                                    vstore[h_i][ksel[SWINW-1:0]][d_i]
-                                        <= v_j[h_i*V_DIM + d_i];
+                            if (VSTORE_RAM) begin
+                                // RAM form: pack ALL heads*dims of this key's V into ONE
+                                //   wide word and store it at slot ksel -> a SINGLE
+                                //   synchronous write port, one word/cycle (BRAM).
+                                for (d_i=0; d_i<HV; d_i=d_i+1)
+                                    vword[d_i*16 +: 16] = v_j[d_i];
+                                vstore_mem[ksel[SWINW-1:0]] <= vword;
+                            end else begin
+                                for (h_i=0; h_i<H_HEADS; h_i=h_i+1)
+                                    for (d_i=0; d_i<V_DIM; d_i=d_i+1)
+                                        vstore[h_i][ksel[SWINW-1:0]][d_i]
+                                            <= v_j[h_i*V_DIM + d_i];
+                            end
                             gv_head <= {$clog2(H_HEADS+1){1'b0}};
                             kst     <= K_SCORE;
                         end
@@ -1223,8 +1269,13 @@ module mla_attn_fp8 #(
                         // store each row's q.K score at the UNION SLOT ksel (SWIN scratch).
                         if (mm_out_valid && gv_st==GV_WAIT)
                             for (rr=0; rr<PE_M; rr=rr+1)
-                                scores[rr][gv_head[$clog2(H_HEADS)-1:0]][ksel[SWINW-1:0]]
-                                    <= mm_c[16*(rr*PE_N) +:16];
+                                if (VSTORE_RAM)
+                                    scores_mem[(rr*H_HEADS + gv_head[$clog2(H_HEADS)-1:0])*SWIN
+                                               + ksel[SWINW-1:0]]
+                                        <= mm_c[16*(rr*PE_N) +:16];
+                                else
+                                    scores[rr][gv_head[$clog2(H_HEADS)-1:0]][ksel[SWINW-1:0]]
+                                        <= mm_c[16*(rr*PE_N) +:16];
                         if (gv_done) begin
                             if (gv_head == H_HEADS[$clog2(H_HEADS+1)-1:0]-1'b1) begin
                                 gv_score <= 1'b0;
@@ -1280,8 +1331,12 @@ module mla_attn_fp8 #(
                             for (rr=0; rr<PE_M; rr=rr+1)
                                 sm_x_in[16*rr +: 16] <=
                                     (sf_feed_i < sel_cnt_r[rr]) ?
-                                       scores[rr][sf_head[$clog2(H_HEADS)-1:0]]
-                                             [rowslot2union[rr][sf_feed_i[TKW-1:0]]]
+                                       (VSTORE_RAM ?
+                                          scores_mem[(rr*H_HEADS
+                                                      + sf_head[$clog2(H_HEADS)-1:0])*SWIN
+                                                     + rowslot2union[rr][sf_feed_i[TKW-1:0]]]
+                                        : scores[rr][sf_head[$clog2(H_HEADS)-1:0]]
+                                                [rowslot2union[rr][sf_feed_i[TKW-1:0]]])
                                      : NEG_BIG;
                             sf_feed_i   <= sf_feed_i + 1'b1;
                             if (sf_feed_i == SWIN[IDXW:0]-1'b1)
@@ -1342,9 +1397,16 @@ module mla_attn_fp8 #(
                             ctx_acc[rr] <= fp32_add(ctx_acc[rr],
                                          fp32_mul(
                                            bf16_to_fp32(probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[SWINW-1:0]]),
-                                           bf16_to_fp32(vstore[cx_head[$clog2(H_HEADS)-1:0]]
-                                                              [rowslot2union[rr][cx_s[TKW-1:0]]]
-                                                              [cx_d[$clog2(V_DIM)-1:0]])));
+                                           // RAM form: read the packed slot word, part-select
+                                           //   lane (head*V_DIM+dim) -- same V value the flop
+                                           //   array held (vstore[head][slot][dim]).
+                                           bf16_to_fp32(VSTORE_RAM ?
+                                             vstore_mem[rowslot2union[rr][cx_s[TKW-1:0]]]
+                                                       [(cx_head[$clog2(H_HEADS)-1:0]*V_DIM
+                                                         + cx_d[$clog2(V_DIM)-1:0])*16 +: 16]
+                                           : vstore[cx_head[$clog2(H_HEADS)-1:0]]
+                                                   [rowslot2union[rr][cx_s[TKW-1:0]]]
+                                                   [cx_d[$clog2(V_DIM)-1:0]])));
                         if (cx_s == u_cnt - 1'b1) cxst <= CX_STORE;
                         else cx_s <= cx_s + 1'b1;
                     end
