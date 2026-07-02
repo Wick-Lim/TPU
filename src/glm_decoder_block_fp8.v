@@ -391,10 +391,29 @@ module glm_decoder_block_fp8 #(
     // all PE_M rows).  Widths: dense grp/k are the WIDE family (FF_GWD/FF_KWD >=
     // moe's), so the moe fields zero-extend.  FP8 col/scale responses are width-
     // shared (same TN) -- dense uses all FF_NB_D scale K-blocks, moe slices low FF_NB_M.
+    // CONFIG GUARD (task B4 followup): the zero-extensions below assume the dense
+    // FFN is at least as wide as the MoE FFN (FF_GWD >= FF_GWM, FF_KWD >= FF_KWM),
+    // i.e. INTER_DENSE >= INTER_MOE.  At the real GLM-5.2 config this holds
+    // (12288 >= 2048).  An INTER_MOE > INTER_DENSE misconfig would make the
+    // {(FF_GWD-FF_GWM){1'b0}} replication count NEGATIVE and silently produce a
+    // malformed netlist -- fail LOUDLY instead of silently.
+    initial begin
+        if (FF_GWM > FF_GWD)
+            $fatal(1, "glm_decoder_block_fp8: FF_GWM(%0d) > FF_GWD(%0d) -- MoE FFN wider than dense; fw_grp zero-extension requires INTER_DENSE >= INTER_MOE", FF_GWM, FF_GWD);
+        if (FF_KWM > FF_KWD)
+            $fatal(1, "glm_decoder_block_fp8: FF_KWM(%0d) > FF_KWD(%0d) -- MoE FFN wider than dense; fw_k zero-extension requires INTER_DENSE >= INTER_MOE", FF_KWM, FF_KWD);
+    end
+
     assign fw_req = mode_q ? em_wreq : ed_wreq;
     assign fw_sel = mode_q ? em_wsel : ed_wsel;
-    assign fw_grp = mode_q ? {{(FF_GWD-FF_GWM){1'b0}}, em_wgrp} : ed_wgrp;
-    assign fw_k   = mode_q ? {{(FF_KWD-FF_KWM){1'b0}}, em_wk}   : ed_wk;
+    // Clamp the zero-extension count to >= 0 so a misconfig cannot produce a
+    // NEGATIVE replication (an iverilog elab error / a yosys huge-unsigned wrap);
+    // for every valid config (FF_GWD >= FF_GWM) this equals FF_GWD-FF_GWM exactly
+    // -> byte-identical.  The initial-block guard above $fatals with a clear msg.
+    localparam integer FF_GXT = (FF_GWD > FF_GWM) ? (FF_GWD - FF_GWM) : 0;
+    localparam integer FF_KXT = (FF_KWD > FF_KWM) ? (FF_KWD - FF_KWM) : 0;
+    assign fw_grp = mode_q ? {{FF_GXT{1'b0}}, em_wgrp} : ed_wgrp;
+    assign fw_k   = mode_q ? {{FF_KXT{1'b0}}, em_wk}   : ed_wk;
 
     //========================================================================
     // FFN combine accumulator (MoE): facc[r][d] += gate * y[r][d] (fp32) per row;
