@@ -133,6 +133,23 @@ module glm_fp8_system #(
     parameter integer WL_KMAX     = 256,    // max K the loader can stream
     parameter integer WL_ADDR_W   = 24,     // loader staging-memory address width
     parameter integer LOADER_KLEN = MODEL_DIM, // representative tile K length (<= WL_KMAX)
+    // ---- weight-decompression (die-side Flash-BW lever; §DECOMP) ----
+    //   0 = OFF: the wl_mem backing image is the RAW weight-word stream, fed to
+    //            weight_loader unchanged (BYTE-IDENTICAL to the pre-DECOMP module).
+    //   1 = weight_decomp (order-0 canonical Huffman): the wl_mem backing image is
+    //            the LOSSLESSLY-COMPRESSED weight-word byte stream; it is streamed
+    //            through weight_decomp, the decoded FP8 bytes are re-assembled into
+    //            WL_DATA_W words in the loader's sequential read order, and the
+    //            loader (hence the observable FP8 code beats) consumes DECOMPRESSED
+    //            codes from that reconstruction buffer.
+    parameter integer DECOMP      = 0,
+    parameter integer WD_MAXLEN   = 15,     // weight_decomp: max canonical code length
+    parameter integer WD_SYMW     = 9,      // weight_decomp: symbol width (0..256)
+    parameter integer WD_COUNTW   = 10,     // weight_decomp: per-length count width
+    parameter integer WD_AW       = 9,      // weight_decomp: table load addr width
+    parameter integer WD_BUFW     = 32,     // weight_decomp: bit-buffer width
+    parameter integer WD_EOB_SYM  = 256,    // weight_decomp: end-of-block symbol
+    parameter integer RECON_DEPTH = 2048,   // decompressed-word reconstruction RAM depth
     // ====================================================================
     // derived (do NOT override) -- mirror glm_model_fp8's port-width derivations
     // ====================================================================
@@ -275,6 +292,15 @@ module glm_fp8_system #(
     output wire                          wl_mem_en,
     output wire [WL_ADDR_W-1:0]          wl_mem_addr,
     input  wire [WL_DATA_W-1:0]          wl_mem_data,
+
+    //========================== weight-decomp table load (DECOMP>=1 only) ===
+    //   Loads the canonical-Huffman tables into the internal weight_decomp.
+    //   UNUSED when DECOMP==0 (the decompressor is not elaborated), so the
+    //   pre-DECOMP behaviour is byte-identical and these may be left unconnected.
+    input  wire                          decomp_tbl_we,
+    input  wire                          decomp_tbl_sel,   // 1=symbol_table, 0=count_table
+    input  wire [WD_AW-1:0]              decomp_tbl_addr,
+    input  wire [WD_COUNTW-1:0]          decomp_tbl_wdata,
 
     //========================== observability ===============================
     output wire [TOKW-1:0]               argmax_o,
@@ -579,20 +605,164 @@ module glm_fp8_system #(
     wire [WL_SCALE_W-1:0]      wl_w_scale;
     wire                       wl_done;
 
+    // ---- weight_loader <-> backing-store nets (muxed by §DECOMP below) ----
+    //   DECOMP==0 : these connect straight through to the wl_mem port (raw image).
+    //   DECOMP>=1 : ldr_load is released after decompression fills the recon RAM,
+    //               ldr_mem_data is the reconstruction-RAM read (latency-1), and
+    //               the wl_mem port instead pulls the COMPRESSED byte stream.
+    wire                       ldr_load;
+    wire                       ldr_mem_en;
+    wire [WL_ADDR_W-1:0]       ldr_mem_addr;
+    wire [WL_DATA_W-1:0]       ldr_mem_data;
+
     weight_loader #(
         .PE_N(WL_PE_N), .KMAX(WL_KMAX), .BLK(WL_BLK), .ADDR_W(WL_ADDR_W)
     ) u_loader (
         .clk(clk), .rst(rst),
-        .load(mdl_start),
+        .load(ldr_load),
         .desc_base({WL_ADDR_W{1'b0}}),
         .desc_klen(LOADER_KLEN[WL_KW-1:0]),
         .desc_nblk({{(WL_BKW-1){1'b0}}, 1'b1}),    // one [128,128] block
-        .mem_en(wl_mem_en), .mem_addr(wl_mem_addr), .mem_data(wl_mem_data),
+        .mem_en(ldr_mem_en), .mem_addr(ldr_mem_addr), .mem_data(ldr_mem_data),
         .mm_start(wl_mm_start), .mm_k_len(wl_k_len),
         .mm_w_row(loader_w_row), .mm_w_scale(wl_w_scale),
         .mm_in_valid(loader_in_valid),
         .busy(loader_busy), .done(wl_done)
     );
+
+    //========================================================================
+    // 7b) WEIGHT REFILL PATH -- raw (DECOMP==0) vs. on-chip decompressed (DECOMP>=1)
+    //========================================================================
+    generate
+    if (DECOMP == 0) begin : g_wpath
+        // -------- RAW: pass the loader's pulls straight to the wl_mem port ------
+        assign ldr_load    = mdl_start;
+        assign wl_mem_en   = ldr_mem_en;
+        assign wl_mem_addr = ldr_mem_addr;
+        assign ldr_mem_data = wl_mem_data;
+    end else begin : g_wpath
+        // -------- COMPRESSED backing image -> weight_decomp -> recon RAM --------
+        localparam integer RAW   = (RECON_DEPTH <= 1) ? 1 : $clog2(RECON_DEPTH);
+        localparam integer NBYTE = WL_DATA_W / 8;   // decoded bytes per staging word
+
+        // weight_decomp handshake nets
+        reg  [7:0]            wd_in_byte;
+        reg                   wd_in_valid;
+        wire                  wd_in_ready;
+        wire [7:0]            wd_out_byte;
+        wire                  wd_out_valid;
+        wire                  wd_eob;
+
+        // compressed-byte fetch from the wl_mem port (registered, latency-1)
+        reg  [WL_ADDR_W-1:0]  cmp_addr;
+        reg                   rd_pending;
+        reg  [7:0]            hold_byte;
+        reg                   hold_valid;
+        reg                   wd_active;    // a decode block is in progress
+
+        wire want_byte = wd_active & wd_in_ready & ~hold_valid & ~rd_pending & ~wd_eob;
+
+        assign wl_mem_en   = want_byte;
+        assign wl_mem_addr = cmp_addr;
+
+        always @* begin
+            wd_in_byte  = hold_byte;
+            wd_in_valid = hold_valid;
+        end
+
+        always @(posedge clk) begin
+            if (rst) begin
+                cmp_addr   <= {WL_ADDR_W{1'b0}};
+                rd_pending <= 1'b0;
+                hold_byte  <= 8'h00;
+                hold_valid <= 1'b0;
+                wd_active  <= 1'b0;
+            end else begin
+                if (rd_pending) begin                // returned byte lands now
+                    hold_byte  <= wl_mem_data[7:0];
+                    hold_valid <= 1'b1;
+                    rd_pending <= 1'b0;
+                end
+                if (want_byte) begin                 // issue the next fetch
+                    rd_pending <= 1'b1;
+                    cmp_addr   <= cmp_addr + 1'b1;
+                end
+                if (wd_in_valid & wd_in_ready)       // decomp consumed the held byte
+                    hold_valid <= 1'b0;
+                if (wd_eob) wd_active <= 1'b0;        // block finished
+                if (mdl_start) begin                 // (re)start on each compute launch
+                    cmp_addr   <= {WL_ADDR_W{1'b0}};
+                    rd_pending <= 1'b0;
+                    hold_valid <= 1'b0;
+                    wd_active  <= 1'b1;
+                end
+            end
+        end
+
+        weight_decomp #(
+            .MAXLEN(WD_MAXLEN), .SYMW(WD_SYMW), .COUNTW(WD_COUNTW),
+            .AW(WD_AW), .BUFW(WD_BUFW), .EOB_SYM(WD_EOB_SYM)
+        ) u_wdecomp (
+            .clk(clk), .rst(rst),
+            .tbl_we(decomp_tbl_we), .tbl_sel(decomp_tbl_sel),
+            .tbl_addr(decomp_tbl_addr), .tbl_wdata(decomp_tbl_wdata),
+            .start(mdl_start),
+            .in_byte(wd_in_byte), .in_valid(wd_in_valid), .in_ready(wd_in_ready),
+            .out_byte(wd_out_byte), .out_valid(wd_out_valid),
+            .out_ready(1'b1), .eob(wd_eob)
+        );
+
+        // reassemble decoded FP8 bytes (LE) into WL_DATA_W words; write recon RAM
+        reg  [WL_DATA_W-1:0]  recon [0:RECON_DEPTH-1];
+        reg  [RAW-1:0]        word_idx;
+        reg  [1:0]            byte_lane;
+        reg  [WL_DATA_W-1:0]  word_acc;
+        reg                   recon_ready;
+        reg                   recon_ld_pulse;
+        reg  [WL_DATA_W-1:0]  recon_rd;
+
+        always @(posedge clk) begin
+            if (rst) begin
+                word_idx       <= {RAW{1'b0}};
+                byte_lane      <= 2'd0;
+                word_acc       <= {WL_DATA_W{1'b0}};
+                recon_ready    <= 1'b0;
+                recon_ld_pulse <= 1'b0;
+            end else begin
+                recon_ld_pulse <= 1'b0;
+                if (mdl_start) begin
+                    word_idx    <= {RAW{1'b0}};
+                    byte_lane   <= 2'd0;
+                    word_acc    <= {WL_DATA_W{1'b0}};
+                    recon_ready <= 1'b0;
+                end else begin
+                    if (wd_out_valid) begin
+                        word_acc[8*byte_lane +: 8] <= wd_out_byte;
+                        if (byte_lane == (NBYTE-1)) begin
+                            recon[word_idx] <= { wd_out_byte, word_acc[8*(NBYTE-1)-1:0] };
+                            word_idx  <= word_idx + 1'b1;
+                            byte_lane <= 2'd0;
+                        end else begin
+                            byte_lane <= byte_lane + 2'd1;
+                        end
+                    end
+                    // release the loader one cycle after EOB (final word committed)
+                    if (wd_eob && !recon_ready) begin
+                        recon_ready    <= 1'b1;
+                        recon_ld_pulse <= 1'b1;
+                    end
+                end
+            end
+        end
+
+        // latency-1 reconstruction-RAM read serving the loader's sequential pulls
+        always @(posedge clk)
+            recon_rd <= recon[ldr_mem_addr[RAW-1:0]];
+
+        assign ldr_load     = recon_ld_pulse;
+        assign ldr_mem_data = recon_rd;
+    end
+    endgenerate
 
     always @(posedge clk) begin
         if (rst) begin
