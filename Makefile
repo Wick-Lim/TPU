@@ -467,6 +467,20 @@ define run_bmc   # $(1)=dut name  $(2)=extra read deps  $(3)=extra yosys (e.g. c
 	    || { echo "FAILED(BMC counterexample): $(1)"; tail -20 $(FV_DIR)/$(1)_fv_bmc.log; exit 1; }
 endef
 
+# Named-harness BMC (harness basename != dut name, and a custom read-source list).
+# Used for kv_cache_pager_ecc_fv (proves the ECC=1 lane-SECDED ring datapath).
+define run_bmc_named   # $(1)=harness basename  $(2)=read sources  $(3)=bound K
+	@yosys -p "read_verilog -sv -formal -I src $(2) test/formal/$(1).v; \
+	          prep -top $(1) -flatten; memory_map; async2sync; chformal -lower; \
+	          write_smt2 -wires $(FV_DIR)/$(1).smt2" > $(FV_DIR)/$(1)_build.log 2>&1 \
+	    || { echo "FAILED(build): $(1)"; cat $(FV_DIR)/$(1)_build.log; exit 1; }
+	@test `grep -ic assert $(FV_DIR)/$(1).smt2` -gt 0 \
+	    || { echo "FAILED(vacuous: 0 assertions): $(1)"; exit 1; }
+	@yosys-smtbmc -s z3 -t $(3) $(FV_DIR)/$(1).smt2 > $(FV_DIR)/$(1)_bmc.log 2>&1 \
+	    && printf '[formal %-20s] PASSED  K=%s  (%s asserts)\n' "$(1)" "$(3)" "`grep -ic assert $(FV_DIR)/$(1).smt2`" \
+	    || { echo "FAILED(BMC counterexample): $(1)"; tail -20 $(FV_DIR)/$(1)_bmc.log; exit 1; }
+endef
+
 formal:
 	@mkdir -p $(FV_DIR)
 	$(call run_bmc,ddr5_xbar,,,12)
@@ -475,7 +489,10 @@ formal:
 	$(call run_bmc,spec_decode_seq,,,20)
 	$(call run_bmc,kv_cache_pager,,,16)
 	$(call run_bmc,expert_cache_pf,src/expert_cache_ctrl.v,chparam -set PF_ENABLE 0 expert_cache_pf_fv;,20)
-	@echo "formal: all 5 controllers BMC-proven (no counterexample); see docs/FORMAL.md for bounds + coverage"
+	@# kv_cache_pager ECC=1 datapath (task C6-full followup): the lane-SECDED ring preserves
+	@# encode-decode identity + window/in-bounds + no-false-alarm (single-lane; see harness header).
+	$(call run_bmc_named,kv_cache_pager_ecc_fv,src/kv_cache_pager.v src/ecc_secded.v,12)
+	@echo "formal: 5 controllers + the ECC=1 pager datapath BMC-proven (no counterexample); see docs/FORMAL.md"
 
 # UNBOUNDED proof via temporal k-INDUCTION (yosys-smtbmc -i): base case + induction
 # step => the asserts hold on ALL reachable states, not just the first K cycles.
