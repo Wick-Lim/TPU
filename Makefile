@@ -240,6 +240,11 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_fp8_system_decomp_sim test/glm_fp8_system_decomp_tb.v src/glm_fp8_system.v src/weight_decomp.v src/glm_model_fp8.v src/ddr5_xbar.v src/weight_loader.v src/expert_cache_pf.v src/expert_cache_ctrl.v src/kv_cache_pager.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_fp8_system(decomp)"; $(VVP) $(BUILD_DIR)/glm_fp8_system_decomp_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: glm_fp8_system_decomp"; exit 1; }
+	@# glm_fp8_system(LOOPBACK=1) (task C8-full): the die's aw_col FP8 lanes sourced from the
+	@# ddr5_xbar returned read data (loop closed) == the combinational-stub token, bit-exact.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_fp8_system_loopback_sim test/glm_fp8_system_loopback_tb.v src/glm_fp8_system.v src/weight_decomp.v src/glm_model_fp8.v src/ddr5_xbar.v src/weight_loader.v src/expert_cache_pf.v src/expert_cache_ctrl.v src/kv_cache_pager.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
+	@printf '[%s] ' "glm_fp8_system(loopback)"; $(VVP) $(BUILD_DIR)/glm_fp8_system_loopback_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: glm_fp8_system_loopback"; exit 1; }
 	@# glm_fp8_system_cdc: 2-clock wrapper (host/USB <-> compute via cdc_async_fifo) == standalone across async clocks.
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_fp8_system_cdc_sim test/glm_fp8_system_cdc_tb.v src/glm_fp8_system_cdc.v src/glm_fp8_system.v src/cdc_async_fifo.v src/reset_sync.v src/glm_model_fp8.v src/ddr5_xbar.v src/weight_loader.v src/expert_cache_pf.v src/expert_cache_ctrl.v src/kv_cache_pager.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/sampler.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_fp8_system_cdc"; $(VVP) $(BUILD_DIR)/glm_fp8_system_cdc_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
@@ -264,6 +269,11 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/kv_cache_pager_sim test/kv_cache_pager_tb.v src/kv_cache_pager.v
 	@printf '[%s] ' "kv_cache_pager"; $(VVP) $(BUILD_DIR)/kv_cache_pager_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: kv_cache_pager"; exit 1; }
+	@# kv_cache_pager(ECC=1) (task C6-full): lane-partitioned SECDED on the real ring --
+	@# single-bit corrected, double-bit detected, across the ragged 768-bit / 100-bit rows.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/kv_cache_pager_ecc_sim test/kv_cache_pager_ecc_tb.v src/kv_cache_pager.v src/ecc_secded.v
+	@printf '[%s] ' "kv_cache_pager(ECC)"; $(VVP) $(BUILD_DIR)/kv_cache_pager_ecc_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: kv_cache_pager_ecc"; exit 1; }
 	@# ddr5_xbar: N-channel banked DDR5 read fabric (address striping -> ~Nx aggregate bandwidth).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/ddr5_xbar_sim test/ddr5_xbar_tb.v src/ddr5_xbar.v
 	@printf '[%s] ' "ddr5_xbar"; $(VVP) $(BUILD_DIR)/ddr5_xbar_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
