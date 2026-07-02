@@ -70,6 +70,12 @@ module kv_cache_pager #(
     parameter integer S_MAX     = 1024,  // logical context capacity (positions)
     parameter integer POSW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
     parameter integer FLASH_LAT = 8,     // cold-row fetch latency (doc; TB models it)
+    // ECC=0 (default): storage + behaviour byte-IDENTICAL to the un-ECC'd pager.
+    // ECC=1: the resident ring stores lane-partitioned SECDED codewords instead
+    //        of raw rows -- encode on append, decode+correct on resident gather,
+    //        with sticky ecc_serr (a lane SBU was corrected) / ecc_derr (a lane
+    //        DBU was detected).  See the ECC section + docs/P2_MEMORY_MAP.md.
+    parameter integer ECC       = 0,
     // ---- derived (do NOT override) ----
     parameter integer RPTRW     = (RESIDENT <= 1) ? 1 : $clog2(RESIDENT)
 )(
@@ -96,7 +102,11 @@ module kv_cache_pager #(
     // ---- observability ----
     output wire [POSW-1:0]      append_count,  // total rows appended (= next logical pos)
     output wire [POSW-1:0]      resident_lo,   // lowest RESIDENT logical position
-    output wire                 overflowed     // older positions have spilled to Flash
+    output wire                 overflowed,    // older positions have spilled to Flash
+
+    // ---- ECC observability (ECC=1; tied 0 when ECC=0) ----
+    output reg                  ecc_serr,      // sticky: a resident gather CORRECTED a lane SBU
+    output reg                  ecc_derr       // sticky: a resident gather DETECTED a lane DBU
 );
 
     // touch FLASH_LAT (a documentation parameter; the TB/DMA models the latency)
@@ -104,13 +114,99 @@ module kv_cache_pager #(
     localparam integer FLASH_LAT_DOC = FLASH_LAT;
 
     //------------------------------------------------------------------------
-    // RING storage + append counter.
+    // ECC lane geometry (used only when ECC=1).  A ROW_BITS row is partitioned
+    // into NLANES = ceil(ROW_BITS/64) 64-bit SECDED lanes; the ragged final lane
+    // is ZERO-PADDED to 64 before encode (docs/P2_MEMORY_MAP.md ECC lane note).
+    // Each lane is stored as its CODE_W-bit codeword (never the raw payload).
+    // When ECC=0 the ring keeps its native ROW_BITS width (byte-identical).
     //------------------------------------------------------------------------
-    reg [ROW_BITS-1:0] ring [0:RESIDENT-1];
+    localparam integer LANE_W = 64;
+    function integer calc_p;                 // Hamming parity bits for dw payload
+        input integer dw;
+        integer p;
+        begin
+            p = 0;
+            while ((1 << p) < (dw + p + 1)) p = p + 1;
+            calc_p = p;
+        end
+    endfunction
+    localparam integer P_ECC  = calc_p(LANE_W);                 // = 7  for 64b
+    localparam integer CODE_W = LANE_W + P_ECC + 1;             // = 72 for 64b
+    localparam integer NLANES = (ROW_BITS + LANE_W - 1) / LANE_W;
+    // ring element width: raw row (ECC=0) or packed lane codewords (ECC=1).
+    localparam integer RING_W = (ECC != 0) ? (NLANES * CODE_W) : ROW_BITS;
+
+    //------------------------------------------------------------------------
+    // RING storage + append counter.  (ECC=1 stores codewords, see above.)
+    //------------------------------------------------------------------------
+    reg [RING_W-1:0]   ring [0:RESIDENT-1];
     reg [POSW-1:0]     count;        // number of rows appended so far
     integer            i;
 
     assign append_count = count;
+
+    //------------------------------------------------------------------------
+    // ENCODE (append) / DECODE+CORRECT (resident gather) datapath.
+    //   enc_word : the value written into the ring on append
+    //              (= append_row when ECC=0; packed lane codewords when ECC=1).
+    //   dec_row  : the resident row read out of the ring at gather_idx's slot
+    //              (= raw ring word when ECC=0; decoded+corrected row when ECC=1).
+    //   dec_serr/dec_derr : this-cycle aggregate lane SBU/DBU on that read
+    //              (always 0 when ECC=0).
+    // The Hamming math is NOT reimplemented -- ecc_secded #(64) does each lane.
+    //------------------------------------------------------------------------
+    wire [RING_W-1:0]   enc_word;
+    wire [ROW_BITS-1:0] dec_row;
+    wire                dec_serr, dec_derr;
+    // combinational read of the addressed resident slot (pre-edge value).
+    wire [RING_W-1:0]   rd_word = ring[gather_idx[RPTRW-1:0]];
+
+    genvar j;
+    generate
+        if (ECC != 0) begin : g_ecc
+            wire [NLANES-1:0] lane_serr;
+            wire [NLANES-1:0] lane_derr;
+            for (j = 0; j < NLANES; j = j + 1) begin : LANE
+                localparam integer LO  = j * LANE_W;
+                localparam integer WID = (LO + LANE_W <= ROW_BITS)
+                                         ? LANE_W : (ROW_BITS - LO);
+                // ENCODE on append: zero-pad the ragged final lane, then encode.
+                wire [LANE_W-1:0] wlane =
+                    { {(LANE_W-WID){1'b0}}, append_row[LO +: WID] };
+                wire [LANE_W-1:0] enc_d_unused;
+                wire              enc_s_unused, enc_d2_unused;
+                ecc_secded #(.DATA_W(LANE_W)) u_enc (
+                    .data_in    (wlane),
+                    .code_out   (enc_word[j*CODE_W +: CODE_W]),
+                    .code_in    ({CODE_W{1'b0}}),
+                    .data_out   (enc_d_unused),
+                    .single_err (enc_s_unused),
+                    .double_err (enc_d2_unused)
+                );
+                // DECODE+CORRECT on resident gather.
+                wire [LANE_W-1:0] dec_data;
+                wire [CODE_W-1:0] dec_c_unused;
+                ecc_secded #(.DATA_W(LANE_W)) u_dec (
+                    .data_in    ({LANE_W{1'b0}}),
+                    .code_out   (dec_c_unused),
+                    .code_in    (rd_word[j*CODE_W +: CODE_W]),
+                    .data_out   (dec_data),
+                    .single_err (lane_serr[j]),
+                    .double_err (lane_derr[j])
+                );
+                // reconstruct only the valid low bits of the lane (pad dropped).
+                assign dec_row[LO +: WID] = dec_data[WID-1:0];
+            end
+            assign dec_serr = |lane_serr;   // any lane corrected a single-bit err
+            assign dec_derr = |lane_derr;   // any lane detected a double-bit err
+        end else begin : g_noecc
+            // byte-identical passthrough: no encode, raw ring read, no flags.
+            assign enc_word = append_row;
+            assign dec_row  = rd_word;
+            assign dec_serr = 1'b0;
+            assign dec_derr = 1'b0;
+        end
+    endgenerate
 
     // resident window low bound (combinational from the counter).
     wire over = (count > RESIDENT[POSW-1:0]);
@@ -136,8 +232,10 @@ module kv_cache_pager #(
             flash_req <= 1'b0;
             flash_idx <= {POSW{1'b0}};
             g_state   <= G_IDLE;
+            ecc_serr  <= 1'b0;
+            ecc_derr  <= 1'b0;
             for (i = 0; i < RESIDENT; i = i + 1)
-                ring[i] <= {ROW_BITS{1'b0}};
+                ring[i] <= {RING_W{1'b0}};
         end else begin
             // row_valid is a 1-cycle pulse -> default low every cycle.
             row_valid <= 1'b0;
@@ -147,9 +245,11 @@ module kv_cache_pager #(
             // `count` at slot count mod RESIDENT, then advances the head.  A
             // concurrent resident gather of the oldest slot reads the OLD
             // (pre-eviction) value (nonblocking), the correct boundary value.
+            // enc_word == append_row when ECC=0 (byte-identical); packed lane
+            // SECDED codewords of append_row when ECC=1.
             //----------------------------------------------------------------
             if (append_valid) begin
-                ring[count[RPTRW-1:0]] <= append_row;
+                ring[count[RPTRW-1:0]] <= enc_word;
                 count                  <= count + 1'b1;
             end
 
@@ -161,8 +261,13 @@ module kv_cache_pager #(
                     if (gather_valid && !busy) begin
                         if (g_resident) begin
                             // fast path: registered ring read, 1-cycle latency.
-                            row_out   <= ring[gather_idx[RPTRW-1:0]];
+                            // dec_row == raw ring word (ECC=0) or decoded+
+                            // corrected row (ECC=1); dec_serr/dec_derr are 0
+                            // when ECC=0.  ecc_serr/ecc_derr are STICKY.
+                            row_out   <= dec_row;
                             row_valid <= 1'b1;
+                            ecc_serr  <= ecc_serr | dec_serr;
+                            ecc_derr  <= ecc_derr | dec_derr;
                         end else begin
                             // cold path: issue + hold a Flash fetch, go busy.
                             flash_req <= 1'b1;
