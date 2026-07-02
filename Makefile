@@ -193,6 +193,11 @@ unittests:
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_sparse_perrow_sim test/mla_attn_fp8_sparse_perrow_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
 	@printf '[%s] ' "mla_attn_fp8(sparse-perrow)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_sparse_perrow_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
 	    || { echo "FAILED: mla_attn_fp8_sparse_perrow"; exit 1; }
+	@# mla_attn_fp8 SWIN-vs-S_MAX decouple (task B7): attention scratch sized by SWIN (top-K window),
+	@# key indices still span S_MAX. Proves SWIN=8 out === SWIN=64(=S_MAX) out bit-exact at S_MAX=64.
+	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/mla_attn_fp8_swin_decouple_sim test/mla_attn_fp8_swin_decouple_tb.v src/mla_attn_fp8.v src/glm_matmul_fp8.v src/glm_matmul_pipe.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_fp_pipe.v
+	@printf '[%s] ' "mla_attn_fp8(swin-decouple)"; $(VVP) $(BUILD_DIR)/mla_attn_fp8_swin_decouple_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \
+	    || { echo "FAILED: mla_attn_fp8_swin_decouple"; exit 1; }
 	@# glm_decoder_block_fp8: one full GLM-5.2-FP8 decoder layer (mla_attn_fp8 + moe_router_fp8 + swiglu_expert_fp8).
 	@$(IVERILOG) $(IFLAGS) -o $(BUILD_DIR)/glm_decoder_block_fp8_sim test/glm_decoder_block_fp8_tb.v src/glm_decoder_block_fp8.v src/mla_attn_fp8.v src/swiglu_expert_fp8.v src/moe_router_fp8.v src/glm_matmul_fp8.v src/rmsnorm_unit.v src/rope_interleave_unit.v src/glm_softmax.v src/dsa_indexer.v src/topk_select.v src/glm_act.v src/glm_matmul_pipe.v src/glm_fp_pipe.v
 	@printf '[%s] ' "glm_decoder_block_fp8"; $(VVP) $(BUILD_DIR)/glm_decoder_block_fp8_sim | grep -E 'ALL [0-9]+ TESTS PASSED' \

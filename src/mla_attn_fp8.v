@@ -106,6 +106,15 @@ module mla_attn_fp8 #(
     parameter integer KV_LORA   = 32,
     parameter integer S_MAX     = 8,
     parameter integer TOPK      = 8,
+    // SWIN (B7): attention SCRATCH window == the DSA top-K budget (default = TOPK).
+    //   scores/probs/vstore and glm_softmax LEN are sized by SWIN (a small window),
+    //   NOT by S_MAX (the full 1M position range).  Since at most u_cnt (<= SWIN)
+    //   DISTINCT keys are ever selected, SWIN entries suffice.  The KEY INDICES
+    //   (kc_idx/IDXW, sel_list_r, union_list, positions) still span the full S_MAX.
+    //   Default SWIN==TOPK: at the slice (S_MAX small, dense fallback selects all
+    //   keys 0..S-1 so u_cnt==S<=TOPK==SWIN) the key->slot compaction is the
+    //   IDENTITY -> byte-identical to the pre-B7 (S_MAX-indexed) scratch.
+    parameter integer SWIN      = TOPK,
     parameter integer THETA     = 8000000,
     parameter integer PE_N      = 4,    // matmul tile width (output lanes/pass)
     parameter integer POSW      = 20,
@@ -128,6 +137,7 @@ module mla_attn_fp8 #(
     // ---- derived (do NOT override) ----
     parameter integer QK_DIM    = NOPE + ROPE,
     parameter integer IDXW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
+    parameter integer SWINW     = (SWIN  <= 1) ? 1 : $clog2(SWIN),   // union-slot index width (addresses SWIN-sized scratch)
     parameter integer HQK       = H_HEADS * QK_DIM,   // q width
     parameter integer HNOPE     = H_HEADS * NOPE,     // k_nope width
     parameter integer HV        = H_HEADS * V_DIM,    // v width (and W_o K)
@@ -256,9 +266,13 @@ module mla_attn_fp8 #(
     reg [15:0] v_j       [0:HV-1];                     // ckv_n*W_uv (per head)    (SHARED)
     reg [15:0] krope_j   [0:ROPE-1];                   // cached k_rope[j]         (SHARED)
 
-    reg [15:0] scores    [0:PE_M-1][0:H_HEADS-1][0:S_MAX-1];           // per row, KEY-indexed
-    reg [15:0] vstore    [0:H_HEADS-1][0:S_MAX-1][0:V_DIM-1];          // SHARED (key V), KEY-indexed
-    reg [15:0] probs     [0:PE_M-1][0:H_HEADS-1][0:S_MAX-1];           // per row, SLOT-indexed
+    // B7: SCRATCH re-scoped to the SWIN window and indexed by the COMPACT UNION
+    //   SLOT (0..u_cnt-1 <= SWIN-1), NOT the raw key (0..S_MAX-1).  scores/vstore
+    //   are written at union slot ksel and read via rowslot2union[row][row-slot];
+    //   probs stays row-slot-indexed.  All three shrink from S_MAX to SWIN.
+    reg [15:0] scores    [0:PE_M-1][0:H_HEADS-1][0:SWIN-1];            // per row, UNION-SLOT-indexed
+    reg [15:0] vstore    [0:H_HEADS-1][0:SWIN-1][0:V_DIM-1];           // SHARED (key V), UNION-SLOT-indexed
+    reg [15:0] probs     [0:PE_M-1][0:H_HEADS-1][0:SWIN-1];            // per row, SLOT-indexed
     reg [15:0] ctx       [0:PE_M-1][0:HV-1];                           // per row (O concat)
     reg [15:0] outbuf    [0:PE_M-1][0:MODEL_DIM-1];                    // per row
 
@@ -269,15 +283,25 @@ module mla_attn_fp8 #(
     //   all rows form the UNION (union_list/u_cnt): the shared key-fetch + K/V pass
     //   below visits each union key ONCE (fetch-sharing preserved), and every row's
     //   score/softmax/context runs over ITS OWN selection in ITS OWN slot order.
-    //   scores/vstore are indexed by the ACTUAL KEY here (not the slot), so a row that
-    //   selects a key in a different slot still reads that key's exact score/V.
+    //   scores/vstore are UNION-SLOT-indexed (B7): written at the compact union slot
+    //   (0..u_cnt-1 <= SWIN-1) and read via rowslot2union[row][row-slot], so a row that
+    //   selects a key in a different slot still reads that key's exact score/V -- while
+    //   the SCRATCH is sized by SWIN (the top-K window), NOT S_MAX (the position range).
     //   At PE_M=1 (and whenever all rows' selections agree -- e.g. the dense fallback,
     //   equal-x, or the current q-independent DSA slice) union==row-0's list and every
     //   row's slot order == the shared order -> byte-identical to the pre-B6 datapath.
     reg [IDXW-1:0] sel_list_r [0:PE_M-1][0:TOPK-1];   // per-row selected key indices (slot order)
     reg [IDXW:0]   sel_cnt_r  [0:PE_M-1];             // per-row valid count = min(slen_r,TOPK)
-    reg [IDXW-1:0] union_list [0:S_MAX-1];            // distinct keys across all rows (ascending)
-    reg [IDXW:0]   u_cnt;                             // union size == #distinct keys fetched once
+    reg [IDXW-1:0] union_list [0:S_MAX-1];            // distinct keys across all rows (ascending); values span full S_MAX
+    reg [IDXW:0]   u_cnt;                             // union size == #distinct keys fetched once (<= SWIN)
+    // COMPACT SCRATCH SLOT MAP (B7): rowslot2union[r][i] = the UNION SLOT (0..u_cnt-1)
+    //   holding row r's OWN selected key sel_list_r[r][i].  Built in S_UNION beside
+    //   union_list.  scores/vstore are union-slot-indexed, so the read side converts
+    //   each row's key back to its slot via this map.  DENSE / q-independent slice
+    //   (keys 0..S-1, union_list[slot]==slot) => rowslot2union[r][i]==i (IDENTITY),
+    //   so the SWIN-sized scratch reads/writes the SAME locations as the pre-B7
+    //   S_MAX-key-indexed scratch -> byte-identical.  Tiny (PE_M*TOPK, SWINW-wide).
+    reg [SWINW-1:0] rowslot2union [0:PE_M-1][0:TOPK-1];
     // per-row DSA sequencer + union-build scratch
     localparam integer DRW = (PE_M <= 1) ? 1 : $clog2(PE_M);
     localparam integer TKW = (TOPK <= 1) ? 1 : $clog2(TOPK);
@@ -455,7 +479,7 @@ module mla_attn_fp8 #(
     genvar gs;
     generate
     for (gs = 0; gs < PE_M; gs = gs + 1) begin : SM
-        glm_softmax #(.LEN(S_MAX), .LANES(1)) u_softmax (
+        glm_softmax #(.LEN(SWIN), .LANES(1)) u_softmax (
             .clk(clk), .rst(rst), .start(sm_start),
             .in_valid(sm_in_valid), .x_in(sm_x_in[16*gs +: 16]),
             .busy(sm_busy[gs]), .out_valid(sm_out_valid[gs]), .p_out(sm_p_out[16*gs +: 16]),
@@ -697,7 +721,7 @@ module mla_attn_fp8 #(
                 for (s_i=0; s_i<ROPE;     s_i=s_i+1) krope_cur[rr][s_i]<=16'h0;
                 for (s_i=0; s_i<HV;       s_i=s_i+1) ctx[rr][s_i]<=16'h0;
                 for (h_i=0; h_i<H_HEADS;  h_i=h_i+1)
-                    for (s_i=0; s_i<S_MAX; s_i=s_i+1) begin
+                    for (s_i=0; s_i<SWIN; s_i=s_i+1) begin
                         scores[rr][h_i][s_i]<=16'h0; probs[rr][h_i][s_i]<=16'h0;
                     end
             end
@@ -706,11 +730,14 @@ module mla_attn_fp8 #(
             for (s_i=0; s_i<HNOPE;    s_i=s_i+1) knope_j[s_i]<=16'h0;
             for (s_i=0; s_i<HV;       s_i=s_i+1) v_j[s_i]<=16'h0;
             for (h_i=0; h_i<H_HEADS;  h_i=h_i+1)
-                for (s_i=0; s_i<S_MAX; s_i=s_i+1)
+                for (s_i=0; s_i<SWIN; s_i=s_i+1)
                     for (d_i=0; d_i<V_DIM; d_i=d_i+1) vstore[h_i][s_i][d_i]<=16'h0;
             for (rr=0; rr<PE_M; rr=rr+1) begin
                 sel_cnt_r[rr] <= {(IDXW+1){1'b0}};
-                for (s_i=0; s_i<TOPK; s_i=s_i+1) sel_list_r[rr][s_i]<={IDXW{1'b0}};
+                for (s_i=0; s_i<TOPK; s_i=s_i+1) begin
+                    sel_list_r[rr][s_i]<={IDXW{1'b0}};
+                    rowslot2union[rr][s_i]<={SWINW{1'b0}};
+                end
             end
             for (s_i=0; s_i<S_MAX; s_i=s_i+1) union_list[s_i]<={IDXW{1'b0}};
         end else begin
@@ -982,19 +1009,26 @@ module mla_attn_fp8 #(
             // ------------------------------------------------------------- union
             // Build the ASCENDING list of DISTINCT keys selected by ANY row.  Each
             //   such key is fetched + K/V-projected exactly ONCE in S_KEY (fetch-
-            //   sharing), and scores/vstore are indexed by the actual key so every
-            //   row later reads its own selected keys.  When all rows agree (PE_M=1,
-            //   dense fallback, equal-x, or the q-independent DSA slice) the union is
-            //   exactly the shared selection in the same order -> byte-identical.
+            //   sharing), and scores/vstore are UNION-SLOT-indexed (B7) so the SWIN-
+            //   sized scratch (0..u_cnt-1) suffices; rowslot2union maps each row's own
+            //   selected key back to its slot.  When all rows agree (PE_M=1, dense
+            //   fallback, equal-x, or the q-independent DSA slice) the union is exactly
+            //   the shared selection in the same order and the slot map is the identity
+            //   -> byte-identical to the pre-B7 S_MAX-key-indexed scratch.
             S_UNION: begin
                 un_cnt = {(IDXW+1){1'b0}};
                 for (uk = 0; uk < S_MAX; uk = uk + 1) begin
                     un_pres = 1'b0;
+                    // record, for EVERY (row,row-slot) that selected key uk, the
+                    //   union slot un_cnt this key is about to occupy (blocking un_cnt
+                    //   == #distinct present keys with value < uk == this key's slot).
                     for (ur = 0; ur < PE_M; ur = ur + 1)
                         for (up = 0; up < TOPK; up = up + 1)
                             if ((up[IDXW:0] < sel_cnt_r[ur]) &&
-                                (sel_list_r[ur][up] == uk[IDXW-1:0]))
+                                (sel_list_r[ur][up] == uk[IDXW-1:0])) begin
                                 un_pres = 1'b1;
+                                rowslot2union[ur][up] <= un_cnt[SWINW-1:0];
+                            end
                     if (un_pres) begin
                         union_list[un_cnt[IDXW-1:0]] <= uk[IDXW-1:0];
                         un_cnt = un_cnt + 1'b1;
@@ -1075,11 +1109,11 @@ module mla_attn_fp8 #(
                                     v_j[gv_grp*PE_N+tt] <= mm_c[16*tt +:16];
                         end
                         if (gv_done) begin
-                            // store V indexed by the ACTUAL KEY (union_list[ksel]) so
-                            //   each row later reads the V of the keys IT selected.
+                            // store V at the UNION SLOT ksel (SWIN-sized scratch); each
+                            //   row later reads its selected keys' V via rowslot2union.
                             for (h_i=0; h_i<H_HEADS; h_i=h_i+1)
                                 for (d_i=0; d_i<V_DIM; d_i=d_i+1)
-                                    vstore[h_i][union_list[ksel[IDXW-1:0]]][d_i]
+                                    vstore[h_i][ksel[SWINW-1:0]][d_i]
                                         <= v_j[h_i*V_DIM + d_i];
                             gv_head <= {$clog2(H_HEADS+1){1'b0}};
                             kst     <= K_SCORE;
@@ -1096,10 +1130,10 @@ module mla_attn_fp8 #(
                     end
                     K_NEXTH: begin
                         if (gv_go) gv_go <= 1'b0;
-                        // store each row's q.K score indexed by the ACTUAL KEY.
+                        // store each row's q.K score at the UNION SLOT ksel (SWIN scratch).
                         if (mm_out_valid && gv_st==GV_WAIT)
                             for (rr=0; rr<PE_M; rr=rr+1)
-                                scores[rr][gv_head[$clog2(H_HEADS)-1:0]][union_list[ksel[IDXW-1:0]]]
+                                scores[rr][gv_head[$clog2(H_HEADS)-1:0]][ksel[SWINW-1:0]]
                                     <= mm_c[16*(rr*PE_N) +:16];
                         if (gv_done) begin
                             if (gv_head == H_HEADS[$clog2(H_HEADS+1)-1:0]-1'b1) begin
@@ -1149,14 +1183,18 @@ module mla_attn_fp8 #(
                             //   the shared count -> identical logit sequence as pre-B6.
                             //   (sf_feed_i>=sel_cnt_r read of sel_list_r is gated off; the
                             //    ternary picks NEG_BIG regardless of the true-branch idx.)
+                            //   scores is now UNION-SLOT-indexed: convert row r's
+                            //   row-slot sf_feed_i to its union slot via rowslot2union.
+                            //   (dense/q-indep fold: rowslot2union[r][i]==i -> same
+                            //    logit sequence as the pre-B7 S_MAX-key-indexed read.)
                             for (rr=0; rr<PE_M; rr=rr+1)
                                 sm_x_in[16*rr +: 16] <=
                                     (sf_feed_i < sel_cnt_r[rr]) ?
                                        scores[rr][sf_head[$clog2(H_HEADS)-1:0]]
-                                             [sel_list_r[rr][sf_feed_i[TKW-1:0]]]
+                                             [rowslot2union[rr][sf_feed_i[TKW-1:0]]]
                                      : NEG_BIG;
                             sf_feed_i   <= sf_feed_i + 1'b1;
-                            if (sf_feed_i == S_MAX[IDXW:0]-1'b1)
+                            if (sf_feed_i == SWIN[IDXW:0]-1'b1)
                                 sfst <= SF_CAP;
                         end
                     end
@@ -1166,7 +1204,7 @@ module mla_attn_fp8 #(
                         //   the union bound contributes nothing for them (bit-exact).
                         if (sm_out_valid[0]) begin
                             for (rr=0; rr<PE_M; rr=rr+1)
-                                probs[rr][sf_head[$clog2(H_HEADS)-1:0]][sf_cap_i[IDXW-1:0]] <=
+                                probs[rr][sf_head[$clog2(H_HEADS)-1:0]][sf_cap_i[SWINW-1:0]] <=
                                     (sf_cap_i < sel_cnt_r[rr]) ? sm_p_out[16*rr +: 16] : 16'h0;
                             sf_cap_i <= sf_cap_i + 1'b1;
                         end
@@ -1206,12 +1244,16 @@ module mla_attn_fp8 #(
                         //   The loop runs over the UNION count (>= every row's own
                         //   count); a row's padding slots carry prob=+0.0 so their FMA
                         //   adds +0.0 (bit-exact to stopping at that row's own count).
+                        //   probs is slot-indexed (row-slot cx_s); vstore is now
+                        //   UNION-SLOT-indexed, so read V of row r's slot-cx_s key via
+                        //   rowslot2union.  (dense fold: rowslot2union[r][cx_s]==cx_s ->
+                        //   same key V as the pre-B7 sel_list_r[r][cx_s] key-indexed read.)
                         for (rr=0; rr<PE_M; rr=rr+1)
                             ctx_acc[rr] <= fp32_add(ctx_acc[rr],
                                          fp32_mul(
-                                           bf16_to_fp32(probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[IDXW-1:0]]),
+                                           bf16_to_fp32(probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[SWINW-1:0]]),
                                            bf16_to_fp32(vstore[cx_head[$clog2(H_HEADS)-1:0]]
-                                                              [sel_list_r[rr][cx_s[TKW-1:0]]]
+                                                              [rowslot2union[rr][cx_s[TKW-1:0]]]
                                                               [cx_d[$clog2(V_DIM)-1:0]])));
                         if (cx_s == u_cnt - 1'b1) cxst <= CX_STORE;
                         else cx_s <= cx_s + 1'b1;
@@ -1298,7 +1340,7 @@ module mla_attn_fp8 #(
             end
             if (sm_start) sm_in_valid_able <= 1'b1;
             else if (state==S_SOFT && sfst==SF_FEED &&
-                     sf_feed_i==S_MAX[IDXW:0]-1'b1 && sm_in_valid_able)
+                     sf_feed_i==SWIN[IDXW:0]-1'b1 && sm_in_valid_able)
                      sm_in_valid_able <= 1'b0;
         end
     end
