@@ -75,10 +75,19 @@
 //     token activation x AND now their query position pos_r.  (Keeping the causal
 //     extent = the shared s_len is also REQUIRED for byte-identicality: the
 //     committed datapath attends all s_len keys regardless of pos, e.g. pos<s_len.)
-//     The DSA top-K selection is driven from row 0's q and SHARED across rows --
-//     EXACT in the dense fallback (S <= TOPK, where dsa_indexer ignores q and
-//     keeps keys 0..S-1), which is the regime the TB and this decode slice use.
-//     (Sparse per-row selection divergence is out of scope for PE_M>1.)
+//     DSA top-K selection is now PER-ROW (B6): each batched row r selects over ITS
+//     OWN query qrot[r] and ITS OWN causal extent slen_r[r] (a serialized re-run of
+//     dsa_indexer per row), producing sel_list_r[r]/sel_cnt_r[r] -- exactly what a
+//     PE_M=1 standalone decode of row r would compute.  The DISTINCT keys across all
+//     rows form a UNION that the shared key-fetch + W_uk/W_uv K/V pass visits ONCE
+//     per key (fetch-sharing preserved: ONE fetch per distinct key, not PE_M), while
+//     each row's score/softmax/context runs over ITS OWN selection in ITS OWN slot
+//     order (scores/vstore are KEY-indexed).  So batched row r is BIT-EXACT to its
+//     standalone run even in the SPARSE DSA regime (S_MAX > TOPK).  When all rows'
+//     selections agree -- PE_M=1, the dense fallback (S<=TOPK -> keys 0..S-1), equal
+//     queries, or the current q-independent index slice (dsa_kidx=0) -- the union is
+//     the shared list in the same order and this folds byte-identically to the pre-B6
+//     row-0-shared datapath.
 //
 //   At PE_M=1 every PE_M-indexed construct constant-folds to the original single-
 //   row datapath -> the committed test/mla_attn_fp8_tb.v instantiates this
@@ -247,15 +256,35 @@ module mla_attn_fp8 #(
     reg [15:0] v_j       [0:HV-1];                     // ckv_n*W_uv (per head)    (SHARED)
     reg [15:0] krope_j   [0:ROPE-1];                   // cached k_rope[j]         (SHARED)
 
-    reg [15:0] scores    [0:PE_M-1][0:H_HEADS-1][0:S_MAX-1];           // per row
-    reg [15:0] vstore    [0:H_HEADS-1][0:S_MAX-1][0:V_DIM-1];          // SHARED (key V)
-    reg [15:0] probs     [0:PE_M-1][0:H_HEADS-1][0:S_MAX-1];           // per row
+    reg [15:0] scores    [0:PE_M-1][0:H_HEADS-1][0:S_MAX-1];           // per row, KEY-indexed
+    reg [15:0] vstore    [0:H_HEADS-1][0:S_MAX-1][0:V_DIM-1];          // SHARED (key V), KEY-indexed
+    reg [15:0] probs     [0:PE_M-1][0:H_HEADS-1][0:S_MAX-1];           // per row, SLOT-indexed
     reg [15:0] ctx       [0:PE_M-1][0:HV-1];                           // per row (O concat)
     reg [15:0] outbuf    [0:PE_M-1][0:MODEL_DIM-1];                    // per row
 
-    // DSA selection results (SHARED -- dense-fallback / row-0-driven; see header)
-    reg [IDXW-1:0] sel_list [0:TOPK-1];
-    reg [IDXW:0]   sel_cnt;
+    // DSA selection results -- PER-ROW top-K (B6).  Each batched row r selects over
+    //   ITS OWN query (qrot[r]) and ITS OWN causal extent (slen_r[r]), producing its
+    //   own descending-score slot list sel_list_r[r] / count sel_cnt_r[r] -- exactly
+    //   what a PE_M=1 standalone run on row r would compute.  The DISTINCT keys across
+    //   all rows form the UNION (union_list/u_cnt): the shared key-fetch + K/V pass
+    //   below visits each union key ONCE (fetch-sharing preserved), and every row's
+    //   score/softmax/context runs over ITS OWN selection in ITS OWN slot order.
+    //   scores/vstore are indexed by the ACTUAL KEY here (not the slot), so a row that
+    //   selects a key in a different slot still reads that key's exact score/V.
+    //   At PE_M=1 (and whenever all rows' selections agree -- e.g. the dense fallback,
+    //   equal-x, or the current q-independent DSA slice) union==row-0's list and every
+    //   row's slot order == the shared order -> byte-identical to the pre-B6 datapath.
+    reg [IDXW-1:0] sel_list_r [0:PE_M-1][0:TOPK-1];   // per-row selected key indices (slot order)
+    reg [IDXW:0]   sel_cnt_r  [0:PE_M-1];             // per-row valid count = min(slen_r,TOPK)
+    reg [IDXW-1:0] union_list [0:S_MAX-1];            // distinct keys across all rows (ascending)
+    reg [IDXW:0]   u_cnt;                             // union size == #distinct keys fetched once
+    // per-row DSA sequencer + union-build scratch
+    localparam integer DRW = (PE_M <= 1) ? 1 : $clog2(PE_M);
+    localparam integer TKW = (TOPK <= 1) ? 1 : $clog2(TOPK);
+    reg [DRW-1:0]  dsa_row;                           // which row's selection is scoring now
+    integer        uk, ur, up;                        // union-build loop vars
+    reg            un_pres;                            // key present in some row's selection
+    reg [IDXW:0]   un_cnt;                             // running union count (blocking)
 
     //========================================================================
     // PER-ROW CAUSAL EXTENT resolve (combinational; latched at start).  Row 0 =
@@ -456,12 +485,13 @@ module mla_attn_fp8 #(
         S_KVDKV = 5'd5,    // x*W_dkv -> ckv_cur              (FP8, batched rows)
         S_KVKR  = 5'd6,    // x*W_kr -> krope_cur             (FP8, batched rows)
         S_KRROPE= 5'd7,    // rope shared k_rope              (bf16, per row)
-        S_DSA   = 5'd8,    // dsa_indexer select keys
-        S_KEY   = 5'd9,    // per key: norm/W_uk/W_uv (shared)/assemble/score (per row)
+        S_DSA   = 5'd8,    // dsa_indexer select keys -- PER ROW (serialized over rows)
+        S_KEY   = 5'd9,    // per UNION key: norm/W_uk/W_uv (shared)/assemble/score (per row)
         S_SOFT  = 5'd10,   // per head softmax over scores    (bf16, per row)
         S_CTX   = 5'd11,   // weighted-V context              (bf16 fp32-acc, per row)
         S_OUT   = 5'd12,   // ctx*W_o -> out                  (FP8, batched rows)
-        S_DONE  = 5'd13;
+        S_DONE  = 5'd13,
+        S_UNION = 5'd14;   // build the distinct-key UNION across rows' selections
     reg [4:0] state;
 
     // ---- GEMV micro-sequencer sub-state (shared by every projection stage) ----
@@ -495,7 +525,7 @@ module mla_attn_fp8 #(
         K_NEXTH=4'd8,  // advance head in score loop
         K_NEXT=4'd9;   // advance selected key s
     reg [3:0]        kst;
-    reg [IDXW:0]     ksel;         // index into sel_list (0..sel_cnt-1)
+    reg [IDXW:0]     ksel;         // index into union_list (0..u_cnt-1)
 
     // ---- softmax loop bookkeeping (S_SOFT) ----
     localparam [2:0] SF_FEED=3'd0, SF_CAP=3'd2, SF_NEXT=3'd3;
@@ -655,7 +685,9 @@ module mla_attn_fp8 #(
             sf_feed_i  <= {(IDXW+1){1'b0}}; sf_cap_i <= {(IDXW+1){1'b0}};
             cxst       <= CX_INIT; cx_head <= {$clog2(H_HEADS+1){1'b0}};
             cx_d       <= {$clog2(V_DIM+1){1'b0}}; cx_s <= {(IDXW+1){1'b0}};
-            sel_cnt    <= {(IDXW+1){1'b0}};
+            dsa_row    <= {DRW{1'b0}};
+            u_cnt      <= {(IDXW+1){1'b0}};
+            un_pres    <= 1'b0; un_cnt <= {(IDXW+1){1'b0}};
             for (rr=0; rr<PE_M; rr=rr+1) begin
                 ctx_acc[rr] <= 32'h0;
                 for (s_i=0; s_i<MODEL_DIM; s_i=s_i+1) begin xbuf[rr][s_i]<=16'h0; outbuf[rr][s_i]<=16'h0; end
@@ -676,7 +708,11 @@ module mla_attn_fp8 #(
             for (h_i=0; h_i<H_HEADS;  h_i=h_i+1)
                 for (s_i=0; s_i<S_MAX; s_i=s_i+1)
                     for (d_i=0; d_i<V_DIM; d_i=d_i+1) vstore[h_i][s_i][d_i]<=16'h0;
-            for (s_i=0; s_i<TOPK; s_i=s_i+1) sel_list[s_i]<={IDXW{1'b0}};
+            for (rr=0; rr<PE_M; rr=rr+1) begin
+                sel_cnt_r[rr] <= {(IDXW+1){1'b0}};
+                for (s_i=0; s_i<TOPK; s_i=s_i+1) sel_list_r[rr][s_i]<={IDXW{1'b0}};
+            end
+            for (s_i=0; s_i<S_MAX; s_i=s_i+1) union_list[s_i]<={IDXW{1'b0}};
         end else begin
             // ---- default pulse deasserts ----
             done          <= 1'b0;
@@ -906,11 +942,13 @@ module mla_attn_fp8 #(
                     end
                 end
                 if (rp_done[0]) begin
-                    // DSA selection driven from row 0's q (head0 nope) -- shared.
+                    // PER-ROW DSA (B6): score row 0's selection first, then advance
+                    //   through rows 1..PE_M-1 in S_DSA -- each with ITS OWN q + extent.
                     for (d_i=0; d_i<NOPE; d_i=d_i+1)
                         dsa_qidx[16*d_i +: 16] <= qrot[0][d_i];
-                    dsa_slen  <= s_reg;
+                    dsa_slen  <= slen_r[(IDXW+1)*0 +: (IDXW+1)];   // row 0 own extent (== s_len)
                     dsa_start <= 1'b1;
+                    dsa_row   <= {DRW{1'b0}};
                     state     <= S_DSA;
                 end
             end
@@ -922,19 +960,56 @@ module mla_attn_fp8 #(
                     dsa_key_valid <= 1'b1;
                 end
                 if (dsa_done) begin
+                    // capture THIS row's own selection (slot list + count).
                     for (s_i=0; s_i<TOPK; s_i=s_i+1)
-                        sel_list[s_i] <= dsa_sel_idx[IDXW*s_i +: IDXW];
-                    sel_cnt <= dsa_sel_count;
-                    ksel    <= {(IDXW+1){1'b0}};
-                    kst     <= K_RDREQ;
-                    state   <= S_KEY;
+                        sel_list_r[dsa_row][s_i] <= dsa_sel_idx[IDXW*s_i +: IDXW];
+                    sel_cnt_r[dsa_row] <= dsa_sel_count;
+                    if (dsa_row == DRW'(PE_M-1)) begin
+                        // all rows selected -> build the distinct-key union next.
+                        state <= S_UNION;
+                    end else begin
+                        // advance to the next row: re-run the indexer on ITS OWN
+                        //   query + causal extent (a fresh per-query list, exactly
+                        //   like that row's PE_M=1 standalone decode).
+                        for (d_i=0; d_i<NOPE; d_i=d_i+1)
+                            dsa_qidx[16*d_i +: 16] <= qrot[dsa_row + 1'b1][d_i];
+                        dsa_slen  <= slen_r[(IDXW+1)*(dsa_row + 1'b1) +: (IDXW+1)];
+                        dsa_start <= 1'b1;
+                        dsa_row   <= dsa_row + 1'b1;
+                    end
                 end
+            end
+            // ------------------------------------------------------------- union
+            // Build the ASCENDING list of DISTINCT keys selected by ANY row.  Each
+            //   such key is fetched + K/V-projected exactly ONCE in S_KEY (fetch-
+            //   sharing), and scores/vstore are indexed by the actual key so every
+            //   row later reads its own selected keys.  When all rows agree (PE_M=1,
+            //   dense fallback, equal-x, or the q-independent DSA slice) the union is
+            //   exactly the shared selection in the same order -> byte-identical.
+            S_UNION: begin
+                un_cnt = {(IDXW+1){1'b0}};
+                for (uk = 0; uk < S_MAX; uk = uk + 1) begin
+                    un_pres = 1'b0;
+                    for (ur = 0; ur < PE_M; ur = ur + 1)
+                        for (up = 0; up < TOPK; up = up + 1)
+                            if ((up[IDXW:0] < sel_cnt_r[ur]) &&
+                                (sel_list_r[ur][up] == uk[IDXW-1:0]))
+                                un_pres = 1'b1;
+                    if (un_pres) begin
+                        union_list[un_cnt[IDXW-1:0]] <= uk[IDXW-1:0];
+                        un_cnt = un_cnt + 1'b1;
+                    end
+                end
+                u_cnt <= un_cnt;
+                ksel  <= {(IDXW+1){1'b0}};
+                kst   <= K_RDREQ;
+                state <= S_KEY;
             end
             // ------------------------------------------------------------- per-key
             S_KEY: begin
                 case (kst)
                     K_RDREQ: begin
-                        kc_idx  <= sel_list[ksel[IDXW-1:0]];
+                        kc_idx  <= union_list[ksel[IDXW-1:0]];   // ksel indexes the UNION
                         kc_req  <= 1'b1;
                         kst     <= K_RDWAIT;
                     end
@@ -1000,9 +1075,11 @@ module mla_attn_fp8 #(
                                     v_j[gv_grp*PE_N+tt] <= mm_c[16*tt +:16];
                         end
                         if (gv_done) begin
+                            // store V indexed by the ACTUAL KEY (union_list[ksel]) so
+                            //   each row later reads the V of the keys IT selected.
                             for (h_i=0; h_i<H_HEADS; h_i=h_i+1)
                                 for (d_i=0; d_i<V_DIM; d_i=d_i+1)
-                                    vstore[h_i][ksel[IDXW-1:0]][d_i]
+                                    vstore[h_i][union_list[ksel[IDXW-1:0]]][d_i]
                                         <= v_j[h_i*V_DIM + d_i];
                             gv_head <= {$clog2(H_HEADS+1){1'b0}};
                             kst     <= K_SCORE;
@@ -1019,9 +1096,10 @@ module mla_attn_fp8 #(
                     end
                     K_NEXTH: begin
                         if (gv_go) gv_go <= 1'b0;
+                        // store each row's q.K score indexed by the ACTUAL KEY.
                         if (mm_out_valid && gv_st==GV_WAIT)
                             for (rr=0; rr<PE_M; rr=rr+1)
-                                scores[rr][gv_head[$clog2(H_HEADS)-1:0]][ksel[IDXW-1:0]]
+                                scores[rr][gv_head[$clog2(H_HEADS)-1:0]][union_list[ksel[IDXW-1:0]]]
                                     <= mm_c[16*(rr*PE_N) +:16];
                         if (gv_done) begin
                             if (gv_head == H_HEADS[$clog2(H_HEADS+1)-1:0]-1'b1) begin
@@ -1034,7 +1112,7 @@ module mla_attn_fp8 #(
                         end
                     end
                     K_NEXT: begin
-                        if (ksel == sel_cnt - 1'b1) begin
+                        if (ksel == u_cnt - 1'b1) begin   // done all UNION keys
                             sf_head   <= {$clog2(H_HEADS+1){1'b0}};
                             sfst      <= SF_FEED;
                             sf_feed_i <= {(IDXW+1){1'b0}};
@@ -1056,31 +1134,26 @@ module mla_attn_fp8 #(
                         sm_in_valid <= 1'b0;
                         if (sm_in_valid_able) begin
                             sm_in_valid <= 1'b1;
-                            // PER-ROW CAUSAL EXTENT mask: selection slot sf_feed_i holds
-                            //   the score for the ACTUAL key index sel_list[sf_feed_i]
-                            //   (scores/probs/vstore are all indexed by SELECTION SLOT --
-                            //   see K_SCORE).  Row r's logit for that slot is fed only
-                            //   while the slot is a valid selected key (< sel_cnt) AND the
-                            //   slot's ACTUAL key index sel_list[sf_feed_i] is within THAT
-                            //   row's own causal extent (< slen_r[r]); beyond either it is
-                            //   bf16 -inf (NEG_BIG) so softmax gives it zero mass.  The
-                            //   extent test MUST use the actual key index (sel_list), not
-                            //   the slot, because in the SPARSE path (S>TOPK) slot != key.
-                            //   No-op guarantees:
-                            //     * Dense DSA fallback (the documented PE_M>1 regime):
-                            //       sel_list[s]=s so sel_list[sf_feed_i]==sf_feed_i ->
-                            //       byte-identical to the prior slot-based compare.
-                            //     * PER_ROW_SLEN=0: slen_r[r]==s_reg and every selected key
-                            //       index is < s_reg (DSA only selects keys 0..s_reg-1), so
-                            //       the extent term is always true and never fires -> the
-                            //       mask reduces to (sf_feed_i < sel_cnt) (byte-identical).
-                            //   (When sf_feed_i>=TOPK, sel_list[] read is out-of-range/X but
-                            //    sf_feed_i<sel_cnt is already false, and 1'b0 && X == 1'b0.)
+                            // PER-ROW softmax over ROW r's OWN selection (B6).  Slot
+                            //   sf_feed_i of row r selects key sel_list_r[r][sf_feed_i]
+                            //   (its own descending-score order).  Feed that key's logit
+                            //   scores[r][h][key] while the slot is a valid selection
+                            //   (sf_feed_i < sel_cnt_r[r]); past it, bf16 -inf (NEG_BIG)
+                            //   so softmax gives zero mass.  The causal-extent trim is
+                            //   INTRINSIC: sel_cnt_r/sel_list_r came from row r's OWN
+                            //   dsa run at slen_r[r], so every selected key is already
+                            //   < slen_r[r] -- no separate extent test needed.
+                            //   Byte-identical fold: when all rows' selections agree
+                            //   (PE_M=1, dense fallback, equal-x, q-independent slice)
+                            //   sel_list_r[r][i]==the shared slot key and sel_cnt_r[r]==
+                            //   the shared count -> identical logit sequence as pre-B6.
+                            //   (sf_feed_i>=sel_cnt_r read of sel_list_r is gated off; the
+                            //    ternary picks NEG_BIG regardless of the true-branch idx.)
                             for (rr=0; rr<PE_M; rr=rr+1)
                                 sm_x_in[16*rr +: 16] <=
-                                    ((sf_feed_i < sel_cnt) &&
-                                     (sel_list[sf_feed_i[IDXW-1:0]] < slen_r[(IDXW+1)*rr +: (IDXW+1)])) ?
-                                       scores[rr][sf_head[$clog2(H_HEADS)-1:0]][sf_feed_i[IDXW-1:0]]
+                                    (sf_feed_i < sel_cnt_r[rr]) ?
+                                       scores[rr][sf_head[$clog2(H_HEADS)-1:0]]
+                                             [sel_list_r[rr][sf_feed_i[TKW-1:0]]]
                                      : NEG_BIG;
                             sf_feed_i   <= sf_feed_i + 1'b1;
                             if (sf_feed_i == S_MAX[IDXW:0]-1'b1)
@@ -1088,10 +1161,13 @@ module mla_attn_fp8 #(
                         end
                     end
                     SF_CAP: begin
+                        // probs stay SLOT-indexed (row r's slot sf_cap_i); pad slots
+                        //   beyond row r's own count with +0.0 so the context FMA over
+                        //   the union bound contributes nothing for them (bit-exact).
                         if (sm_out_valid[0]) begin
                             for (rr=0; rr<PE_M; rr=rr+1)
                                 probs[rr][sf_head[$clog2(H_HEADS)-1:0]][sf_cap_i[IDXW-1:0]] <=
-                                    (sf_cap_i < sel_cnt) ? sm_p_out[16*rr +: 16] : 16'h0;
+                                    (sf_cap_i < sel_cnt_r[rr]) ? sm_p_out[16*rr +: 16] : 16'h0;
                             sf_cap_i <= sf_cap_i + 1'b1;
                         end
                         if (sm_done[0]) sfst <= SF_NEXT;
@@ -1122,12 +1198,22 @@ module mla_attn_fp8 #(
                         cxst    <= CX_ACC;
                     end
                     CX_ACC: begin
+                        // O_h[d] = sum over ROW r's OWN slots of p[r][h][slot] *
+                        //   V[h][ key = sel_list_r[r][slot] ][d].  probs is slot-indexed,
+                        //   vstore is key-indexed, so each row accumulates over exactly
+                        //   the keys IT selected, in ITS OWN descending-score slot order
+                        //   -- the identical fp32 FMA chain as its PE_M=1 standalone run.
+                        //   The loop runs over the UNION count (>= every row's own
+                        //   count); a row's padding slots carry prob=+0.0 so their FMA
+                        //   adds +0.0 (bit-exact to stopping at that row's own count).
                         for (rr=0; rr<PE_M; rr=rr+1)
                             ctx_acc[rr] <= fp32_add(ctx_acc[rr],
                                          fp32_mul(
                                            bf16_to_fp32(probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[IDXW-1:0]]),
-                                           bf16_to_fp32(vstore[cx_head[$clog2(H_HEADS)-1:0]][cx_s[IDXW-1:0]][cx_d[$clog2(V_DIM)-1:0]])));
-                        if (cx_s == sel_cnt - 1'b1) cxst <= CX_STORE;
+                                           bf16_to_fp32(vstore[cx_head[$clog2(H_HEADS)-1:0]]
+                                                              [sel_list_r[rr][cx_s[TKW-1:0]]]
+                                                              [cx_d[$clog2(V_DIM)-1:0]])));
+                        if (cx_s == u_cnt - 1'b1) cxst <= CX_STORE;
                         else cx_s <= cx_s + 1'b1;
                     end
                     CX_STORE: begin
