@@ -167,6 +167,25 @@ module mla_attn_fp8 #(
     //   so the datapath stays BYTE-IDENTICAL to the flop form.  =0: the original
     //   fully-parallel, reset-cleared flop arrays (safe non-memory fallback).
     parameter integer VSTORE_RAM = 1,
+    // VSTORE_SYNC_RD=0 (default): the vstore_mem V-scratch is read COMBINATIONALLY
+    //   (async) in the CX_ACC context FMA -- today's path, byte-identical, which
+    //   infers as distributed/LUT RAM.  =1: REGISTER the vstore_mem read (present the
+    //   union-slot address one cycle, consume the registered V word the next) so the
+    //   memory maps to a true BLOCK-RAM -- a $dff read-data register / synchronous
+    //   read port (the B7 follow-up that makes the V-scratch realizable at large
+    //   SWIN).  The CX_ACC FSM inserts the matching 1-cycle read-latency beat
+    //   (u_cnt+1 cycles instead of u_cnt per head*dim sweep); the fp32 context
+    //   accumulation stays BIT-EXACT -- the SAME per-key prob*V products in the SAME
+    //   order, only the read timing shifts.  Build-time selectable via
+    //   `-DVSTORE_SYNC_RD` (flips this default to 1) or a per-instance param override
+    //   (yosys chparam); at =0 it constant-folds to the exact async path.  (scores_mem
+    //   is already read into a FF one cycle before the softmax consumes it, so it is
+    //   left as-is -- already registered-read-friendly, not an async FMA operand.)
+`ifdef VSTORE_SYNC_RD
+    parameter integer VSTORE_SYNC_RD = 1,
+`else
+    parameter integer VSTORE_SYNC_RD = 0,
+`endif
     // ---- derived (do NOT override) ----
     parameter integer QK_DIM    = NOPE + ROPE,
     parameter integer IDXW      = (S_MAX <= 1) ? 1 : $clog2(S_MAX),
@@ -631,6 +650,16 @@ module mla_attn_fp8 #(
     wire [31:0] ctx_lin = cx_head*V_DIM + {{(32-$clog2(V_DIM+1)){1'b0}}, cx_d};
     /* verilator lint_on UNUSEDSIGNAL */
     reg [IDXW:0]     cx_s;
+    // VSTORE_SYNC_RD=1 : registered-read pipeline for the vstore BLOCK-RAM.  The
+    //   ADDRESS phase presents rowslot2union[r][cx_s] and registers the FULL V word
+    //   (vrd_word -- the BRAM read-data register) plus the matching prob (cx_prob_d);
+    //   the ACCUMULATE phase, one beat later (cx_rd_vld), part-selects lane
+    //   (head*V_DIM+dim) and does the fp32 FMA.  Same prob*V values in the same order
+    //   as the async read -- only a 1-cycle read-latency beat is inserted.  At
+    //   VSTORE_SYNC_RD=0 these are dead (the sync branch constant-folds away).
+    reg [VMEMW-1:0]  vrd_word  [0:PE_M-1];   // registered V word (BRAM sync read data)
+    reg [15:0]       cx_prob_d [0:PE_M-1];   // prob registered alongside vrd_word
+    reg              cx_rd_vld;              // registered V beat valid this cycle
 
     //========================================================================
     // GEMV micro-sequencer (combinational operand drive + sequential control).
@@ -773,6 +802,7 @@ module mla_attn_fp8 #(
             sf_feed_i  <= {(IDXW+1){1'b0}}; sf_cap_i <= {(IDXW+1){1'b0}};
             cxst       <= CX_INIT; cx_head <= {$clog2(H_HEADS+1){1'b0}};
             cx_d       <= {$clog2(V_DIM+1){1'b0}}; cx_s <= {(IDXW+1){1'b0}};
+            cx_rd_vld  <= 1'b0;
             dsa_row    <= {DRW{1'b0}};
             u_cnt      <= {(IDXW+1){1'b0}};
             un_pres    <= 1'b0; un_cnt <= {(IDXW+1){1'b0}};
@@ -781,6 +811,8 @@ module mla_attn_fp8 #(
                 for (pfd=0; pfd<NOPE; pfd=pfd+1) kidx_buf[rr][pfd] <= 16'h0;
             for (rr=0; rr<PE_M; rr=rr+1) begin
                 ctx_acc[rr] <= 32'h0;
+                vrd_word[rr]  <= {VMEMW{1'b0}};   // sync-read pipeline (VSTORE_SYNC_RD=1)
+                cx_prob_d[rr] <= 16'h0;
                 for (s_i=0; s_i<MODEL_DIM; s_i=s_i+1) begin xbuf[rr][s_i]<=16'h0; outbuf[rr][s_i]<=16'h0; end
                 for (s_i=0; s_i<Q_LORA;   s_i=s_i+1) begin qlora[rr][s_i]<=16'h0; qlora_n[rr][s_i]<=16'h0; end
                 for (s_i=0; s_i<HQK;      s_i=s_i+1) begin qfull[rr][s_i]<=16'h0; qrot[rr][s_i]<=16'h0; end
@@ -1378,6 +1410,8 @@ module mla_attn_fp8 #(
                     CX_INIT: begin
                         for (rr=0; rr<PE_M; rr=rr+1) ctx_acc[rr] <= 32'h0;
                         cx_s    <= {(IDXW+1){1'b0}};
+                        // sync-read pipeline starts empty (no V beat in flight yet).
+                        if (VSTORE_SYNC_RD != 0) cx_rd_vld <= 1'b0;
                         cxst    <= CX_ACC;
                     end
                     CX_ACC: begin
@@ -1393,22 +1427,61 @@ module mla_attn_fp8 #(
                         //   UNION-SLOT-indexed, so read V of row r's slot-cx_s key via
                         //   rowslot2union.  (dense fold: rowslot2union[r][cx_s]==cx_s ->
                         //   same key V as the pre-B7 sel_list_r[r][cx_s] key-indexed read.)
-                        for (rr=0; rr<PE_M; rr=rr+1)
-                            ctx_acc[rr] <= fp32_add(ctx_acc[rr],
-                                         fp32_mul(
-                                           bf16_to_fp32(probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[SWINW-1:0]]),
-                                           // RAM form: read the packed slot word, part-select
-                                           //   lane (head*V_DIM+dim) -- same V value the flop
-                                           //   array held (vstore[head][slot][dim]).
-                                           bf16_to_fp32(VSTORE_RAM ?
-                                             vstore_mem[rowslot2union[rr][cx_s[TKW-1:0]]]
-                                                       [(cx_head[$clog2(H_HEADS)-1:0]*V_DIM
-                                                         + cx_d[$clog2(V_DIM)-1:0])*16 +: 16]
-                                           : vstore[cx_head[$clog2(H_HEADS)-1:0]]
-                                                   [rowslot2union[rr][cx_s[TKW-1:0]]]
-                                                   [cx_d[$clog2(V_DIM)-1:0]])));
-                        if (cx_s == u_cnt - 1'b1) cxst <= CX_STORE;
-                        else cx_s <= cx_s + 1'b1;
+                        if (VSTORE_SYNC_RD == 0) begin
+                            // ---- ASYNC (combinational) V read : today's path -------
+                            for (rr=0; rr<PE_M; rr=rr+1)
+                                ctx_acc[rr] <= fp32_add(ctx_acc[rr],
+                                             fp32_mul(
+                                               bf16_to_fp32(probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[SWINW-1:0]]),
+                                               // RAM form: read the packed slot word, part-select
+                                               //   lane (head*V_DIM+dim) -- same V value the flop
+                                               //   array held (vstore[head][slot][dim]).
+                                               bf16_to_fp32(VSTORE_RAM ?
+                                                 vstore_mem[rowslot2union[rr][cx_s[TKW-1:0]]]
+                                                           [(cx_head[$clog2(H_HEADS)-1:0]*V_DIM
+                                                             + cx_d[$clog2(V_DIM)-1:0])*16 +: 16]
+                                               : vstore[cx_head[$clog2(H_HEADS)-1:0]]
+                                                       [rowslot2union[rr][cx_s[TKW-1:0]]]
+                                                       [cx_d[$clog2(V_DIM)-1:0]])));
+                            if (cx_s == u_cnt - 1'b1) cxst <= CX_STORE;
+                            else cx_s <= cx_s + 1'b1;
+                        end else begin
+                            // ---- SYNC (registered) V read : true BLOCK-RAM read port -
+                            //   Two overlapping phases share this beat (1-deep pipeline):
+                            //   ADDRESS: while cx_s < u_cnt, present rowslot2union[r][cx_s]
+                            //     and register the WHOLE V word (vrd_word -- the BRAM
+                            //     read-data $dff) plus this slot's prob (cx_prob_d), then
+                            //     advance cx_s.  vstore_mem is thus read ONLY as
+                            //     "q <= mem[addr]" -> a synchronous read port (BRAM).
+                            //   ACCUMULATE: one beat later (cx_rd_vld), part-select lane
+                            //     (head*V_DIM+dim) from vrd_word and do the SAME fp32 FMA.
+                            //   The accumulate consumes slot j exactly one cycle after its
+                            //   address was presented, so the per-key prob*V products and
+                            //   their order are IDENTICAL to the async path -- only a lone
+                            //   read-latency beat is inserted (u_cnt+1 cycles/sweep).  The
+                            //   pipeline is fully drained before CX_STORE (last accumulate
+                            //   fires when cx_s has reached u_cnt with a beat still valid).
+                            if (cx_s < u_cnt) begin
+                                for (rr=0; rr<PE_M; rr=rr+1) begin
+                                    vrd_word[rr]  <= vstore_mem[rowslot2union[rr][cx_s[TKW-1:0]]];
+                                    cx_prob_d[rr] <= probs[rr][cx_head[$clog2(H_HEADS)-1:0]][cx_s[SWINW-1:0]];
+                                end
+                                cx_rd_vld <= 1'b1;
+                                cx_s      <= cx_s + 1'b1;
+                            end else begin
+                                cx_rd_vld <= 1'b0;
+                            end
+                            if (cx_rd_vld) begin
+                                for (rr=0; rr<PE_M; rr=rr+1)
+                                    ctx_acc[rr] <= fp32_add(ctx_acc[rr],
+                                                 fp32_mul(
+                                                   bf16_to_fp32(cx_prob_d[rr]),
+                                                   bf16_to_fp32(vrd_word[rr]
+                                                        [(cx_head[$clog2(H_HEADS)-1:0]*V_DIM
+                                                          + cx_d[$clog2(V_DIM)-1:0])*16 +: 16])));
+                                if (cx_s >= u_cnt) cxst <= CX_STORE;  // last beat consumed
+                            end
+                        end
                     end
                     CX_STORE: begin
                         for (rr=0; rr<PE_M; rr=rr+1)
