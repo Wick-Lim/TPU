@@ -51,7 +51,7 @@ UNITS := instruction_decoder register_file memory tile_memory vector_alu \
 
 IFLAGS := -g2012 -Wall -I src
 
-.PHONY: all build test hazard axi soc unittests cache-study formal formal-ind bitacc sim wave lint synth synth-glm ppa clean
+.PHONY: all build test hazard axi soc unittests cache-study formal formal-ind bitacc sim wave lint synth synth-glm cdc ppa clean
 
 all: test hazard unittests lint synth synth-glm formal
 
@@ -553,6 +553,16 @@ GLM_CDC_SRCS := src/glm_fp8_system_cdc.v src/glm_fp8_system.v src/cdc_async_fifo
 synth-glm:
 	$(YOSYS) -q -p "read_verilog -sv -I src $(GLM_CDC_SRCS); \
 	                hierarchy -top glm_fp8_system_cdc -check; proc; opt; check -assert; stat"
+
+# ---- CDC structural sign-off for the 2-clock product top (task C8) ----------
+# Asserts every host_clk<->core_clk crossing in glm_fp8_system_cdc flows through a
+# recognized synchronizer (async FIFO / 2-FF / reset_sync) and that no raw
+# multi-bit register is captured across the boundary.  A targeted structural
+# checker (not a commercial CDC tool -- see tools/cdc_check.py header for limits);
+# constraints/glm_fp8_system_cdc.sdc carries the matching false-path/async SDC.
+cdc:
+	@python3 tools/cdc_check.py src/glm_fp8_system_cdc.v \
+	    || { echo "FAILED: cdc structural sign-off"; exit 1; }
 
 # ---- PPA (area + timing) via yosys synth_ecp5 -----------------------------
 # For each tensor unit and the full TPU top we map to real Lattice ECP5 FPGA
