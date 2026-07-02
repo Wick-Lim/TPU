@@ -63,7 +63,7 @@
   always @* P``em_val = EMB[P``em_tok][P``em_idx]; \
   always @* P``fn_val = GF[P``fn_idx]; \
   always @* begin P``lw_col = {LM_TN*16{1'b0}}; \
-    for (P``ts=0;P``ts<LM_TN;P``ts=P``ts+1) P``lw_col[16*P``ts+:16] = Wlm[P``lw_vtile*LM_TN + P``ts][P``lw_k]; end \
+    if (!force_zero_lm) for (P``ts=0;P``ts<LM_TN;P``ts=P``ts+1) P``lw_col[16*P``ts+:16] = Wlm[P``lw_vtile*LM_TN + P``ts][P``lw_k]; end \
   always @* P``gn_val = P``gn_which ? G2[P``db_layer][P``gn_idx] : G1[P``db_layer][P``gn_idx]; \
   always @* begin \
     P``aw_col = {PE_N*8{1'b0}}; P``aw_scale = {16*PE_N*A_NB{1'b0}}; \
@@ -193,7 +193,7 @@
             else begin P``fw_scale_g[16*(0*TN+P``ft)+:16]=mScMg[P``fw_eidx]; P``fw_scale_u[16*(0*TN+P``ft)+:16]=mScMu[P``fw_eidx]; end \
           end end end end end \
   always @* begin P``lw_col = {LM_TN*16{1'b0}}; \
-    if (!force_zero_mtp) for (P``pq=0;P``pq<LM_TN;P``pq=P``pq+1) P``lw_col[16*P``pq+:16] = mWlm[P``lw_vtile*LM_TN + P``pq][P``lw_k]; end \
+    if (!force_zero_mtp && !force_zero_lm) for (P``pq=0;P``pq<LM_TN;P``pq=P``pq+1) P``lw_col[16*P``pq+:16] = mWlm[P``lw_vtile*LM_TN + P``pq][P``lw_k]; end \
   always @(posedge clk) begin if (rst) P``kc_valid<=1'b0; else P``kc_valid<=P``kc_req; end
 
 //============================================================================
@@ -463,6 +463,10 @@ module sct_engine #(
     // ================= shared responder mode / zeroing controls =================
     reg cur_mode;         // mtp head FFN mode for THIS case (dense/moe)
     reg force_zero_mtp;   // zero all mtp weight answers (garbage-draft scenario)
+    reg force_zero_lm;    // zero BOTH lm-head answers (model Wlm + mtp mWlm) so every
+                          // model/mtp argmax collapses to token 0 -> the chained draft
+                          // MATCHES the verify argmax -> deterministic ACCEPT (K_eff>1),
+                          // spec==greedy still exact (both streams are all token 0).
 
     // ================= DUT : spec_chain_top =====================================
     reg                       start;
@@ -709,11 +713,12 @@ module sct_engine #(
         input [IDXW:0]    sl;
         input             md;
         input             fz;          // force-zero mtp weights
-        input             exp_acc_pos; // assert reference accepts>0
+        input             fzlm;        // force-zero BOTH lm heads (deterministic accept)
+        input             exp_acc_pos; // assert reference accepts>0 (accept-path case)
         input [8*16-1:0]  nm;
         begin
             test_count = test_count + 1;
-            force_zero_mtp = fz; cur_mode = md;
+            force_zero_mtp = fz; force_zero_lm = fzlm; cur_mode = md;
             $display(".. K=%0d %0s: start (np=%0d fz=%0d md=%0d)", DRAFT_K, nm, np, fz, md); $fflush;
 
             // (a) INDEPENDENT reference (DUT idle / in reset)
@@ -753,8 +758,22 @@ module sct_engine #(
             if (accepts !== ref_acc)       begin $display("FAIL K=%0d %0s: accepts %0d != ref %0d",     DRAFT_K, nm, accepts, ref_acc);    errors=errors+1; end
             if (rejects !== ref_rej)       begin $display("FAIL K=%0d %0s: rejects %0d != ref %0d",     DRAFT_K, nm, rejects, ref_rej);    errors=errors+1; end
 
-            $display("ok  K=%0d %0s: passes=%0d commits=%0d(=%0.2f/pass) acc=%0d rej=%0d fz=%0d | committed==greedy EXACT | K_eff=%0.2f",
-                     DRAFT_K, nm, np, commit_n, (1.0*commit_n)/np, accepts, rejects, fz,
+            // ---- accept-path binding : a chained draft was GENUINELY accepted ----
+            // (b) accepts>0 AND committed-tokens-per-pass>1 -> the chain drafted-and-
+            //     accepted (K_eff>1), it did NOT merely fall back to 1-token greedy.
+            if (exp_acc_pos) begin
+                if (!(accepts > 0)) begin
+                    $display("FAIL K=%0d %0s: accept-path DUT accepts=%0d not >0 (no draft accepted)",
+                             DRAFT_K, nm, accepts); errors=errors+1;
+                end
+                if (!(commit_n > np)) begin
+                    $display("FAIL K=%0d %0s: accept-path commits/pass=%0d over %0d pass(es) not >1",
+                             DRAFT_K, nm, commit_n, np); errors=errors+1;
+                end
+            end
+
+            $display("ok  K=%0d %0s: passes=%0d commits=%0d(=%0.2f/pass) acc=%0d rej=%0d fz=%0d fzlm=%0d | committed==greedy EXACT | K_eff=%0.2f",
+                     DRAFT_K, nm, np, commit_n, (1.0*commit_n)/np, accepts, rejects, fz, fzlm,
                      (1.0*(accepts+np))/np);
             $fflush;
         end
@@ -766,7 +785,7 @@ module sct_engine #(
         prompt_tok=0; start_pos=0; s_len=1; mtp_mode=1'b0; num_passes=0;
         r_tok=0; r_pos=0; r_slen=1;
         rm_mode=1'b0; rm_pos=0; rm_slen=1; rm_h_t=0; rm_emb=0;
-        cur_mode=1'b0; force_zero_mtp=1'b0;
+        cur_mode=1'b0; force_zero_mtp=1'b0; force_zero_lm=1'b0;
         cap=1'b0; commit_n=0;
         test_count=0; errors=0; finished=1'b0; tests_out=0; errors_out=0;
         rst=1'b1; repeat(4) @(negedge clk); rst=1'b0; @(negedge clk);
@@ -788,12 +807,26 @@ module sct_engine #(
         // is exercised end-to-end while the whole engine still finishes in minutes.
 
         // (1) nonzero, DENSE mtp, 2 passes.  committed==greedy EXACT; K_eff reported.
-        run_case(NP, 4'd3, 0, 1'b1, 1'b0, 1'b0, 1'b0, "nonzero-den");
+        //     (safety fallback: random weights -> drafts rejected -> 1 token/pass.)
+        run_case(NP, 4'd3, 0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, "nonzero-den");
+
+        // (2) ACCEPT PATH (K_eff>1) -- the multi-token chained-accept coverage.
+        //     fzlm=1 zeroes BOTH lm heads (model Wlm + mtp mWlm) while EVERY other
+        //     weight stays real, so the model's next-token argmax AND the recurrent
+        //     MTP head's drafts both collapse to token 0 for this context.  Hence
+        //     every chained draft d_0..d_{K-1} MATCHES the verify model's argmaxes
+        //     m_0..m_{K-1} -> the whole prefix is ACCEPTED (p=K):
+        //       * (a) spec==greedy STILL EXACT -- both the committed stream and the
+        //             independent greedy rollout are all token 0 (asserted beat-for-beat);
+        //       * (b) accepts>0 AND commits/pass=K+1>1 (asserted) -- the chain genuinely
+        //             drafted-and-accepted, it did NOT fall back to 1-token greedy.
+        //     One pass keeps it fast; exp_acc_pos=1 binds accepts>0 on both ref and DUT.
+        run_case(1, 4'd1, 0, 1'b1, 1'b0, 1'b0, 1'b1, 1'b1, "accept-lm0");
 
 `ifdef B8_ZERO_CASE
-        // (2) forced-zero mtp weights : garbage drafts -> still commits EXACTLY the
+        // (3) forced-zero mtp weights : garbage drafts -> still commits EXACTLY the
         //     greedy stream (safety independent of draft quality), 2 passes.
-        run_case(NP, 4'd5, 1, 1'b1, 1'b0, 1'b1, 1'b0, "zero-mtp");
+        run_case(NP, 4'd5, 1, 1'b1, 1'b0, 1'b1, 1'b0, 1'b0, "zero-mtp");
 `endif
 
         tests_out=test_count; errors_out=errors; finished=1'b1;
