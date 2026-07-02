@@ -113,9 +113,24 @@ The RTL that runs the real model from Flash through a fast tier into the FP8 die
 | **`glm_fp8_system_cdc.v`** | 2-clock wrapper (host/USB ↔ compute via `cdc_async_fifo`) | 31 tests (token == standalone across async clocks) |
 
 Verified by `make unittests` (every per-unit TB) + `make formal` (6 controllers, z3 BMC).
-`make all` = `test hazard unittests lint synth formal` (the full CI surface); `make synth-glm`
-(the whole-chip GLM structural gate), `make bitacc`, `make cache-study`, and `make formal-ind`
-are additional targets run separately.
+`make all` = `test hazard unittests lint synth synth-glm formal` (the full CI surface, incl.
+the whole-chip GLM structural gate); `make bitacc`, `make cache-study`, `make cdc`, and
+`make formal-ind` are additional targets run separately.
+
+### Product-hardening — the next-steps plan (on `main`) — DONE
+
+Taking the verified prototype toward a shippable accelerator (see [`NEXT_STEPS_PLAN.md`](NEXT_STEPS_PLAN.md),
+[`docs/P2_MEMORY_MAP.md`](docs/P2_MEMORY_MAP.md), [`docs/P12_SCALEUP.md`](docs/P12_SCALEUP.md)):
+
+| Area | What | Verification |
+|---|---|---|
+| **whole-chip gate** | `make synth-glm` — first structural sign-off of the product top `glm_fp8_system_cdc` (caught a real multi-driver bug in `glm_model_fp8`) | `check -assert` clean, in `make all` |
+| **attention (MLA/DSA)** | per-row DSA selection + **union key-fetch** (batched sparse decode bit-exact per row); **real query-dependent index vectors** (the divergent path is now live/observable); **SWIN** window decouples the scratch from the 1M range; `vstore` infers as **single-write-port RAM** (flops halved) | sparse oracle **38**; all mla TBs byte-identical (7/6/24/20/10/30/6) |
+| **spec-decode** | `spec_chain_top` promoted to driveable; committed==greedy proven incl. the **multi-token accept path** (K_eff>1) | `spec_chain_top` TB (safety + accept) |
+| **reliability / DFT** | SECDED **scrub-write-back** (`ecc_mem_wrap`); lane-partitioned SECDED on the real **`kv_cache_pager` ring** (ragged 768-bit); **MBIST/ICG clock-gating cluster** (gated==free-running, scan, safety) | ecc 22290, pager-ECC 42 + **BMC re-blessed**, clk-gate 16 |
+| **memory / system** | `weight_decomp` wired into the Flash→loader refill path (tok/s lever); **C8 loopback CLOSED** — the die consumes `ddr5_xbar`-returned weight bytes bit-exactly | decomp 3, loopback 3 (token == stub) |
+| **CDC / formal** | 2-domain `reset_sync` wired into the CDC top; **CDC sign-off** (`make cdc` + SDC); `ddr5_xbar` response-FIFO lifted to **unbounded k-induction** | `make cdc` 6/6 guarded; `make formal-ind` 5 UNBOUNDED |
+| **P1.2 scale-up** | full-config parameter header + real-dim elaboration study (found a latent dense≥MoE FFN-width constraint, now guarded) | verilator elaborates at real MLA/FFN dims |
 
 ### Performance / power levers — measured (see [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md))
 
